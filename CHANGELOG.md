@@ -5,6 +5,30 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-21
+
+### Added
+- **Consumer Start Modes (`ConsumerStartMode`)**:
+  - `Latest`: Instant jump to the newest published sequence without reading historical backlog.
+  - `Head` / `Oldest`: Start reading from the oldest available non-overwritten sequence.
+  - `Sequence(u64)`: Position consumer at an exact target sequence number.
+  - Dynamic repositioning via `RingConsumer::seek(ConsumerStartMode)`.
+- **Lock-Free SHM Offset Checkpointing (`OffsetCheckpoint`)**:
+  - Cache-line aligned (64 bytes) persistent offset storage in `/dev/shm`.
+  - Sub-10ns atomic commits (`commit_offset(seq)`) with Acquire/Release synchronization.
+  - Automatic consumer crash recovery and resumption upon restart.
+- **Fluent Consumer Builder (`RingConsumerBuilder`)**:
+  - Convenient construction API: `start_from_latest()`, `start_from_head()`, `start_from_sequence(seq)`, `offset_shm(path)`.
+- **Variable-Length Payload Arena (`PayloadArena`, `BlobProducer`, `BlobConsumer`)**:
+  - Out-of-band circular payload arena for large, variable-sized binary messages.
+  - Zero heap allocation during push/pull.
+- **Reader Registry & Heartbeat (`ReaderRegistry`)**:
+  - Liveness monitoring, consumer registration, and dead-reader detection via cycle stamps.
+- **ABI & Layout Validation (`LayoutSignature`, `CycleStamp`)**:
+  - Compile-time and runtime validation signatures in SHM header preventing ABI drift between producers and consumers.
+- **Python Integration**:
+  - Updated `ringfire.py` with `ConsumerStartMode` support and atomic offset checkpointing.
+
 ## [0.1.0] - 2026-09-21
 
 ### Added
