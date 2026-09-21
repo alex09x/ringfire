@@ -1,236 +1,38 @@
 //! # ringfire
 //!
 //! Ultra-low-latency, zero-copy lock-free Inter-Process Communication (IPC)
-//! ring buffer and shared memory bus for Rust.
+//! ring buffer and shared memory bus for Linux.
+//!
+//! Designed as the high-performance cross-process counterpart to `rapidfire`,
+//! operating over memory-mapped `/dev/shm` files with 128-byte cache-line aligned headers,
+//! atomic release/acquire synchronization, `LatestWins` lossy overflow handling,
+//! configurable wait strategies (BusySpin, YieldBackoff, Futex 0% CPU idle),
+//! and an O(1) seqlock-backed Blackboard state table.
 
-use std::fs::OpenOptions;
-use std::io;
-use std::marker::PhantomData;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use memmap2::MmapMut;
+pub mod blackboard;
+pub mod error;
+pub mod ffi;
+pub mod header;
+pub mod mpmc;
+pub mod spmc;
+pub mod wait;
 
-pub const RINGFIRE_MAGIC: u64 = 0x5249_4E47_4649_5245; // "RINGFIRE" in ASCII
-pub const RINGFIRE_VERSION: u32 = 1;
+#[cfg(feature = "tokio")]
+pub mod async_ring;
 
-/// Common header stored at the beginning of the shared memory region.
-#[repr(C, align(128))]
-pub struct RingHeader {
-    pub magic: u64,
-    pub version: u32,
-    pub element_size: u32,
-    pub capacity: u64,
-    pub mask: u64,
-    pub write_seq: AtomicU64,
-    _pad: [u8; 88], // Cache-line padding to 128 bytes
-}
+// Re-export primary types
+pub use blackboard::{BlackboardConsumer, BlackboardProducer};
+pub use error::{Result, RingfireError};
+pub use header::{
+    BlackboardHeader, BlackboardSlot, RingHeader, Slot, BLACKBOARD_MAGIC, BLACKBOARD_VERSION,
+    FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+};
+pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
+pub use spmc::{CleanupMode, RecvStatus, RingConsumer, RingProducer, RingProducerBuilder};
+pub use wait::{BusySpin, FutexWait, WaitStrategy, YieldBackoff};
 
-/// An entry in the ring buffer containing sequence number and payload.
-#[repr(C)]
-pub struct Slot<T> {
-    pub seq: AtomicU64,
-    pub data: T,
-}
-
-/// Single-producer ring buffer writer backed by shared memory (`/dev/shm`).
-pub struct RingProducer<T: Copy> {
-    mmap: MmapMut,
-    header: *mut RingHeader,
-    slots: *mut Slot<T>,
-    capacity: u64,
-    mask: u64,
-    seq: u64,
-    _marker: PhantomData<T>,
-}
-
-unsafe impl<T: Copy + Send> Send for RingProducer<T> {}
-
-impl<T: Copy> RingProducer<T> {
-    /// Creates a new shared memory ring buffer at `path` with `capacity` slots.
-    /// Capacity must be a power of two.
-    pub fn create<P: AsRef<Path>>(path: P, capacity: u64) -> io::Result<Self> {
-        if !capacity.is_power_of_two() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Capacity must be a power of two",
-            ));
-        }
-
-        let slot_size = std::mem::size_of::<Slot<T>>();
-        let total_size = std::mem::size_of::<RingHeader>() + (capacity as usize * slot_size);
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-
-        file.set_len(total_size as u64)?;
-
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        let header_ptr = mmap.as_mut_ptr().cast::<RingHeader>();
-        unsafe {
-            header_ptr.write(RingHeader {
-                magic: RINGFIRE_MAGIC,
-                version: RINGFIRE_VERSION,
-                element_size: slot_size as u32,
-                capacity,
-                mask: capacity - 1,
-                write_seq: AtomicU64::new(0),
-                _pad: [0; 88],
-            });
-        }
-
-        let slots_ptr = unsafe {
-            mmap.as_mut_ptr()
-                .add(std::mem::size_of::<RingHeader>())
-                .cast::<Slot<T>>()
-        };
-
-        // Initialize slots sequence numbers
-        for i in 0..capacity {
-            unsafe {
-                let slot = slots_ptr.add(i as usize);
-                (*slot).seq = AtomicU64::new(0);
-            }
-        }
-
-        Ok(Self {
-            mmap,
-            header: header_ptr,
-            slots: slots_ptr,
-            capacity,
-            mask: capacity - 1,
-            seq: 1,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Publishes a message into the ring buffer.
-    /// Uses release ordering so consumers see complete payload.
-    #[inline(always)]
-    pub fn push(&mut self, item: &T) {
-        let idx = (self.seq & self.mask) as usize;
-        unsafe {
-            let slot = self.slots.add(idx);
-            // Write data payload
-            std::ptr::copy_nonoverlapping(item, &mut (*slot).data, 1);
-            // Publish sequence number with release ordering
-            (*slot).seq.store(self.seq, Ordering::Release);
-            // Update global header sequence
-            (*self.header).write_seq.store(self.seq, Ordering::Release);
-        }
-        self.seq += 1;
-    }
-
-    /// Current sequence number of the producer.
-    #[inline]
-    pub fn sequence(&self) -> u64 {
-        self.seq - 1
-    }
-}
-
-/// Multi-consumer ring buffer reader backed by shared memory (`/dev/shm`).
-pub struct RingConsumer<T: Copy> {
-    _mmap: MmapMut,
-    header: *const RingHeader,
-    slots: *const Slot<T>,
-    capacity: u64,
-    mask: u64,
-    cursor: u64,
-    _marker: PhantomData<T>,
-}
-
-unsafe impl<T: Copy + Send> Send for RingConsumer<T> {}
-
-impl<T: Copy> RingConsumer<T> {
-    /// Attaches to an existing shared memory ring buffer at `path`.
-    pub fn attach<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        let header_ptr = mmap.as_ptr().cast::<RingHeader>();
-        let header = unsafe { &*header_ptr };
-
-        if header.magic != RINGFIRE_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid ringfire magic header",
-            ));
-        }
-
-        let slot_size = std::mem::size_of::<Slot<T>>();
-        if header.element_size as usize != slot_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Element size mismatch: header expects {}, struct is {}",
-                    header.element_size, slot_size
-                ),
-            ));
-        }
-
-        let capacity = header.capacity;
-        let mask = header.mask;
-        let slots_ptr = unsafe {
-            mmap.as_ptr()
-                .add(std::mem::size_of::<RingHeader>())
-                .cast::<Slot<T>>()
-        };
-
-        // Start at current write sequence or 1
-        let current_write = header.write_seq.load(Ordering::Acquire);
-        let cursor = if current_write > capacity {
-            current_write - capacity + 1
-        } else {
-            1
-        };
-
-        Ok(Self {
-            _mmap: mmap,
-            header: header_ptr,
-            slots: slots_ptr,
-            capacity,
-            mask,
-            cursor,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Attempts to read the next available message without blocking.
-    /// Returns `Some(T)` if a new message was published, or `None` if caught up.
-    #[inline(always)]
-    pub fn try_recv(&mut self) -> Option<T> {
-        let idx = (self.cursor & self.mask) as usize;
-        unsafe {
-            let slot = self.slots.add(idx);
-            let published_seq = (*slot).seq.load(Ordering::Acquire);
-
-            if published_seq == self.cursor {
-                let data = (*slot).data;
-                self.cursor += 1;
-                Some(data)
-            } else if published_seq > self.cursor {
-                // Reader fell behind (lapped by producer)
-                self.cursor = published_seq;
-                let data = (*slot).data;
-                self.cursor += 1;
-                Some(data)
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Current reader cursor sequence.
-    #[inline]
-    pub fn cursor(&self) -> u64 {
-        self.cursor
-    }
-}
+#[cfg(feature = "tokio")]
+pub use async_ring::AsyncRingConsumer;
 
 #[cfg(test)]
 mod tests {
@@ -247,7 +49,7 @@ mod tests {
 
     #[test]
     fn test_ring_buffer_push_and_recv() {
-        let tmp_path = std::env::temp_dir().join("test_ringfire.shm");
+        let tmp_path = std::env::temp_dir().join("test_ringfire_spmc.shm");
         let _ = std::fs::remove_file(&tmp_path);
 
         let mut producer = RingProducer::<TestTrade>::create(&tmp_path, 1024).unwrap();
@@ -255,8 +57,18 @@ mod tests {
 
         assert_eq!(consumer.try_recv(), None);
 
-        let t1 = TestTrade { time_ns: 100, px: 81200, sz: 15, side: b'B' };
-        let t2 = TestTrade { time_ns: 200, px: 81205, sz: 20, side: b'S' };
+        let t1 = TestTrade {
+            time_ns: 100,
+            px: 81200,
+            sz: 15,
+            side: b'B',
+        };
+        let t2 = TestTrade {
+            time_ns: 200,
+            px: 81205,
+            sz: 20,
+            side: b'S',
+        };
 
         producer.push(&t1);
         producer.push(&t2);
@@ -264,7 +76,174 @@ mod tests {
         assert_eq!(consumer.try_recv(), Some(t1));
         assert_eq!(consumer.try_recv(), Some(t2));
         assert_eq!(consumer.try_recv(), None);
+    }
 
+    #[test]
+    fn test_ring_buffer_batch_recv() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_batch.shm");
         let _ = std::fs::remove_file(&tmp_path);
+
+        let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
+        let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        let items: Vec<u64> = (1..=50).collect();
+        producer.push_batch(&items);
+
+        let mut buf = [0u64; 32];
+        let n1 = consumer.recv_batch(&mut buf);
+        assert_eq!(n1, 32);
+        assert_eq!(&buf[..], &(1..=32).collect::<Vec<u64>>()[..]);
+
+        let n2 = consumer.recv_batch(&mut buf);
+        assert_eq!(n2, 18);
+        assert_eq!(&buf[..18], &(33..=50).collect::<Vec<u64>>()[..]);
+
+        assert_eq!(consumer.recv_batch(&mut buf), 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_latest_wins_lapping() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_lap.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let capacity = 64;
+        let mut producer = RingProducer::<u64>::create(&tmp_path, capacity).unwrap();
+        let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        // Write 150 items into a capacity 64 buffer (lapping consumer twice)
+        for i in 1..=150 {
+            producer.push(&i);
+        }
+
+        // Consumer reads: slot 1 (cursor 1 & 63 = 1) was overwritten with sequence 129 (1, 65, 129)
+        let status = consumer.recv_status();
+        match status {
+            RecvStatus::Lapped { skipped, item } => {
+                assert_eq!(skipped, 128);
+                assert_eq!(item, 129);
+            }
+            _ => panic!("Expected Lapped status"),
+        }
+
+        assert_eq!(consumer.lapped_count(), 128);
+
+        // Subsequent reads drain from 130 up to 150 in sequence
+        for expected in 130..=150 {
+            assert_eq!(consumer.try_recv(), Some(expected));
+        }
+        assert_eq!(consumer.try_recv(), None);
+    }
+
+    #[test]
+    fn test_blackboard_read_write() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_bb.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct BboSnapshot {
+            bid_px: u64,
+            ask_px: u64,
+            bid_sz: u64,
+            ask_sz: u64,
+        }
+
+        let mut producer = BlackboardProducer::<BboSnapshot>::create(&tmp_path, 256).unwrap();
+        let consumer = BlackboardConsumer::<BboSnapshot>::attach(&tmp_path).unwrap();
+
+        assert_eq!(consumer.read(0).unwrap(), None);
+
+        let bbo_btc = BboSnapshot {
+            bid_px: 82100_00,
+            ask_px: 82100_50,
+            bid_sz: 500,
+            ask_sz: 300,
+        };
+
+        producer.write(1, &bbo_btc).unwrap();
+
+        let read_val = consumer.read(1).unwrap().unwrap();
+        assert_eq!(read_val, bbo_btc);
+    }
+
+    #[test]
+    fn test_wait_strategy_yield_and_futex() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_wait.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
+        let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let mut wait = FutexWait::default();
+            consumer.recv_blocking(&mut wait)
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let val = 424242u64;
+        producer.push(&val);
+
+        let res = handle.join().unwrap();
+        assert_eq!(res, val);
+    }
+
+    #[test]
+    fn test_mpmc_producers() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_mpmc.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let p1 = MpmcProducer::<u64>::create(&tmp_path, 1024).unwrap();
+        let p2 = MpmcProducer::<u64>::attach(&tmp_path).unwrap();
+        let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        p1.push(&100);
+        p2.push(&200);
+
+        let v1 = consumer.try_recv().unwrap();
+        let v2 = consumer.try_recv().unwrap();
+
+        assert_eq!(v1 + v2, 300);
+    }
+
+    #[tokio::test]
+    async fn test_tokio_async_consumer() {
+        let tmp_path = std::env::temp_dir().join("test_tokio_async.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
+        let mut async_consumer = AsyncRingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        // Spawn a background cooperative counter task on the Tokio runtime
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c_clone = counter.clone();
+        let bg_task = tokio::spawn(async move {
+            for _ in 0..100 {
+                c_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Spawn async reader task
+        let reader_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..5 {
+                let msg = async_consumer.recv().await;
+                received.push(msg);
+            }
+            received
+        });
+
+        // Push messages with small delay
+        for val in 1..=5 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            producer.push(&val);
+        }
+
+        let msgs = reader_task.await.unwrap();
+        assert_eq!(msgs, vec![1, 2, 3, 4, 5]);
+
+        // Verify background task made continuous progress (not starved by the reader!)
+        bg_task.await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 100);
     }
 }

@@ -10,11 +10,34 @@ readme = "README.md"
 keywords = ["ipc", "shared-memory", "lock-free", "ring-buffer", "hft"]
 categories = ["concurrency", "asynchronous"]
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [dependencies]
 memmap2 = "0.9"
+libc = "0.2"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"], optional = true }
+futures-core = { version = "0.3", optional = true }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "dep:futures-core"]
 
 [dev-dependencies]
 criterion = { version = "0.5" }
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
+
+[[bench]]
+name = "blackboard"
+harness = false
 
 [profile.release]
 opt-level = 3
