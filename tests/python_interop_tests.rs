@@ -290,3 +290,147 @@ print("PYTHON_SHM_OFFSET_RESUME_OK")
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 }
+
+#[test]
+fn test_python_consumer_sanitized_offset_path() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_py_sanitize_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+
+    let mut producer = RingProducer::<PyTrade>::create(&ring_path, 1024).unwrap();
+    producer.push(&PyTrade {
+        timestamp_ns: 1000,
+        price: 100,
+        quantity: 1,
+        side: b'B',
+        _pad: [0; 7],
+    });
+
+    let python_code = format!(
+        r#"
+import sys, ctypes, os
+sys.path.insert(0, 'python')
+from ringfire import RingConsumer
+
+class PyTrade(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("price", ctypes.c_uint64),
+        ("quantity", ctypes.c_uint64),
+        ("side", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+# Unsafe consumer name containing directory traversal and invalid chars
+unsafe_name = "../../unsafe/worker:1#tag"
+consumer = RingConsumer('{ring}', PyTrade, consumer_name=unsafe_name)
+expected_stem = os.path.splitext(os.path.basename('{ring}'))[0]
+expected_safe = "______unsafe_worker_1_tag"
+expected_filename = f"{{expected_stem}}_{{expected_safe}}.offset"
+actual_filename = os.path.basename(consumer.offset_file)
+assert actual_filename == expected_filename, f"Expected {{expected_filename}}, got {{actual_filename}}"
+assert os.path.dirname(consumer.offset_file) == os.path.dirname('{ring}')
+consumer.close()
+if os.path.exists(consumer.offset_file):
+    os.remove(consumer.offset_file)
+print("PYTHON_SANITIZATION_OK")
+"#,
+        ring = ring_path.to_str().unwrap()
+    );
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(&python_code)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to execute python3");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python sanitization failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("PYTHON_SANITIZATION_OK"));
+
+    let _ = std::fs::remove_file(&ring_path);
+}
+
+#[test]
+fn test_python_consumer_start_mode_sequence_validation() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_py_start_mode_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+
+    let mut producer = RingProducer::<PyTrade>::create(&ring_path, 1024).unwrap();
+    for i in 1..=10 {
+        producer.push(&PyTrade {
+            timestamp_ns: i * 1000,
+            price: i * 100,
+            quantity: 1,
+            side: b'B',
+            _pad: [0; 7],
+        });
+    }
+
+    let python_code = format!(
+        r#"
+import sys, ctypes
+sys.path.insert(0, 'python')
+from ringfire import RingConsumer
+
+class PyTrade(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("price", ctypes.c_uint64),
+        ("quantity", ctypes.c_uint64),
+        ("side", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+# 1. sequence mode without start_seq must raise ValueError
+try:
+    RingConsumer('{ring}', PyTrade, start_mode="sequence")
+    assert False, "Should have raised ValueError for sequence mode without start_seq"
+except ValueError as e:
+    assert "start_seq" in str(e), f"Unexpected message: {{e}}"
+
+# 2. sequence mode with start_seq=5 starts at 5
+c = RingConsumer('{ring}', PyTrade, start_mode="sequence", start_seq=5)
+item = c.try_recv()
+assert item is not None and item.price == 500, f"Expected price 500, got {{item.price if item else None}}"
+c.close()
+
+# 3. invalid start mode raises ValueError
+try:
+    RingConsumer('{ring}', PyTrade, start_mode="nonexistent_mode")
+    assert False, "Should have raised ValueError for unknown start_mode"
+except ValueError as e:
+    assert "Unknown start_mode" in str(e)
+
+print("PYTHON_START_MODE_VALIDATION_OK")
+"#,
+        ring = ring_path.to_str().unwrap()
+    );
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(&python_code)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to execute python3");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python start mode validation failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("PYTHON_START_MODE_VALIDATION_OK"));
+
+    let _ = std::fs::remove_file(&ring_path);
+}
