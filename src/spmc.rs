@@ -8,6 +8,7 @@ use memmap2::MmapMut;
 
 use crate::error::{Result, RingfireError};
 use crate::header::{RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION};
+use crate::signature::LayoutSignature;
 use crate::wait::{wake_futex, WaitStrategy};
 
 /// Cleanup behavior for the shared memory file when the producer is dropped.
@@ -63,13 +64,13 @@ impl RingProducerBuilder {
         self
     }
 
-    pub fn build<T: Copy, P: AsRef<Path>>(self, path: P) -> Result<RingProducer<T>> {
+    pub fn build<T: Copy + 'static, P: AsRef<Path>>(self, path: P) -> Result<RingProducer<T>> {
         RingProducer::create_with_options(path, self)
     }
 }
 
 /// Single-producer ring buffer writer backed by shared memory (`/dev/shm`).
-pub struct RingProducer<T: Copy> {
+pub struct RingProducer<T: Copy + 'static> {
     path: PathBuf,
     file: Option<File>,
     _mmap: MmapMut,
@@ -82,9 +83,9 @@ pub struct RingProducer<T: Copy> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Copy + Send> Send for RingProducer<T> {}
+unsafe impl<T: Copy + Send + 'static> Send for RingProducer<T> {}
 
-impl<T: Copy> RingProducer<T> {
+impl<T: Copy + 'static> RingProducer<T> {
     /// Creates a new shared memory ring buffer at `path` with `capacity` slots.
     /// `capacity` must be a power of two.
     pub fn create<P: AsRef<Path>>(path: P, capacity: u64) -> Result<Self> {
@@ -141,8 +142,12 @@ impl<T: Copy> RingProducer<T> {
                 waiting_consumers: std::sync::atomic::AtomicU32::new(0),
                 _align_pad: 0,
                 read_seq: std::sync::atomic::AtomicU64::new(0),
-                _reserved: 0,
-                _pad: [0; 48],
+                schema_sig: T::layout_signature(),
+                arena_offset: 0,
+                arena_size: 0,
+                reader_registry_offset: 0,
+                reader_registry_count: 0,
+                _pad: [0; 24],
             });
         }
 
@@ -244,7 +249,7 @@ impl<T: Copy> RingProducer<T> {
     }
 }
 
-impl<T: Copy> Drop for RingProducer<T> {
+impl<T: Copy + 'static> Drop for RingProducer<T> {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             let fd = file.as_raw_fd();
@@ -258,8 +263,17 @@ impl<T: Copy> Drop for RingProducer<T> {
     }
 }
 
+impl<T: Copy + 'static> std::fmt::Debug for RingProducer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingProducer")
+            .field("capacity", &self.capacity)
+            .field("seq", &self.seq)
+            .finish()
+    }
+}
+
 /// Multi-consumer ring buffer reader backed by shared memory (`/dev/shm`).
-pub struct RingConsumer<T: Copy> {
+pub struct RingConsumer<T: Copy + 'static> {
     _mmap: MmapMut,
     header: *const RingHeader,
     slots: *const Slot<T>,
@@ -270,9 +284,19 @@ pub struct RingConsumer<T: Copy> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Copy + Send> Send for RingConsumer<T> {}
+unsafe impl<T: Copy + Send + 'static> Send for RingConsumer<T> {}
 
-impl<T: Copy> RingConsumer<T> {
+impl<T: Copy + 'static> std::fmt::Debug for RingConsumer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingConsumer")
+            .field("capacity", &self.capacity)
+            .field("cursor", &self.cursor)
+            .field("lapped_total", &self.lapped_total)
+            .finish()
+    }
+}
+
+impl<T: Copy + 'static> RingConsumer<T> {
     /// Attaches to an existing shared memory ring buffer at `path`.
     pub fn attach<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -301,6 +325,15 @@ impl<T: Copy> RingConsumer<T> {
             return Err(RingfireError::ElementSizeMismatch {
                 expected: header.element_size as usize,
                 actual: slot_size,
+            });
+        }
+
+        let expected_sig = T::layout_signature();
+        if header.schema_sig != 0 && header.schema_sig != expected_sig {
+            return Err(RingfireError::SchemaMismatch {
+                expected: header.schema_sig,
+                actual: expected_sig,
+                type_name: std::any::type_name::<T>(),
             });
         }
 

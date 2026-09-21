@@ -107,8 +107,12 @@ pub unsafe extern "C" fn ringfire_producer_create(
             waiting_consumers: std::sync::atomic::AtomicU32::new(0),
             _align_pad: 0,
             read_seq: AtomicU64::new(0),
-            _reserved: 0,
-            _pad: [0; 48],
+            schema_sig: 0,
+            arena_offset: 0,
+            arena_size: 0,
+            reader_registry_offset: 0,
+            reader_registry_count: 0,
+            _pad: [0; 24],
         });
 
         let slots_base = mmap

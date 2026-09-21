@@ -9,12 +9,13 @@ use crate::error::{Result, RingfireError};
 use crate::header::{
     RingHeader, Slot, FLAG_MODE_MPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION,
 };
+use crate::signature::LayoutSignature;
 use crate::spmc::CleanupMode;
 use crate::wait::{wake_futex, WaitStrategy};
 
 /// Multi-producer writer for shared memory ring buffer.
 /// Allows multiple concurrent processes to safely publish messages into the same ring buffer.
-pub struct MpmcProducer<T: Copy> {
+pub struct MpmcProducer<T: Copy + 'static> {
     path: PathBuf,
     _file: File,
     _mmap: MmapMut,
@@ -26,10 +27,10 @@ pub struct MpmcProducer<T: Copy> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Copy + Send> Send for MpmcProducer<T> {}
-unsafe impl<T: Copy + Sync> Sync for MpmcProducer<T> {}
+unsafe impl<T: Copy + Send + 'static> Send for MpmcProducer<T> {}
+unsafe impl<T: Copy + Sync + 'static> Sync for MpmcProducer<T> {}
 
-impl<T: Copy> MpmcProducer<T> {
+impl<T: Copy + 'static> MpmcProducer<T> {
     /// Creates a new MPMC shared memory ring buffer at `path`.
     pub fn create<P: AsRef<Path>>(path: P, capacity: u64) -> Result<Self> {
         if !capacity.is_power_of_two() {
@@ -67,8 +68,12 @@ impl<T: Copy> MpmcProducer<T> {
                 waiting_consumers: std::sync::atomic::AtomicU32::new(0),
                 _align_pad: 0,
                 read_seq: std::sync::atomic::AtomicU64::new(1),
-                _reserved: 0,
-                _pad: [0; 48],
+                schema_sig: T::layout_signature(),
+                arena_offset: 0,
+                arena_size: 0,
+                reader_registry_offset: 0,
+                reader_registry_count: 0,
+                _pad: [0; 24],
             });
         }
 
@@ -127,6 +132,15 @@ impl<T: Copy> MpmcProducer<T> {
             return Err(RingfireError::ElementSizeMismatch {
                 expected: header.element_size as usize,
                 actual: slot_size,
+            });
+        }
+
+        let expected_sig = T::layout_signature();
+        if header.schema_sig != 0 && header.schema_sig != expected_sig {
+            return Err(RingfireError::SchemaMismatch {
+                expected: header.schema_sig,
+                actual: expected_sig,
+                type_name: std::any::type_name::<T>(),
             });
         }
 
@@ -189,7 +203,7 @@ impl<T: Copy> Drop for MpmcProducer<T> {
 
 /// Multi-consumer worker queue reader: multiple consumers compete for items,
 /// each item is consumed by exactly one consumer.
-pub struct MpmcQueueConsumer<T: Copy> {
+pub struct MpmcQueueConsumer<T: Copy + 'static> {
     _mmap: MmapMut,
     header: *const RingHeader,
     slots: *const Slot<T>,
@@ -197,9 +211,9 @@ pub struct MpmcQueueConsumer<T: Copy> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Copy + Send> Send for MpmcQueueConsumer<T> {}
+unsafe impl<T: Copy + Send + 'static> Send for MpmcQueueConsumer<T> {}
 
-impl<T: Copy> MpmcQueueConsumer<T> {
+impl<T: Copy + 'static> MpmcQueueConsumer<T> {
     /// Attaches to an MPMC ring buffer as a competing queue consumer.
     pub fn attach<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -220,6 +234,15 @@ impl<T: Copy> MpmcQueueConsumer<T> {
             return Err(RingfireError::ElementSizeMismatch {
                 expected: header.element_size as usize,
                 actual: slot_size,
+            });
+        }
+
+        let expected_sig = T::layout_signature();
+        if header.schema_sig != 0 && header.schema_sig != expected_sig {
+            return Err(RingfireError::SchemaMismatch {
+                expected: header.schema_sig,
+                actual: expected_sig,
+                type_name: std::any::type_name::<T>(),
             });
         }
 

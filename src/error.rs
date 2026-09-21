@@ -20,6 +20,18 @@ pub enum RingfireError {
     KeyOutOfRange { key: usize, capacity: usize },
     /// Value size mismatch for blackboard.
     ValueSizeMismatch { expected: usize, actual: usize },
+    /// Layout signature / schema fingerprint mismatch across processes.
+    SchemaMismatch {
+        expected: u64,
+        actual: u64,
+        type_name: &'static str,
+    },
+    /// Payload exceeds maximum arena capacity.
+    ArenaPayloadTooLarge { len: usize, max_capacity: usize },
+    /// Provided output buffer is too small for payload.
+    BufferTooSmall { required: usize, provided: usize },
+    /// Reader registry is full (all slots occupied).
+    NoAvailableReaderSlots,
 }
 
 impl fmt::Display for RingfireError {
@@ -53,6 +65,24 @@ impl fmt::Display for RingfireError {
                 "Blackboard value size mismatch: expected {} bytes, got {} bytes",
                 expected, actual
             ),
+            Self::SchemaMismatch { expected, actual, type_name } => write!(
+                f,
+                "Schema signature mismatch for type '{}': expected 0x{:016X}, got 0x{:016X}",
+                type_name, expected, actual
+            ),
+            Self::ArenaPayloadTooLarge { len, max_capacity } => write!(
+                f,
+                "Payload size ({} bytes) exceeds arena capacity ({} bytes)",
+                len, max_capacity
+            ),
+            Self::BufferTooSmall { required, provided } => write!(
+                f,
+                "Output buffer too small: required {} bytes, provided {} bytes",
+                required, provided
+            ),
+            Self::NoAvailableReaderSlots => {
+                write!(f, "Reader registry full: no free slots available")
+            }
         }
     }
 }
