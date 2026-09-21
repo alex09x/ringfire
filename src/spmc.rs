@@ -214,10 +214,22 @@ impl<T: Copy> RingProducer<T> {
         }
     }
 
-    /// Current sequence number of the producer.
+    /// Sequence number of the last published message (0 if no messages pushed yet).
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.seq - 1
+    }
+
+    /// Sequence number that will be assigned to the next pushed message.
+    #[inline]
+    pub fn next_sequence(&self) -> u64 {
+        self.seq
+    }
+
+    /// Current sequence published in the shared memory header visible to consumers.
+    #[inline]
+    pub fn published_sequence(&self) -> u64 {
+        unsafe { (*self.header).write_seq.load(Ordering::Acquire) }
     }
 
     /// Capacity of the ring buffer.
