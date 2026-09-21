@@ -290,4 +290,3 @@ print("PYTHON_SHM_OFFSET_RESUME_OK")
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 }
-

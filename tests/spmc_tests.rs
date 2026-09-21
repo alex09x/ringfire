@@ -271,4 +271,3 @@ fn test_shm_offset_lapping_recovery() {
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 }
-
