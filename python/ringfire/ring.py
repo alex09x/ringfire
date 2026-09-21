@@ -79,7 +79,8 @@ class RingConsumer:
         if offset_file is None and consumer_name is not None:
             dirname = os.path.dirname(path) or "/dev/shm"
             stem = os.path.splitext(os.path.basename(path))[0]
-            self.offset_file = os.path.join(dirname, f"{stem}_{consumer_name}.offset")
+            safe_name = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in consumer_name)
+            self.offset_file = os.path.join(dirname, f"{stem}_{safe_name}.offset")
 
         saved_seq = None
         if self.offset_file:
@@ -97,16 +98,23 @@ class RingConsumer:
             self.cursor = write_seq if write_seq > 0 else 1
         elif start_mode == "head":
             self.cursor = write_seq + 1
-        elif start_mode == "sequence" and start_seq is not None:
+        elif start_mode == "sequence":
+            if start_seq is None:
+                raise ValueError("start_seq must be provided when start_mode is 'sequence'")
             if start_seq < oldest:
                 self.lapped_count += oldest - start_seq
                 self.cursor = oldest
             else:
                 self.cursor = start_seq
-        else:  # "oldest"
+        elif start_mode == "oldest":
             self.cursor = oldest
+        else:
+            raise ValueError(f"Unknown start_mode: '{start_mode}'")
 
     def _init_offset_shm(self, name: str):
+        offset_dir = os.path.dirname(self.offset_file)
+        if offset_dir:
+            os.makedirs(offset_dir, exist_ok=True)
         self.offset_fd = os.open(self.offset_file, os.O_RDWR | os.O_CREAT, 0o660)
         if os.fstat(self.offset_fd).st_size < 64:
             os.ftruncate(self.offset_fd, 64)
