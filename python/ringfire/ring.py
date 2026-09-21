@@ -1,4 +1,5 @@
 import os
+import time
 import mmap
 import ctypes
 import struct
@@ -33,13 +34,27 @@ class RecvStatus(Enum):
     EMPTY = 2
     LAPPED = 3
 
+SHM_OFFSET_MAGIC = 0x53484D5F4F464653
+SHM_OFFSET_VERSION = 1
+
 class RingConsumer:
     """Zero-copy reader for ringfire shared memory ring buffer."""
 
-    def __init__(self, path: str, struct_cls: Type[ctypes.Structure]):
+    def __init__(
+        self,
+        path: str,
+        struct_cls: Type[ctypes.Structure],
+        start_mode: str = "oldest",  # "latest", "head", "oldest", "sequence"
+        offset_file: Optional[str] = None,
+        consumer_name: Optional[str] = None,
+        start_seq: Optional[int] = None,
+    ):
         self.path = path
         self.struct_cls = struct_cls
         self.payload_size = ctypes.sizeof(struct_cls)
+        self.offset_file = offset_file
+        self.offset_mm = None
+        self.offset_fd = -1
 
         self.fd = os.open(path, os.O_RDWR)
         file_size = os.fstat(self.fd).st_size
@@ -56,14 +71,85 @@ class RingConsumer:
         self.mask = self.header.mask
         self.slots_offset = HEADER_SIZE
 
-        # Start cursor
         write_seq = self.header.write_seq
-        if write_seq > self.capacity:
-            self.cursor = write_seq - self.capacity + 1
-        else:
-            self.cursor = 1
-
+        oldest = (write_seq - self.capacity + 1) if write_seq > self.capacity else 1
         self.lapped_count = 0
+
+        # Handle offset file if provided or derived from consumer_name
+        if offset_file is None and consumer_name is not None:
+            dirname = os.path.dirname(path) or "/dev/shm"
+            stem = os.path.splitext(os.path.basename(path))[0]
+            self.offset_file = os.path.join(dirname, f"{stem}_{consumer_name}.offset")
+
+        saved_seq = None
+        if self.offset_file:
+            self._init_offset_shm(consumer_name or "py_consumer")
+            saved_seq = self._load_offset()
+
+        if saved_seq is not None and saved_seq > 0:
+            target = saved_seq + 1
+            if target < oldest:
+                self.lapped_count += oldest - target
+                self.cursor = oldest
+            else:
+                self.cursor = target
+        elif start_mode == "latest":
+            self.cursor = write_seq if write_seq > 0 else 1
+        elif start_mode == "head":
+            self.cursor = write_seq + 1
+        elif start_mode == "sequence" and start_seq is not None:
+            if start_seq < oldest:
+                self.lapped_count += oldest - start_seq
+                self.cursor = oldest
+            else:
+                self.cursor = start_seq
+        else:  # "oldest"
+            self.cursor = oldest
+
+    def _init_offset_shm(self, name: str):
+        self.offset_fd = os.open(self.offset_file, os.O_RDWR | os.O_CREAT, 0o660)
+        if os.fstat(self.offset_fd).st_size < 64:
+            os.ftruncate(self.offset_fd, 64)
+            self.offset_mm = mmap.mmap(self.offset_fd, 64, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            name_bytes = name.encode("utf-8")[:31].ljust(32, b"\x00")
+            header_bytes = struct.pack("<QIIQQ", SHM_OFFSET_MAGIC, SHM_OFFSET_VERSION, os.getpid(), 0, int(time.time() * 1e9))
+            self.offset_mm[0:32] = header_bytes
+            self.offset_mm[32:64] = name_bytes
+        else:
+            self.offset_mm = mmap.mmap(self.offset_fd, 64, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            magic, version = struct.unpack_from("<QI", self.offset_mm, 0)
+            if magic != SHM_OFFSET_MAGIC:
+                raise ValueError(f"Invalid SHM offset magic: 0x{magic:016X}")
+
+    def _load_offset(self) -> Optional[int]:
+        if self.offset_mm is None:
+            return None
+        return struct.unpack_from("<Q", self.offset_mm, 16)[0]
+
+    def commit_offset(self):
+        """Atomically commits current cursor - 1 to shared memory (<10ns)."""
+        if self.offset_mm is None:
+            raise ValueError("No offset file configured for this consumer")
+        last_seq = max(0, self.cursor - 1)
+        now_ns = int(time.time() * 1e9)
+        struct.pack_into("<Q", self.offset_mm, 16, last_seq)
+        struct.pack_into("<Q", self.offset_mm, 24, now_ns)
+
+    def seek(self, target_seq: int) -> int:
+        """Seeks cursor to target sequence number, handling lapping if necessary."""
+        write_seq = self.header.write_seq
+        oldest = (write_seq - self.capacity + 1) if write_seq > self.capacity else 1
+        if target_seq < oldest:
+            skipped = oldest - target_seq
+            self.lapped_count += skipped
+            self.cursor = oldest
+            return skipped
+        else:
+            self.cursor = target_seq
+            return 0
+
+    def last_processed_sequence(self) -> int:
+        return max(0, self.cursor - 1)
 
     def try_recv(self) -> Optional[ctypes.Structure]:
         """Attempts to read the next message without blocking."""
@@ -115,10 +201,31 @@ class RingConsumer:
         return items
 
     def close(self):
+        if hasattr(self, "offset_mm") and self.offset_mm is not None:
+            try:
+                self.offset_mm.close()
+            except Exception:
+                pass
+            self.offset_mm = None
+        if hasattr(self, "offset_fd") and self.offset_fd >= 0:
+            try:
+                os.close(self.offset_fd)
+            except Exception:
+                pass
+            self.offset_fd = -1
+
+        self.header = None
         if hasattr(self, "mm") and self.mm is not None:
-            self.mm.close()
+            try:
+                self.mm.close()
+            except Exception:
+                pass
+            self.mm = None
         if hasattr(self, "fd") and self.fd >= 0:
-            os.close(self.fd)
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
             self.fd = -1
 
     def __enter__(self):

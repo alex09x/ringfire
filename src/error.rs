@@ -32,6 +32,8 @@ pub enum RingfireError {
     BufferTooSmall { required: usize, provided: usize },
     /// Reader registry is full (all slots occupied).
     NoAvailableReaderSlots,
+    /// No offset file was configured for this consumer.
+    NoOffsetFileConfigured,
 }
 
 impl fmt::Display for RingfireError {
@@ -82,6 +84,9 @@ impl fmt::Display for RingfireError {
             ),
             Self::NoAvailableReaderSlots => {
                 write!(f, "Reader registry full: no free slots available")
+            }
+            Self::NoOffsetFileConfigured => {
+                write!(f, "No offset file configured for this consumer")
             }
         }
     }

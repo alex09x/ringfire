@@ -12,6 +12,7 @@
 pub mod arena;
 pub mod blackboard;
 pub mod blob;
+pub mod checkpoint;
 pub mod error;
 pub mod ffi;
 pub mod header;
@@ -29,6 +30,7 @@ pub mod async_ring;
 pub use arena::{ArenaHeader, BlobRef, PayloadArena};
 pub use blackboard::{BlackboardConsumer, BlackboardProducer};
 pub use blob::{BlobConsumer, BlobPacket, BlobProducer, BlobProducerBuilder, BlobRecvStatus};
+pub use checkpoint::OffsetCheckpoint;
 pub use error::{Result, RingfireError};
 pub use header::{
     BlackboardHeader, BlackboardSlot, ReaderSlot, RingHeader, Slot, BLACKBOARD_MAGIC,
@@ -38,7 +40,10 @@ pub use header::{
 pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
 pub use registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
 pub use signature::{compute_layout_signature, fnv1a64, LayoutSignature};
-pub use spmc::{CleanupMode, RecvStatus, RingConsumer, RingProducer, RingProducerBuilder};
+pub use spmc::{
+    CleanupMode, ConsumerStartMode, RecvStatus, RingConsumer, RingConsumerBuilder, RingProducer,
+    RingProducerBuilder,
+};
 pub use tsc::CycleStamp;
 pub use wait::{BusySpin, FutexWait, WaitStrategy, YieldBackoff};
 

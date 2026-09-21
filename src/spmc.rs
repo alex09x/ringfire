@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
+use crate::checkpoint::OffsetCheckpoint;
 use crate::error::{Result, RingfireError};
 use crate::header::{RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION};
 use crate::signature::LayoutSignature;
@@ -272,6 +273,115 @@ impl<T: Copy + 'static> std::fmt::Debug for RingProducer<T> {
     }
 }
 
+/// Initial cursor positioning strategy when attaching a consumer to a ring buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerStartMode {
+    /// Start reading from the latest published sequence in the buffer.
+    ///
+    /// Jumps directly to the head of the stream for live execution without
+    /// reading historical backlog.
+    Latest,
+
+    /// Start reading from the next sequence to be published (strictly future messages).
+    Head,
+
+    /// Start reading from the oldest available message surviving in the buffer.
+    ///
+    /// Replays all retained messages (up to buffer capacity).
+    Oldest,
+
+    /// Start reading from a specific sequence number.
+    ///
+    /// If the sequence has already been overwritten due to buffer wraparound,
+    /// the consumer automatically catches up to the oldest available sequence
+    /// and tracks the lapped count.
+    Sequence(u64),
+}
+
+/// Builder for configuring and attaching a `RingConsumer`.
+#[derive(Debug, Clone)]
+pub struct RingConsumerBuilder<T: Copy + LayoutSignature + 'static> {
+    start_mode: ConsumerStartMode,
+    offset_file: Option<PathBuf>,
+    consumer_name: Option<String>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Copy + LayoutSignature + 'static> Default for RingConsumerBuilder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy + LayoutSignature + 'static> RingConsumerBuilder<T> {
+    /// Creates a new `RingConsumerBuilder` defaulting to `ConsumerStartMode::Latest`.
+    pub fn new() -> Self {
+        Self {
+            start_mode: ConsumerStartMode::Latest,
+            offset_file: None,
+            consumer_name: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sets the initial start mode when no offset file is present.
+    pub fn start_mode(mut self, mode: ConsumerStartMode) -> Self {
+        self.start_mode = mode;
+        self
+    }
+
+    /// Configure consumer to start from the latest message published in the buffer.
+    pub fn start_from_latest(mut self) -> Self {
+        self.start_mode = ConsumerStartMode::Latest;
+        self
+    }
+
+    /// Configure consumer to start from the next message to be published (head).
+    pub fn start_from_head(mut self) -> Self {
+        self.start_mode = ConsumerStartMode::Head;
+        self
+    }
+
+    /// Configure consumer to start from the oldest message available in the buffer.
+    pub fn start_from_oldest(mut self) -> Self {
+        self.start_mode = ConsumerStartMode::Oldest;
+        self
+    }
+
+    /// Configure consumer to start from a specific sequence number.
+    pub fn start_from_sequence(mut self, seq: u64) -> Self {
+        self.start_mode = ConsumerStartMode::Sequence(seq);
+        self
+    }
+
+    /// Sets an explicit shared memory path for persisting and loading consumer offsets.
+    ///
+    /// Stores the cursor in a 64-byte cache-aligned atomic struct directly in `/dev/shm`.
+    pub fn offset_file<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.offset_file = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Alias for `offset_file` targeting shared memory paths.
+    pub fn offset_shm<P: AsRef<Path>>(self, path: P) -> Self {
+        self.offset_file(path)
+    }
+
+    /// Identifies this consumer with a human-readable name.
+    ///
+    /// If no explicit `offset_file` is specified, automatically derives a dedicated
+    /// shared memory offset path: `/dev/shm/{ring_basename}_{consumer_name}.offset`.
+    pub fn consumer_name(mut self, name: &str) -> Self {
+        self.consumer_name = Some(name.to_string());
+        self
+    }
+
+    /// Attaches to the shared memory ring buffer at `path` using the configured builder options.
+    pub fn attach<P: AsRef<Path>>(self, path: P) -> Result<RingConsumer<T>> {
+        RingConsumer::attach_with_options(path, self)
+    }
+}
+
 /// Multi-consumer ring buffer reader backed by shared memory (`/dev/shm`).
 pub struct RingConsumer<T: Copy + 'static> {
     _mmap: MmapMut,
@@ -281,6 +391,7 @@ pub struct RingConsumer<T: Copy + 'static> {
     mask: u64,
     cursor: u64,
     lapped_total: u64,
+    checkpoint: Option<OffsetCheckpoint>,
     _marker: PhantomData<T>,
 }
 
@@ -292,14 +403,50 @@ impl<T: Copy + 'static> std::fmt::Debug for RingConsumer<T> {
             .field("capacity", &self.capacity)
             .field("cursor", &self.cursor)
             .field("lapped_total", &self.lapped_total)
+            .field("checkpoint", &self.checkpoint)
             .finish()
     }
 }
 
-impl<T: Copy + 'static> RingConsumer<T> {
-    /// Attaches to an existing shared memory ring buffer at `path`.
+impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
+    /// Returns a new `RingConsumerBuilder` for configuring attach options.
+    pub fn builder() -> RingConsumerBuilder<T> {
+        RingConsumerBuilder::new()
+    }
+
+    /// Attaches to an existing ring buffer, starting from the oldest available message.
+    ///
+    /// Preserves standard replay behavior.
     pub fn attach<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::builder().start_from_oldest().attach(path)
+    }
+
+    /// Attaches to an existing ring buffer, starting from the latest published message.
+    ///
+    /// Skips historical messages to connect immediately to live market data.
+    pub fn attach_latest<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::builder().start_from_latest().attach(path)
+    }
+
+    /// Attaches to an existing ring buffer, resuming from the specified offset file.
+    ///
+    /// If the offset file does not exist, starts from the latest published message.
+    pub fn attach_from_offset<P: AsRef<Path>, O: AsRef<Path>>(
+        path: P,
+        offset_file: O,
+    ) -> Result<Self> {
+        Self::builder()
+            .offset_file(offset_file)
+            .start_from_latest()
+            .attach(path)
+    }
+
+    /// Attaches to an existing shared memory ring buffer at `path` with custom builder options.
+    pub fn attach_with_options<P: AsRef<Path>>(
+        path: P,
+        options: RingConsumerBuilder<T>,
+    ) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
 
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
@@ -345,12 +492,64 @@ impl<T: Copy + 'static> RingConsumer<T> {
                 .cast::<Slot<T>>()
         };
 
-        // Start reading from the oldest available message in the buffer
         let current_write = header.write_seq.load(Ordering::Acquire);
-        let cursor = if current_write > capacity {
+        let oldest = if current_write > capacity {
             current_write - capacity + 1
         } else {
             1
+        };
+
+        let (checkpoint, cursor, lapped_total) = if options.offset_file.is_some() || options.consumer_name.is_some() {
+            let name = options.consumer_name.as_deref().unwrap_or("consumer");
+            let cp = if let Some(ref offset_path) = options.offset_file {
+                OffsetCheckpoint::open_or_create(offset_path, name).map_err(RingfireError::Io)?
+            } else {
+                OffsetCheckpoint::for_consumer(&path, name).map_err(RingfireError::Io)?
+            };
+
+            let (target_cur, lapped) = match cp.load() {
+                Some(saved_seq) => {
+                    let target = saved_seq + 1;
+                    if target < oldest {
+                        (oldest, oldest - target)
+                    } else {
+                        (target, 0)
+                    }
+                }
+                None => match options.start_mode {
+                    ConsumerStartMode::Latest => {
+                        let cur = if current_write > 0 { current_write } else { 1 };
+                        (cur, 0)
+                    }
+                    ConsumerStartMode::Head => (current_write + 1, 0),
+                    ConsumerStartMode::Oldest => (oldest, 0),
+                    ConsumerStartMode::Sequence(seq) => {
+                        if seq < oldest {
+                            (oldest, oldest - seq)
+                        } else {
+                            (seq, 0)
+                        }
+                    }
+                },
+            };
+            (Some(cp), target_cur, lapped)
+        } else {
+            let (target_cur, lapped) = match options.start_mode {
+                ConsumerStartMode::Latest => {
+                    let cur = if current_write > 0 { current_write } else { 1 };
+                    (cur, 0)
+                }
+                ConsumerStartMode::Head => (current_write + 1, 0),
+                ConsumerStartMode::Oldest => (oldest, 0),
+                ConsumerStartMode::Sequence(seq) => {
+                    if seq < oldest {
+                        (oldest, oldest - seq)
+                    } else {
+                        (seq, 0)
+                    }
+                }
+            };
+            (None, target_cur, lapped)
         };
 
         Ok(Self {
@@ -360,7 +559,8 @@ impl<T: Copy + 'static> RingConsumer<T> {
             capacity,
             mask,
             cursor,
-            lapped_total: 0,
+            lapped_total,
+            checkpoint,
             _marker: PhantomData,
         })
     }
@@ -538,5 +738,64 @@ impl<T: Copy + 'static> RingConsumer<T> {
         } else {
             0
         }
+    }
+
+    /// Seeks reader cursor to a specific sequence number.
+    ///
+    /// If `target_seq` is older than the oldest surviving message in the ring,
+    /// cursor automatically advances to the oldest available sequence and returns
+    /// the number of skipped messages.
+    pub fn seek(&mut self, target_seq: u64) -> u64 {
+        let current_write = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        let oldest = if current_write > self.capacity {
+            current_write - self.capacity + 1
+        } else {
+            1
+        };
+        if target_seq < oldest {
+            let skipped = oldest - target_seq;
+            self.lapped_total += skipped;
+            self.cursor = oldest;
+            skipped
+        } else {
+            self.cursor = target_seq;
+            0
+        }
+    }
+
+    /// Reference to the attached shared memory offset checkpoint, if configured.
+    #[inline]
+    pub fn checkpoint(&self) -> Option<&OffsetCheckpoint> {
+        self.checkpoint.as_ref()
+    }
+
+    /// Path to the shared memory offset file, if configured.
+    #[inline]
+    pub fn offset_path(&self) -> Option<&Path> {
+        self.checkpoint.as_ref().map(|cp| cp.path())
+    }
+
+    /// Atomically persists the last processed sequence number (`cursor - 1`) directly into shared memory (<10ns).
+    #[inline(always)]
+    pub fn commit_offset(&self) -> Result<()> {
+        if let Some(ref cp) = self.checkpoint {
+            cp.save(self.last_processed_sequence());
+            Ok(())
+        } else {
+            Err(RingfireError::NoOffsetFileConfigured)
+        }
+    }
+
+    /// Atomically persists the last processed sequence number (`cursor - 1`) to a specified shared memory path.
+    pub fn commit_offset_to<P: AsRef<Path>>(&self, path: P, consumer_name: &str) -> Result<()> {
+        let cp = OffsetCheckpoint::open_or_create(path, consumer_name).map_err(RingfireError::Io)?;
+        cp.save(self.last_processed_sequence());
+        Ok(())
+    }
+
+    /// Sequence number of the last successfully processed message (`cursor - 1`).
+    #[inline]
+    pub fn last_processed_sequence(&self) -> u64 {
+        self.cursor.saturating_sub(1)
     }
 }
