@@ -110,27 +110,51 @@ mod tests {
         let mut producer = RingProducer::<u64>::create(&tmp_path, capacity).unwrap();
         let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
 
-        // Write 150 items into a capacity 64 buffer (lapping consumer twice)
+        // Write 150 items into a capacity 64 buffer (lapping consumer by > 2x capacity)
         for i in 1..=150 {
             producer.push(&i);
         }
 
-        // Consumer reads: slot 1 (cursor 1 & 63 = 1) was overwritten with sequence 129 (1, 65, 129)
+        // Consumer reads: was lapped by full buffer -> jumps to oldest surviving item (150 - 64 + 1 = 87)
         let status = consumer.recv_status();
         match status {
             RecvStatus::Lapped { skipped, item } => {
-                assert_eq!(skipped, 128);
-                assert_eq!(item, 129);
+                assert_eq!(skipped, 86); // 87 - 1 = 86 skipped
+                assert_eq!(item, 87);
             }
             _ => panic!("Expected Lapped status"),
         }
 
-        assert_eq!(consumer.lapped_count(), 128);
+        assert_eq!(consumer.lapped_count(), 86);
 
-        // Subsequent reads drain from 130 up to 150 in sequence
-        for expected in 130..=150 {
+        // Subsequent reads drain from 88 up to 150 in sequence (all 64 surviving messages in the ring!)
+        for expected in 88..=150 {
             assert_eq!(consumer.try_recv(), Some(expected));
         }
+        assert_eq!(consumer.try_recv(), None);
+    }
+
+    #[test]
+    fn test_reader_extreme_lag_and_jump_to_latest() {
+        let tmp_path = std::env::temp_dir().join("test_ringfire_extreme_lag.shm");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let capacity = 1024;
+        let mut producer = RingProducer::<u64>::create(&tmp_path, capacity).unwrap();
+        let mut consumer = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+
+        // Producer writes 1,000,000 items while consumer is completely asleep
+        for i in 1..=1_000_000 {
+            producer.push(&i);
+        }
+
+        // Reader checks lag
+        assert_eq!(consumer.lag(), 1_000_000);
+
+        // Reader can jump directly to latest
+        let skipped = consumer.jump_to_latest();
+        assert_eq!(skipped, 999_999);
+        assert_eq!(consumer.try_recv(), Some(1_000_000));
         assert_eq!(consumer.try_recv(), None);
     }
 

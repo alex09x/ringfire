@@ -156,6 +156,16 @@ impl<T: Copy> AsyncRingConsumer<T> {
         }
     }
 
+    /// Jumps cursor directly to the latest published sequence, skipping any backlog.
+    pub fn jump_to_latest(&mut self) -> u64 {
+        self.inner.jump_to_latest()
+    }
+
+    /// Jumps cursor to the oldest message still surviving in the buffer.
+    pub fn jump_to_oldest(&mut self) -> u64 {
+        self.inner.jump_to_oldest()
+    }
+
     /// Total count of messages skipped due to writer lapping.
     #[inline]
     pub fn lapped_count(&self) -> u64 {

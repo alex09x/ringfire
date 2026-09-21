@@ -323,8 +323,19 @@ impl<T: Copy> RingConsumer<T> {
     /// Attempts to read the next message with explicit status (Ok, Empty, or Lapped).
     #[inline]
     pub fn recv_status(&mut self) -> RecvStatus<T> {
-        let idx = (self.cursor & self.mask) as usize;
         unsafe {
+            let mut skipped = 0;
+            let current_write = (*self.header).write_seq.load(Ordering::Acquire);
+
+            // If reader fell behind by more than buffer capacity, jump to oldest available
+            if current_write > self.cursor && (current_write - self.cursor) >= self.capacity {
+                let oldest = current_write - self.capacity + 1;
+                skipped = oldest - self.cursor;
+                self.lapped_total += skipped;
+                self.cursor = oldest;
+            }
+
+            let idx = (self.cursor & self.mask) as usize;
             let slot = self.slots.add(idx);
             let s1 = (*slot).seq.load(Ordering::Acquire);
 
@@ -332,10 +343,10 @@ impl<T: Copy> RingConsumer<T> {
                 return RecvStatus::Empty;
             }
 
-            let mut skipped = 0;
             if s1 > self.cursor {
-                skipped = s1 - self.cursor;
-                self.lapped_total += skipped;
+                let slot_skipped = s1 - self.cursor;
+                skipped += slot_skipped;
+                self.lapped_total += slot_skipped;
                 self.cursor = s1;
             }
 
@@ -419,6 +430,39 @@ impl<T: Copy> RingConsumer<T> {
             unsafe {
                 wait.wait(&*self.header, self.cursor);
             }
+        }
+    }
+
+    /// Jumps cursor directly to the latest published sequence, skipping any backlog.
+    /// Returns the count of skipped messages.
+    pub fn jump_to_latest(&mut self) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        if write_seq > self.cursor {
+            let skipped = write_seq - self.cursor;
+            self.lapped_total += skipped;
+            self.cursor = write_seq;
+            skipped
+        } else {
+            0
+        }
+    }
+
+    /// Jumps cursor to the oldest message still surviving in the buffer.
+    /// Returns the count of skipped messages.
+    pub fn jump_to_oldest(&mut self) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        let oldest = if write_seq > self.capacity {
+            write_seq - self.capacity + 1
+        } else {
+            1
+        };
+        if oldest > self.cursor {
+            let skipped = oldest - self.cursor;
+            self.lapped_total += skipped;
+            self.cursor = oldest;
+            skipped
+        } else {
+            0
         }
     }
 
