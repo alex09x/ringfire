@@ -171,6 +171,47 @@ if let Some(state) = bb_cons.read(42)? { // 4.09 ns O(1) tear-free read
 }
 ```
 
+### 5. Raw Binary Payloads (`[u8; N]`) & Pointer Casting
+
+You can also operate over raw byte buffers without declaring fixed structs:
+
+```rust
+use ringfire::{RingProducer, AsyncRingConsumer};
+
+// Producer sends a raw 64-byte binary packet
+let mut producer = RingProducer::<[u8; 64]>::create("/dev/shm/raw_stream", 65536)?;
+let raw_bytes = [0xAAu8; 64];
+producer.push(&raw_bytes);
+
+// Consumer reads the 64 bytes and casts to struct in-place
+let mut consumer = AsyncRingConsumer::<[u8; 64]>::attach("/dev/shm/raw_stream")?;
+let bytes: [u8; 64] = consumer.recv().await;
+let ticker: &MarketTicker = unsafe { &*(bytes.as_ptr() as *const MarketTicker) };
+```
+
+---
+
+## 🛡️ Memory Safety: Why Raw Pointers into Shared Memory Are Dangerous
+
+In cross-process shared memory with a non-blocking writer (`LatestWins`), returning a raw pointer (`*const T`) directly into the mapped `/dev/shm` buffer is **fundamentally unsafe**:
+- If a consumer holds a raw pointer to slot $K$, and the writer laps the buffer and begins overwriting slot $K$ on another CPU core, the consumer will observe a **torn read** (half old data, half new data).
+- In high-frequency trading and order book streaming, a torn read corrupts prices and sizes, leading to disastrous trading errors.
+
+### The `ringfire` Solution: Two-Phase Seqlock Validation
+`ringfire` enforces tear-free memory safety without locks:
+1. Consumer loads slot sequence $s_1$ with `Ordering::Acquire`.
+2. Copies the payload into the consumer's local registers/stack (takes **1 CPU clock cycle** for 32–64B via `vmovups`).
+3. Loads slot sequence $s_2$ with `Ordering::Acquire`.
+4. If $s_1 == s_2$, the copy is mathematically guaranteed to be **consistent, uncorrupted, and tear-free**.
+5. If $s_1 \neq s_2$ (writer updated the slot mid-read), the consumer immediately discards the partial copy and re-evaluates the latest sequence.
+
+> [!WARNING]
+> **Anti-Pattern: Returning Raw Pointers into Shared Memory (`*const T`)**
+> Some naive IPC designs attempt to return a direct pointer or slice `&[u8]` into `/dev/shm` to claim "zero-memcpy". In a multi-process architecture with a non-blocking writer (`LatestWins`), this is a dangerous anti-pattern: the writer can overwrite that memory slot at any microsecond while the reader is parsing it, causing undefined behavior, silent data races, and torn reads.
+> 
+> `ringfire` deliberately copies the slot payload into the reader's stack/register space inside a seqlock validation boundary (`s1 == s2`). For modern x86_64/ARM64 architectures, copying 32–64 bytes takes **~1 CPU clock cycle** (via `vmovups`) and is orders of magnitude faster than recovering from corrupted state or dealing with UB.
+
+
 ---
 
 ## ⚡ Wait Strategies
