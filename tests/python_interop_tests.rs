@@ -206,12 +206,88 @@ print("PYTHON_BLACKBOARD_OK")
         .expect("Failed to execute python3");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let _stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("PYTHON_BLACKBOARD_OK"));
+}
+
+#[test]
+fn test_python_consumer_shm_offset_resume() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_py_resume_ring_{}.shm", std::process::id()));
+    let offset_path = dir.join(format!("test_py_resume_offset_{}.offset", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
+
+    let mut producer = RingProducer::<PyTrade>::create(&ring_path, 1024).unwrap();
+    for i in 1..=20 {
+        producer.push(&PyTrade {
+            timestamp_ns: i * 1000,
+            price: i * 100,
+            quantity: 1,
+            side: b'B',
+            _pad: [0; 7],
+        });
+    }
+
+    let python_code = format!(
+        r#"
+import sys, ctypes
+sys.path.insert(0, 'python')
+from ringfire import RingConsumer
+
+class PyTrade(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("price", ctypes.c_uint64),
+        ("quantity", ctypes.c_uint64),
+        ("side", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+# 1. First run: read 10 items, commit offset, exit
+cons1 = RingConsumer('{ring}', PyTrade, offset_file='{offset}', consumer_name='py_bot')
+for expected in range(1, 11):
+    item = cons1.try_recv()
+    assert item is not None, f"Expected item {{expected}}, got None"
+    assert item.price == expected * 100
+cons1.commit_offset()
+assert cons1.last_processed_sequence() == 10
+cons1.close()
+
+# 2. Second run: resume from offset file. Must receive 11..20
+cons2 = RingConsumer('{ring}', PyTrade, offset_file='{offset}', consumer_name='py_bot')
+for expected in range(11, 21):
+    item = cons2.try_recv()
+    assert item is not None, f"Expected item {{expected}}, got None"
+    assert item.price == expected * 100
+assert cons2.try_recv() is None
+assert cons2.last_processed_sequence() == 20
+cons2.commit_offset()
+cons2.close()
+print("PYTHON_SHM_OFFSET_RESUME_OK")
+"#,
+        ring = ring_path.to_str().unwrap(),
+        offset = offset_path.to_str().unwrap()
+    );
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(&python_code)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to execute python3");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "Python blackboard read failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        "Python offset resume failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
         stdout,
         stderr
     );
-    assert!(stdout.contains("PYTHON_BLACKBOARD_OK"));
+    assert!(stdout.contains("PYTHON_SHM_OFFSET_RESUME_OK"));
+
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
 }
+

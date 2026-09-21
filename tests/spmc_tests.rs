@@ -109,3 +109,166 @@ fn test_cleanup_mode_unlink_vs_persistent() {
     assert!(tmp_persist.exists());
     let _ = std::fs::remove_file(&tmp_persist);
 }
+
+#[test]
+fn test_consumer_start_mode_latest_and_head() {
+    let tmp_path = std::env::temp_dir().join(format!("test_spmc_modes_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
+    // Publish 10 items
+    for i in 1..=10 {
+        producer.push(&i);
+    }
+
+    // 1. Latest mode: jumps directly to the latest published item (10), then reads subsequent items
+    let mut cons_latest = RingConsumer::<u64>::attach_latest(&tmp_path).unwrap();
+    assert_eq!(cons_latest.try_recv(), Some(10));
+    assert_eq!(cons_latest.try_recv(), None);
+
+    // 2. Head mode: strictly waits for future items (arriving after attach)
+    let mut cons_head = RingConsumer::<u64>::builder()
+        .start_from_head()
+        .attach(&tmp_path)
+        .unwrap();
+    assert_eq!(cons_head.try_recv(), None);
+
+    // Push new items 11 and 12
+    producer.push(&11);
+    producer.push(&12);
+
+    assert_eq!(cons_latest.try_recv(), Some(11));
+    assert_eq!(cons_latest.try_recv(), Some(12));
+
+    assert_eq!(cons_head.try_recv(), Some(11));
+    assert_eq!(cons_head.try_recv(), Some(12));
+
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+#[test]
+fn test_consumer_start_mode_oldest() {
+    let tmp_path = std::env::temp_dir().join(format!("test_spmc_oldest_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
+    for i in 1..=10 {
+        producer.push(&i);
+    }
+
+    // Oldest mode (default for attach) replays from item 1
+    let mut cons = RingConsumer::<u64>::attach(&tmp_path).unwrap();
+    for i in 1..=10 {
+        assert_eq!(cons.try_recv(), Some(i));
+    }
+    assert_eq!(cons.try_recv(), None);
+
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+#[test]
+fn test_shm_offset_checkpoint_crash_and_resume() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_spmc_resume_ring_{}.shm", std::process::id()));
+    let offset_path = dir.join(format!("test_spmc_resume_offset_{}.offset", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
+
+    let mut producer = RingProducer::<u64>::create(&ring_path, 1024).unwrap();
+    for i in 1..=50 {
+        producer.push(&i);
+    }
+
+    // Consumer 1: processes items 1..=25 and commits offset in shared memory
+    {
+        let mut cons1 = RingConsumer::<u64>::builder()
+            .offset_shm(&offset_path)
+            .consumer_name("worker_a")
+            .start_from_oldest()
+            .attach(&ring_path)
+            .unwrap();
+
+        for i in 1..=25 {
+            assert_eq!(cons1.try_recv(), Some(i));
+        }
+        assert_eq!(cons1.last_processed_sequence(), 25);
+        cons1.commit_offset().unwrap();
+        // cons1 dropped (simulating process exit/crash)
+    }
+
+    // Consumer 2: starts with same offset file. Must resume strictly from 26!
+    {
+        let mut cons2 = RingConsumer::<u64>::builder()
+            .offset_shm(&offset_path)
+            .consumer_name("worker_a")
+            .attach(&ring_path)
+            .unwrap();
+
+        for i in 26..=50 {
+            assert_eq!(cons2.try_recv(), Some(i), "Discontinuity during resume at {}", i);
+        }
+        assert_eq!(cons2.try_recv(), None);
+        assert_eq!(cons2.last_processed_sequence(), 50);
+        cons2.commit_offset().unwrap();
+    }
+
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
+}
+
+#[test]
+fn test_shm_offset_lapping_recovery() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_spmc_lap_rec_ring_{}.shm", std::process::id()));
+    let offset_path = dir.join(format!("test_spmc_lap_rec_offset_{}.offset", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
+
+    let capacity = 32;
+    let mut producer = RingProducer::<u64>::create(&ring_path, capacity).unwrap();
+    for i in 1..=10 {
+        producer.push(&i);
+    }
+
+    // Commit offset at sequence 5
+    {
+        let mut cons1 = RingConsumer::<u64>::builder()
+            .offset_shm(&offset_path)
+            .consumer_name("slow_worker")
+            .start_from_oldest()
+            .attach(&ring_path)
+            .unwrap();
+
+        for i in 1..=5 {
+            assert_eq!(cons1.try_recv(), Some(i));
+        }
+        cons1.commit_offset().unwrap();
+    }
+
+    // Producer laps consumer by writing up to 100 in capacity 32 buffer
+    for i in 11..=100 {
+        producer.push(&i);
+    }
+
+    // Surviving range in buffer is: 100 - 32 + 1 = 69..=100.
+    // Consumer committed at 5, wants 6. But 6 was overwritten!
+    // Consumer must detect lapping and catch up to oldest available (69)
+    {
+        let mut cons2 = RingConsumer::<u64>::builder()
+            .offset_shm(&offset_path)
+            .consumer_name("slow_worker")
+            .attach(&ring_path)
+            .unwrap();
+
+        assert_eq!(cons2.lapped_count(), 69 - 6); // 63 messages skipped
+        assert_eq!(cons2.try_recv(), Some(69));
+        for i in 70..=100 {
+            assert_eq!(cons2.try_recv(), Some(i));
+        }
+        assert_eq!(cons2.try_recv(), None);
+    }
+
+    let _ = std::fs::remove_file(&ring_path);
+    let _ = std::fs::remove_file(&offset_path);
+}
+
