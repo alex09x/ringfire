@@ -1,0 +1,22 @@
+[package]
+name = "ringfire"
+authors = ["alex09x <alex@prod.codes>"]
+version = "0.1.0"
+edition = "2024"
+description = "Zero-copy lock-free inter-process communication (IPC) ring buffer and shared memory bus in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alex09x/ringfire"
+readme = "README.md"
+keywords = ["ipc", "shared-memory", "lock-free", "ring-buffer", "hft"]
+categories = ["concurrency", "asynchronous"]
+
+[dependencies]
+memmap2 = "0.9"
+
+[dev-dependencies]
+criterion = { version = "0.5" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
