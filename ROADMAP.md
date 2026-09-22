@@ -105,3 +105,41 @@ pub struct Slot<T> {
   - **Ping-Pong RTT Latency**: **245.80 ns** round-trip across threads via shared memory (~61 ns one-way)
   - **Blackboard Read**: **4.09 ns**
   - **Blackboard Write**: **1.19 ns**
+
+### Phase 6: Variable-Length Payload Arena, Reader Registry & Checkpoints (v0.2.0)
+- [x] **Variable-Length Payload Arena (`PayloadArena`, `BlobProducer`, `BlobConsumer`)**:
+  - Contiguous cyclic shared-memory byte arena inspired by Firedancer `dcache`.
+  - Zero memory fragmentation with ring-boundary wrapping to index 0.
+  - In-place reading directly from shared memory without intermediate copies.
+- [x] **Lock-Free Reader Registry (`ReaderRegistry`, `ReaderRegistration`)**:
+  - Shared memory registration table tracking active readers, cursors, and lag.
+  - Automatic reclamation of departed or crashed consumer processes.
+- [x] **CycleStamp High-Resolution Timestamps**:
+  - Zero-syscall cycle counters using x86-64 `rdtsc` and AArch64 `cntvct_el0`.
+- [x] **Consumer Start Modes (`ConsumerStartMode`)**:
+  - `Latest`: Jump immediately to latest message for HFT and live trading bots.
+  - `Head`: Wait only for future messages.
+  - `Oldest`: Replay from oldest retained message.
+  - `Sequence(u64)`: Replay from exact sequence with automatic lapping detection.
+- [x] **Lock-Free SHM Offset Checkpoint (`OffsetCheckpoint`)**:
+  - Sub-10ns offset commits in `/dev/shm` using 64-bit seqlock.
+  - Tear-free cross-process crash recovery.
+
+### Phase 7: Advanced Flow Control, Channel Multiplexing & Observability (v0.3.0)
+- [x] **Lossless Backpressure Flow Control (`FlowControl::LosslessBackpressure`)**:
+  - Configurable flow control policy via `RingProducerBuilder::flow_control`.
+  - Writers throttle via spin/yield backoff when slowest reader is within capacity window.
+  - Non-blocking `try_push()` returns `Err(RingfireError::BackpressureBufferFull)`.
+- [x] **Channel Multiplexing (`RingMultiplexer` & `AsyncRingMultiplexer`)**:
+  - Fair Round-Robin polling across multiple ring buffer channels (`try_recv_any`).
+  - Strict Priority scheduling across critical channels (`try_recv_priority`).
+  - Batch draining (`recv_batch_any`) and cooperative Tokio async integration (`recv_any().await`).
+- [x] **Python Variable-Length Blob Support (`BlobConsumer`)**:
+  - Zero-copy Python reading from `PayloadArena` via `memoryview`.
+  - Full interop test suite verifying Rust `BlobProducer` to Python `BlobConsumer`.
+- [x] **CLI Monitoring & Diagnostics Tool (`ringfire`)**:
+  - `stat`: Inspect buffer headers, sequence state, arena, and reader lag (table or `--json`).
+  - `top`: Interactive real-time terminal dashboard with msg/s throughput and reader lag.
+  - `dump`: Inspect recent slots and hex/ASCII payload snippets.
+  - `prune`: Clean up dead reader slots whose processes have terminated.
+

@@ -78,29 +78,28 @@ impl ReaderRegistry {
             let is_free = pid == 0;
             let is_dead = pid != 0 && !is_process_alive(pid);
 
-            if is_free || is_dead {
-                if slot
+            if (is_free || is_dead)
+                && slot
                     .pid
                     .compare_exchange(pid, current_pid, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
-                {
-                    slot.cursor_seq.store(initial_cursor, Ordering::Relaxed);
-                    slot.heartbeat_tsc.store(0, Ordering::Relaxed);
+            {
+                slot.cursor_seq.store(initial_cursor, Ordering::Relaxed);
+                slot.heartbeat_tsc.store(0, Ordering::Relaxed);
 
-                    let slot_mut = unsafe { &mut *self.slots.add(i) };
-                    let mut name_buf = [0u8; 32];
-                    let bytes = name.as_bytes();
-                    let len = bytes.len().min(31);
-                    name_buf[..len].copy_from_slice(&bytes[..len]);
-                    slot_mut.name = name_buf;
+                let slot_mut = unsafe { &mut *self.slots.add(i) };
+                let mut name_buf = [0u8; 32];
+                let bytes = name.as_bytes();
+                let len = bytes.len().min(31);
+                name_buf[..len].copy_from_slice(&bytes[..len]);
+                slot_mut.name = name_buf;
 
-                    slot.active.store(1, Ordering::Release);
+                slot.active.store(1, Ordering::Release);
 
-                    return Ok(ReaderRegistration {
-                        slot_index: i,
-                        slot: self.slots,
-                    });
-                }
+                return Ok(ReaderRegistration {
+                    slot_index: i,
+                    slot: self.slots,
+                });
             }
         }
 

@@ -271,3 +271,85 @@ fn test_shm_offset_lapping_recovery() {
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 }
+
+#[test]
+fn test_flow_control_lossless_backpressure() {
+    use ringfire::{FlowControl, RingfireError};
+
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_spmc_backpressure_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+
+    let capacity = 16;
+    let mut producer = RingProducer::<u64>::create_with_options(
+        &ring_path,
+        RingProducerBuilder::new(capacity)
+            .flow_control(FlowControl::LosslessBackpressure)
+            .max_readers(8),
+    )
+    .unwrap();
+
+    assert_eq!(producer.flow_control(), FlowControl::LosslessBackpressure);
+    assert_eq!(producer.headroom(), capacity);
+
+    // Attach consumer
+    let mut consumer = RingConsumer::<u64>::builder()
+        .consumer_name("careful_reader")
+        .start_from_oldest()
+        .attach(&ring_path)
+        .unwrap();
+
+    assert!(consumer.registration().is_some());
+    assert_eq!(producer.registry().unwrap().active_readers(0).len(), 1);
+
+    // Push 16 items to fill the buffer exactly
+    for i in 1..=16 {
+        producer.push(&i);
+    }
+
+    assert_eq!(producer.headroom(), 0);
+    assert_eq!(producer.reader_lag(), 16);
+
+    // 17th item should fail with BackpressureBufferFull via try_push
+    let res = producer.try_push(&17);
+    match res {
+        Err(RingfireError::BackpressureBufferFull) => {}
+        other => panic!("Expected BackpressureBufferFull, got {:?}", other),
+    }
+
+    // Spawn thread to drain first 8 messages from consumer
+    let drain_handle = thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(20));
+        let mut drained = Vec::new();
+        for _ in 0..8 {
+            if let Some(item) = consumer.try_recv() {
+                drained.push(item);
+            }
+        }
+        (consumer, drained)
+    });
+
+    // Blocking push(17) should unblock once reader drains items
+    producer.push(&17);
+    assert_eq!(producer.headroom(), 7);
+
+    let (mut consumer, drained) = drain_handle.join().unwrap();
+    assert_eq!(drained.len(), 8);
+    assert_eq!(drained, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // Drain remainder from consumer: 9..=17
+    let mut rest = Vec::new();
+    for _ in 9..=17 {
+        if let Some(item) = consumer.try_recv() {
+            rest.push(item);
+        }
+    }
+    assert_eq!(rest, vec![9, 10, 11, 12, 13, 14, 15, 16, 17]);
+    assert_eq!(consumer.lapped_count(), 0); // Zero dropped messages under backpressure
+
+    // Drop consumer; dead reader slot is reclaimed and headroom returns to full capacity
+    drop(consumer);
+    assert_eq!(producer.headroom(), capacity);
+
+    let _ = std::fs::remove_file(&ring_path);
+}

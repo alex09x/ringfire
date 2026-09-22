@@ -242,6 +242,7 @@ impl PayloadArena {
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn slice_mut(&self, blob_ref: BlobRef) -> &mut [u8] {
         let offset = (blob_ref.offset & (self.mask as u64)) as usize;
         unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), blob_ref.len as usize) }

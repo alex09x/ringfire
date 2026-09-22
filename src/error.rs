@@ -34,6 +34,8 @@ pub enum RingfireError {
     NoAvailableReaderSlots,
     /// No offset file was configured for this consumer.
     NoOffsetFileConfigured,
+    /// Ring buffer is full under lossless backpressure flow control.
+    BackpressureBufferFull,
 }
 
 impl fmt::Display for RingfireError {
@@ -87,6 +89,9 @@ impl fmt::Display for RingfireError {
             }
             Self::NoOffsetFileConfigured => {
                 write!(f, "No offset file configured for this consumer")
+            }
+            Self::BackpressureBufferFull => {
+                write!(f, "Ring buffer is full: slowest active reader has not caught up")
             }
         }
     }

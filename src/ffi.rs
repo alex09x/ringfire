@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc, clippy::manual_div_ceil)]
+
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::os::raw::c_char;

@@ -1,4 +1,4 @@
-use ringfire::{BlackboardProducer, RingConsumer, RingProducer};
+use ringfire::{BlackboardProducer, BlobProducer, RingConsumer, RingProducer};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,14 +21,14 @@ fn test_rust_producer_to_python_consumer() {
 
     let t1 = PyTrade {
         timestamp_ns: 1_000_000_000,
-        price: 85000_50,
+        price: 8_500_050,
         quantity: 150,
         side: b'B',
         _pad: [0; 7],
     };
     let t2 = PyTrade {
         timestamp_ns: 1_000_000_100,
-        price: 85001_00,
+        price: 8_500_100,
         quantity: 200,
         side: b'S',
         _pad: [0; 7],
@@ -431,6 +431,104 @@ print("PYTHON_START_MODE_VALIDATION_OK")
         stderr
     );
     assert!(stdout.contains("PYTHON_START_MODE_VALIDATION_OK"));
+
+    let _ = std::fs::remove_file(&ring_path);
+}
+
+#[test]
+fn test_rust_blob_producer_to_python_blob_consumer() {
+    let dir = std::env::temp_dir();
+    let ring_path = dir.join(format!("test_py_blob_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&ring_path);
+
+    let capacity = 64;
+    let arena_capacity = 65536; // 64 KB arena
+    let mut producer = BlobProducer::<PyTrade>::create(&ring_path, capacity, arena_capacity).unwrap();
+
+    let t1 = PyTrade {
+        timestamp_ns: 1_000_000,
+        price: 8_800_050,
+        quantity: 10,
+        side: b'B',
+        _pad: [0; 7],
+    };
+    let payload1 = b"Hello from Rust BlobProducer variable payload!";
+
+    let t2 = PyTrade {
+        timestamp_ns: 2_000_000,
+        price: 8_805_000,
+        quantity: 25,
+        side: b'S',
+        _pad: [0; 7],
+    };
+    let payload2 = vec![0xABu8; 1024]; // 1 KB binary chunk
+
+    producer.push(&t1, payload1).unwrap();
+    producer.push(&t2, &payload2).unwrap();
+
+    let python_code = format!(
+        r#"
+import sys, ctypes
+sys.path.insert(0, 'python')
+from ringfire import BlobConsumer
+
+class PyTrade(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("price", ctypes.c_uint64),
+        ("quantity", ctypes.c_uint64),
+        ("side", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+consumer = BlobConsumer('{ring}', PyTrade)
+
+# Packet 1
+res1 = consumer.try_recv()
+assert res1 is not None, "Expected packet 1"
+meta1, view1 = res1
+assert meta1.timestamp_ns == 1000000
+assert meta1.price == 8800050
+assert meta1.quantity == 10
+assert meta1.side == ord('B')
+assert view1.tobytes() == b"Hello from Rust BlobProducer variable payload!"
+
+# Packet 2
+res2 = consumer.try_recv()
+assert res2 is not None, "Expected packet 2"
+meta2, view2 = res2
+assert meta2.timestamp_ns == 2000000
+assert meta2.price == 8805000
+assert meta2.quantity == 25
+assert meta2.side == ord('S')
+assert len(view2) == 1024
+assert view2[0] == 0xAB and view2[1023] == 0xAB
+
+# Empty
+assert consumer.try_recv() is None
+
+consumer.close()
+print("PYTHON_BLOB_CONSUMER_OK")
+"#,
+        ring = ring_path.to_str().unwrap()
+    );
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(&python_code)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to execute python3");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python BlobConsumer failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("PYTHON_BLOB_CONSUMER_OK"));
 
     let _ = std::fs::remove_file(&ring_path);
 }

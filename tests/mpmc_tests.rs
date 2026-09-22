@@ -63,8 +63,8 @@ fn test_mpmc_concurrent_producers() {
     }
 
     assert_eq!(received_count, total_msgs);
-    for pid in 0..num_producers {
-        assert_eq!(per_prod_seen[pid].len(), msgs_per_prod);
+    for seen in per_prod_seen.iter().take(num_producers) {
+        assert_eq!(seen.len(), msgs_per_prod);
     }
 }
 

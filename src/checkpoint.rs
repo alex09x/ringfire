@@ -62,10 +62,10 @@ impl OffsetCheckpoint {
     /// If the file exists, its magic and version are validated, and its PID updated.
     pub fn open_or_create<P: AsRef<Path>>(path: P, consumer_name: &str) -> io::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        if let Some(parent) = path_buf.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        if let Some(parent) = path_buf.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
         }
 
         let file = OpenOptions::new()

@@ -21,8 +21,8 @@ fn bench_blackboard(c: &mut Criterion) {
 
     let bbo = SymbolBbo {
         symbol_id: 42,
-        bid_px: 82500_00,
-        ask_px: 82501_00,
+        bid_px: 8_250_000,
+        ask_px: 8_250_100,
         bid_sz: 1000,
         ask_sz: 800,
     };

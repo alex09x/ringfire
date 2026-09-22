@@ -45,11 +45,11 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
             prod_fwd.push(black_box(&msg));
 
             loop {
-                if let Some(resp) = cons_rev.try_recv() {
-                    if resp.seq == ping_seq {
-                        black_box(resp);
-                        break;
-                    }
+                if let Some(resp) = cons_rev.try_recv()
+                    && resp.seq == ping_seq
+                {
+                    black_box(resp);
+                    break;
                 }
                 core::hint::spin_loop();
             }

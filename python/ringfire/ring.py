@@ -25,8 +25,12 @@ class RingHeader(ctypes.Structure):
         ("waiting_consumers", ctypes.c_uint32),
         ("_align_pad", ctypes.c_uint32),
         ("read_seq", ctypes.c_uint64),
-        ("_reserved", ctypes.c_uint64),
-        ("_pad", ctypes.c_uint8 * 48),
+        ("schema_sig", ctypes.c_uint64),
+        ("arena_offset", ctypes.c_uint64),
+        ("arena_size", ctypes.c_uint64),
+        ("reader_registry_offset", ctypes.c_uint32),
+        ("reader_registry_count", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint8 * 24),
     ]
 
 class RecvStatus(Enum):
@@ -69,7 +73,10 @@ class RingConsumer:
         self.slot_stride = self.header.element_size
         self.capacity = self.header.capacity
         self.mask = self.header.mask
-        self.slots_offset = HEADER_SIZE
+        if self.header.reader_registry_offset != 0:
+            self.slots_offset = self.header.reader_registry_offset + (self.header.reader_registry_count * 64)
+        else:
+            self.slots_offset = HEADER_SIZE
 
         write_seq = self.header.write_seq
         oldest = (write_seq - self.capacity + 1) if write_seq > self.capacity else 1
@@ -306,3 +313,117 @@ class RingProducer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+class BlobConsumer:
+    """Zero-copy reader for variable-sized binary payloads in ringfire shared memory."""
+
+    def __init__(
+        self,
+        path: str,
+        meta_cls: Type[ctypes.Structure],
+        consumer_name: Optional[str] = None,
+    ):
+        self.path = path
+        self.meta_cls = meta_cls
+        self.meta_size = ctypes.sizeof(meta_cls)
+
+        self.fd = os.open(path, os.O_RDWR)
+        file_size = os.fstat(self.fd).st_size
+        self.mm = mmap.mmap(self.fd, file_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+
+        self.header = RingHeader.from_buffer(self.mm, 0)
+        if self.header.magic != RINGFIRE_MAGIC:
+            raise ValueError(f"Invalid magic: expected 0x{RINGFIRE_MAGIC:016X}, got 0x{self.header.magic:016X}")
+        if self.header.version != RINGFIRE_VERSION:
+            raise ValueError(f"Version mismatch: {self.header.version}")
+        if self.header.arena_offset == 0:
+            raise ValueError("Queue does not contain a PayloadArena")
+
+        self.capacity = self.header.capacity
+        self.mask = self.header.mask
+        self.slot_stride = self.header.element_size
+
+        # Slot layout
+        reg_offset = self.header.reader_registry_offset
+        reg_count = self.header.reader_registry_count
+        if reg_offset != 0:
+            self.slots_offset = reg_offset + (reg_count * 64)
+        else:
+            self.slots_offset = HEADER_SIZE
+
+        # Arena layout
+        self.arena_offset = self.header.arena_offset
+        self.arena_size = self.header.arena_size
+        # ArenaHeader: magic (8), capacity (8), mask (8), write_head (8), pad (32)
+        self.arena_mask = struct.unpack_from("<Q", self.mm, self.arena_offset + 16)[0]
+        self.arena_data_offset = self.arena_offset + 64
+
+        # Padding between meta and blob_ref (aligned to 8 bytes)
+        self.blob_ref_padding = ((self.meta_size + 7) // 8) * 8 - self.meta_size
+
+        # Default cursor: start from oldest
+        write_seq = self.header.write_seq
+        self.cursor = (write_seq - self.capacity + 1) if write_seq > self.capacity else 1
+        self.lapped_count = 0
+
+    def try_recv(self) -> Optional[Tuple[ctypes.Structure, memoryview]]:
+        """Reads the next available (metadata, payload) tuple without blocking."""
+        slot_off = self.slots_offset + (self.cursor & self.mask) * self.slot_stride
+        seq_before = struct.unpack_from("<Q", self.mm, slot_off)[0]
+
+        if seq_before < self.cursor:
+            return None
+
+        if seq_before > self.cursor:
+            self.lapped_count += seq_before - self.cursor
+            self.cursor = seq_before
+            slot_off = self.slots_offset + (self.cursor & self.mask) * self.slot_stride
+            seq_before = struct.unpack_from("<Q", self.mm, slot_off)[0]
+            if seq_before != self.cursor:
+                return None
+
+        # Read meta
+        meta_off = slot_off + 8
+        meta = self.meta_cls.from_buffer_copy(self.mm, meta_off)
+
+        # Read BlobRef (offset: u64, len: u32, flags: u32)
+        ref_off = meta_off + self.meta_size + self.blob_ref_padding
+        blob_offset, blob_len, blob_flags = struct.unpack_from("<QII", self.mm, ref_off)
+
+        # Seqlock validation
+        seq_after = struct.unpack_from("<Q", self.mm, slot_off)[0]
+        if seq_after != seq_before:
+            return None
+
+        self.cursor += 1
+
+        if blob_len == 0:
+            return meta, memoryview(b"")
+
+        phys_offset = blob_offset & self.arena_mask
+        start = self.arena_data_offset + phys_offset
+        end = start + blob_len
+        payload_view = memoryview(self.mm)[start:end]
+
+        return meta, payload_view
+
+    def close(self):
+        if hasattr(self, "mm") and self.mm is not None:
+            try:
+                self.mm.close()
+            except BufferError:
+                pass
+        if hasattr(self, "fd") and self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+

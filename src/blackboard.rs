@@ -104,7 +104,7 @@ impl<V: Copy> BlackboardProducer<V> {
         unsafe {
             let slot = self.slots.add(key);
             let s = (*slot).seqlock.load(Ordering::Relaxed);
-            let write_s = if s % 2 == 0 { s + 1 } else { s + 2 };
+            let write_s = if (s & 1) == 0 { s + 1 } else { s + 2 };
 
             // Step 1: Mark write in progress (odd seqlock)
             (*slot).seqlock.store(write_s, Ordering::Release);

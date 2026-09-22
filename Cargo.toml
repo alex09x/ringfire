@@ -1,7 +1,7 @@
 [package]
 name = "ringfire"
 authors = ["alex09x <alex@prod.codes>"]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Zero-copy lock-free inter-process communication (IPC) ring buffer and shared memory bus in Rust"
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,10 @@ categories = ["concurrency", "asynchronous"]
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "ringfire"
+path = "src/bin/ringfire.rs"
 
 [dependencies]
 memmap2 = "0.9"

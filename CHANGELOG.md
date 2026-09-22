@@ -5,6 +5,26 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-22
+
+### Added
+- **Lossless Backpressure Flow Control (`FlowControl::LosslessBackpressure`)**:
+  - Optional lossless flow control policy configured via `RingProducerBuilder::flow_control(FlowControl::LosslessBackpressure)`.
+  - Producer coordinates with `ReaderRegistry` to guarantee the slowest active reader is never overwritten.
+  - Blocking `push()` automatically throttles via spin/yield backoff when headroom is exhausted; non-blocking `try_push()` returns `Err(RingfireError::BackpressureBufferFull)`.
+  - Verified safe RAII drop order ensuring shared memory remains mapped while registry slots are deregistered.
+- **Channel Multiplexing (`RingMultiplexer` & `AsyncRingMultiplexer`)**:
+  - `RingMultiplexer`: Multi-channel ingestion engine supporting fair Round-Robin polling (`try_recv_any`), strict Priority scheduling (`try_recv_priority`), and batch draining (`recv_batch_any`) across multiple distinct ring buffers.
+  - `AsyncRingMultiplexer`: Cooperative Tokio async multiplexer (`recv_any().await`) with zero task starvation.
+- **Python Variable-Length Payload Support (`BlobConsumer`)**:
+  - Implemented `BlobConsumer` in `python/ringfire` returning `(metadata, memoryview)` directly into the mapped `PayloadArena` with zero memory copies.
+- **CLI Monitoring & Diagnostics Tool (`ringfire`)**:
+  - Zero-dependency diagnostics binary:
+    - `stat`: Inspect buffer headers, sequence state, arena allocation, and reader lag (human-readable or `--json`).
+    - `top`: Real-time terminal dashboard with instantaneous message rate (`msg/s`), throughput (`MB/s`), and consumer lag.
+    - `dump`: Inspect recent slots and hex/ASCII payload snippets.
+    - `prune`: Clean up and reclaim abandoned reader slots from terminated processes.
+
 ## [0.2.0] - 2026-09-21
 
 ### Added

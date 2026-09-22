@@ -8,7 +8,11 @@ use memmap2::MmapMut;
 
 use crate::checkpoint::OffsetCheckpoint;
 use crate::error::{Result, RingfireError};
-use crate::header::{RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION};
+use crate::header::{
+    RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, FLAG_POLICY_LOSSLESS_BACKPRESSURE,
+    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+};
+use crate::registry::{ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
 use crate::signature::LayoutSignature;
 use crate::wait::{wake_futex, WaitStrategy};
 
@@ -19,6 +23,15 @@ pub enum CleanupMode {
     UnlinkOnDrop,
     /// Keep the file on disk/shm across process termination.
     Persistent,
+}
+
+/// Flow control policy for ring buffer publishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowControl {
+    /// Writer always writes; lagging readers are lapped (LatestWins, lossy).
+    LossyLatestWins,
+    /// Writer paces itself and waits if writing would overwrite the slowest active registered reader (guaranteed delivery).
+    LosslessBackpressure,
 }
 
 /// Status returned by `RingConsumer::recv_status`.
@@ -36,6 +49,8 @@ pub enum RecvStatus<T> {
 pub struct RingProducerBuilder {
     capacity: u64,
     cleanup_mode: CleanupMode,
+    flow_control: FlowControl,
+    max_readers: usize,
     mode: u32,
     exclusive_lock: bool,
 }
@@ -45,6 +60,8 @@ impl RingProducerBuilder {
         Self {
             capacity,
             cleanup_mode: CleanupMode::UnlinkOnDrop,
+            flow_control: FlowControl::LossyLatestWins,
+            max_readers: 0,
             mode: 0o660,
             exclusive_lock: true,
         }
@@ -52,6 +69,19 @@ impl RingProducerBuilder {
 
     pub fn cleanup_mode(mut self, mode: CleanupMode) -> Self {
         self.cleanup_mode = mode;
+        self
+    }
+
+    pub fn flow_control(mut self, flow_control: FlowControl) -> Self {
+        self.flow_control = flow_control;
+        if flow_control == FlowControl::LosslessBackpressure && self.max_readers == 0 {
+            self.max_readers = DEFAULT_MAX_READERS;
+        }
+        self
+    }
+
+    pub fn max_readers(mut self, max: usize) -> Self {
+        self.max_readers = max;
         self
     }
 
@@ -74,14 +104,16 @@ impl RingProducerBuilder {
 pub struct RingProducer<T: Copy + 'static> {
     path: PathBuf,
     file: Option<File>,
-    _mmap: MmapMut,
     header: *mut RingHeader,
     slots: *mut Slot<T>,
     capacity: u64,
     mask: u64,
     seq: u64,
     cleanup_mode: CleanupMode,
+    flow_control: FlowControl,
+    registry: Option<ReaderRegistry>,
     _marker: PhantomData<T>,
+    _mmap: MmapMut,
 }
 
 unsafe impl<T: Copy + Send + 'static> Send for RingProducer<T> {}
@@ -103,8 +135,15 @@ impl<T: Copy + 'static> RingProducer<T> {
             return Err(RingfireError::InvalidCapacity(capacity));
         }
 
+        let max_readers = options.max_readers;
+        let registry_bytes = if max_readers > 0 {
+            max_readers * std::mem::size_of::<crate::header::ReaderSlot>()
+        } else {
+            0
+        };
+
         let slot_size = std::mem::size_of::<Slot<T>>();
-        let total_size = std::mem::size_of::<RingHeader>() + (capacity as usize * slot_size);
+        let total_size = std::mem::size_of::<RingHeader>() + registry_bytes + (capacity as usize * slot_size);
 
         let path_buf = path.as_ref().to_path_buf();
 
@@ -128,6 +167,16 @@ impl<T: Copy + 'static> RingProducer<T> {
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
+        let flags = (match options.flow_control {
+            FlowControl::LossyLatestWins => FLAG_POLICY_LATEST_WINS,
+            FlowControl::LosslessBackpressure => FLAG_POLICY_LOSSLESS_BACKPRESSURE,
+        }) | FLAG_MODE_SPMC
+            | (if max_readers > 0 {
+                FLAG_WITH_REGISTRY
+            } else {
+                0
+            });
+
         let header_ptr = mmap.as_mut_ptr().cast::<RingHeader>();
         unsafe {
             header_ptr.write(RingHeader {
@@ -138,7 +187,7 @@ impl<T: Copy + 'static> RingProducer<T> {
                 mask: capacity - 1,
                 write_seq: std::sync::atomic::AtomicU64::new(0),
                 claim_seq: std::sync::atomic::AtomicU64::new(0),
-                flags: FLAG_POLICY_LATEST_WINS | FLAG_MODE_SPMC,
+                flags,
                 futex_word: std::sync::atomic::AtomicU32::new(0),
                 waiting_consumers: std::sync::atomic::AtomicU32::new(0),
                 _align_pad: 0,
@@ -146,15 +195,27 @@ impl<T: Copy + 'static> RingProducer<T> {
                 schema_sig: T::layout_signature(),
                 arena_offset: 0,
                 arena_size: 0,
-                reader_registry_offset: 0,
-                reader_registry_count: 0,
+                reader_registry_offset: if max_readers > 0 {
+                    std::mem::size_of::<RingHeader>() as u32
+                } else {
+                    0
+                },
+                reader_registry_count: max_readers as u32,
                 _pad: [0; 24],
             });
         }
 
+        let registry = if max_readers > 0 {
+            let reg_ptr = unsafe { mmap.as_mut_ptr().add(std::mem::size_of::<RingHeader>()) };
+            let reg = unsafe { ReaderRegistry::init(reg_ptr, max_readers) };
+            Some(reg)
+        } else {
+            None
+        };
+
         let slots_ptr = unsafe {
             mmap.as_mut_ptr()
-                .add(std::mem::size_of::<RingHeader>())
+                .add(std::mem::size_of::<RingHeader>() + registry_bytes)
                 .cast::<Slot<T>>()
         };
 
@@ -176,23 +237,109 @@ impl<T: Copy + 'static> RingProducer<T> {
             mask: capacity - 1,
             seq: 1,
             cleanup_mode: options.cleanup_mode,
+            flow_control: options.flow_control,
+            registry,
             _marker: PhantomData,
         })
     }
 
     /// Publishes a message into the ring buffer.
+    /// Under `FlowControl::LosslessBackpressure`, waits if writing would overwrite the slowest active registered reader.
     /// Uses release ordering so consumers see the complete payload.
     #[inline(always)]
     pub fn push(&mut self, item: &T) {
+        if self.flow_control == FlowControl::LosslessBackpressure {
+            self.wait_for_headroom();
+        }
+
         let idx = (self.seq & self.mask) as usize;
         unsafe {
             let slot = self.slots.add(idx);
             std::ptr::copy_nonoverlapping(item, &mut (*slot).data, 1);
             (*slot).seq.store(self.seq, Ordering::Release);
             (*self.header).write_seq.store(self.seq, Ordering::Release);
-            wake_futex(&*self.header, 1);
+
+            if (*self.header).waiting_consumers.load(Ordering::Relaxed) > 0 {
+                wake_futex(&*self.header, 1);
+            }
         }
         self.seq += 1;
+    }
+
+    /// Attempts to publish a message into the ring buffer without blocking.
+    /// Under `FlowControl::LosslessBackpressure`, returns `Err(RingfireError::BackpressureBufferFull)`
+    /// if the buffer is full and would overwrite the slowest reader.
+    #[inline]
+    pub fn try_push(&mut self, item: &T) -> Result<()> {
+        if self.flow_control == FlowControl::LosslessBackpressure
+            && let Some(min_seq) = self.registry.as_ref().and_then(|reg| reg.min_reader_seq())
+        {
+            let next_seq = self.seq;
+            if next_seq >= self.capacity && (next_seq - self.capacity + 1) > min_seq {
+                return Err(RingfireError::BackpressureBufferFull);
+            }
+        }
+        self.push(item);
+        Ok(())
+    }
+
+    /// Blocks until there is room to write without overwriting the slowest active registered reader.
+    #[cold]
+    #[inline(never)]
+    pub fn wait_for_headroom(&self) {
+        if let Some(ref reg) = self.registry {
+            let mut spins = 0u32;
+            loop {
+                if let Some(min_seq) = reg.min_reader_seq() {
+                    let next_seq = self.seq;
+                    if next_seq >= self.capacity && (next_seq - self.capacity + 1) > min_seq {
+                        spins += 1;
+                        if spins < 100 {
+                            core::hint::spin_loop();
+                        } else if spins < 1000 {
+                            std::thread::yield_now();
+                        } else {
+                            reg.prune_dead_readers();
+                            std::thread::sleep(std::time::Duration::from_micros(10));
+                        }
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Returns the configured flow control mode.
+    #[inline]
+    pub fn flow_control(&self) -> FlowControl {
+        self.flow_control
+    }
+
+    /// Returns a reference to the shared-memory `ReaderRegistry` if enabled.
+    #[inline]
+    pub fn registry(&self) -> Option<&ReaderRegistry> {
+        self.registry.as_ref()
+    }
+
+    /// Available write headroom (number of messages before the slowest active reader is lapped).
+    #[inline]
+    pub fn headroom(&self) -> u64 {
+        if let Some(ref reg) = self.registry {
+            reg.headroom(self.seq, self.capacity)
+        } else {
+            self.capacity
+        }
+    }
+
+    /// Maximum lag across all active readers in messages.
+    #[inline]
+    pub fn reader_lag(&self) -> u64 {
+        if let Some(ref reg) = self.registry {
+            reg.reader_lag(self.seq)
+        } else {
+            0
+        }
     }
 
     /// Publishes a batch of messages consecutively into the ring buffer.
@@ -384,7 +531,6 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumerBuilder<T> {
 
 /// Multi-consumer ring buffer reader backed by shared memory (`/dev/shm`).
 pub struct RingConsumer<T: Copy + 'static> {
-    _mmap: MmapMut,
     header: *const RingHeader,
     slots: *const Slot<T>,
     capacity: u64,
@@ -392,7 +538,10 @@ pub struct RingConsumer<T: Copy + 'static> {
     cursor: u64,
     lapped_total: u64,
     checkpoint: Option<OffsetCheckpoint>,
+    registry: Option<ReaderRegistry>,
+    registration: Option<ReaderRegistration>,
     _marker: PhantomData<T>,
+    _mmap: MmapMut,
 }
 
 unsafe impl<T: Copy + Send + 'static> Send for RingConsumer<T> {}
@@ -448,7 +597,7 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     ) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let header_ptr = mmap.as_ptr().cast::<RingHeader>();
         let header = unsafe { &*header_ptr };
@@ -486,9 +635,15 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
 
         let capacity = header.capacity;
         let mask = header.mask;
+        let slots_offset = if header.reader_registry_offset != 0 {
+            header.reader_registry_offset as usize
+                + (header.reader_registry_count as usize * std::mem::size_of::<crate::header::ReaderSlot>())
+        } else {
+            std::mem::size_of::<RingHeader>()
+        };
         let slots_ptr = unsafe {
             mmap.as_ptr()
-                .add(std::mem::size_of::<RingHeader>())
+                .add(slots_offset)
                 .cast::<Slot<T>>()
         };
 
@@ -552,6 +707,20 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             (None, target_cur, lapped)
         };
 
+        let (registry, registration) = if header.reader_registry_offset != 0 {
+            let reg = unsafe {
+                ReaderRegistry::from_ptr(
+                    mmap.as_mut_ptr().add(header.reader_registry_offset as usize),
+                    header.reader_registry_count as usize,
+                )
+            };
+            let reg_name = options.consumer_name.as_deref().unwrap_or("consumer");
+            let reg_handle = reg.register(reg_name, cursor).ok();
+            (Some(reg), reg_handle)
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             _mmap: mmap,
             header: header_ptr,
@@ -561,6 +730,8 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             cursor,
             lapped_total,
             checkpoint,
+            registry,
+            registration,
             _marker: PhantomData,
         })
     }
@@ -605,6 +776,9 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             }
 
             self.cursor += 1;
+            if let Some(ref reg) = self.registration {
+                reg.update_cursor(self.cursor);
+            }
             if skipped > 0 {
                 RecvStatus::Lapped { skipped, item: data }
             } else {
@@ -662,6 +836,10 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             }
         }
 
+        if let Some(ref reg) = self.registration {
+            reg.update_cursor(self.cursor);
+        }
+
         count
     }
 
@@ -686,6 +864,9 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             let skipped = write_seq - self.cursor;
             self.lapped_total += skipped;
             self.cursor = write_seq;
+            if let Some(ref reg) = self.registration {
+                reg.update_cursor(self.cursor);
+            }
             skipped
         } else {
             0
@@ -705,6 +886,9 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             let skipped = oldest - self.cursor;
             self.lapped_total += skipped;
             self.cursor = oldest;
+            if let Some(ref reg) = self.registration {
+                reg.update_cursor(self.cursor);
+            }
             skipped
         } else {
             0
@@ -752,15 +936,21 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
         } else {
             1
         };
-        if target_seq < oldest {
-            let skipped = oldest - target_seq;
-            self.lapped_total += skipped;
+        let skipped = if target_seq < oldest {
+            let s = oldest - target_seq;
+            self.lapped_total += s;
             self.cursor = oldest;
-            skipped
+            s
         } else {
             self.cursor = target_seq;
             0
+        };
+
+        if let Some(ref reg) = self.registration {
+            reg.update_cursor(self.cursor);
         }
+
+        skipped
     }
 
     /// Reference to the attached shared memory offset checkpoint, if configured.
@@ -775,11 +965,26 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
         self.checkpoint.as_ref().map(|cp| cp.path())
     }
 
+    /// Reference to the ReaderRegistry, if enabled in the ring header.
+    #[inline]
+    pub fn registry(&self) -> Option<&ReaderRegistry> {
+        self.registry.as_ref()
+    }
+
+    /// Reference to this consumer's ReaderRegistration, if registered.
+    #[inline]
+    pub fn registration(&self) -> Option<&ReaderRegistration> {
+        self.registration.as_ref()
+    }
+
     /// Atomically persists the last processed sequence number (`cursor - 1`) directly into shared memory (<10ns).
     #[inline(always)]
     pub fn commit_offset(&self) -> Result<()> {
         if let Some(ref cp) = self.checkpoint {
             cp.save(self.last_processed_sequence());
+            if let Some(ref reg) = self.registration {
+                reg.update_cursor(self.cursor);
+            }
             Ok(())
         } else {
             Err(RingfireError::NoOffsetFileConfigured)
@@ -790,6 +995,9 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     pub fn commit_offset_to<P: AsRef<Path>>(&self, path: P, consumer_name: &str) -> Result<()> {
         let cp = OffsetCheckpoint::open_or_create(path, consumer_name).map_err(RingfireError::Io)?;
         cp.save(self.last_processed_sequence());
+        if let Some(ref reg) = self.registration {
+            reg.update_cursor(self.cursor);
+        }
         Ok(())
     }
 

@@ -47,8 +47,7 @@ async fn test_tokio_multi_task_cooperative_concurrency() {
         let mut expected_seq = 1u64;
         while total_received < total_messages {
             let count = consumer.recv_batch(&mut batch_buf).await;
-            for i in 0..count {
-                let trade = batch_buf[i];
+            for trade in batch_buf.iter().take(count) {
                 assert_eq!(trade.seq, expected_seq);
                 expected_seq += 1;
                 total_received += 1;
@@ -61,7 +60,7 @@ async fn test_tokio_multi_task_cooperative_concurrency() {
     for s in 1..=total_messages {
         let trade = AsyncTrade {
             seq: s,
-            price: 85000_00 + (s % 1000),
+            price: 8_500_000 + (s % 1000),
             qty: 10,
             side: if s % 2 == 0 { b'B' } else { b'S' },
         };

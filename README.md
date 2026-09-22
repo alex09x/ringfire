@@ -1,6 +1,6 @@
 # ringfire 🔥
 
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.1.0-orange.svg)](https://crates.io/crates/ringfire)
+[![Crates.io](https://img.shields.io/badge/crates.io-v0.3.0-orange.svg)](https://crates.io/crates/ringfire)
 [![Documentation](https://docs.rs/ringfire/badge.svg)](https://docs.rs/ringfire)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-brightgreen.svg)](https://www.rust-lang.org)
@@ -187,6 +187,116 @@ producer.push(&raw_bytes);
 let mut consumer = AsyncRingConsumer::<[u8; 64]>::attach("/dev/shm/raw_stream")?;
 let bytes: [u8; 64] = consumer.recv().await;
 let ticker: &MarketTicker = unsafe { &*(bytes.as_ptr() as *const MarketTicker) };
+```
+
+### 6. Variable-Length Payloads (`BlobProducer` & `BlobConsumer`)
+
+For variable-sized messages (e.g. L2/L3 order book snapshots, compressed frames, or variable trade batches), `ringfire` pairs fixed ring descriptors with a contiguous shared-memory `PayloadArena`:
+
+```rust
+use ringfire::{BlobProducerBuilder, BlobConsumer};
+
+// Create a ring with 65,536 descriptor slots and a 16 MB byte arena
+let mut producer = BlobProducerBuilder::new(65536, 16 * 1024 * 1024)
+    .build::<u32>("/dev/shm/orderbook_stream")?;
+
+// Push variable-length JSON, protobuf, or raw bytes directly into the arena
+let raw_json = br#"{"event":"snapshot","bids":[[82000.5,1.2]],"asks":[[82001.0,0.8]]}"#;
+producer.push_blob(&42, raw_json)?;
+
+// Consumer receives the metadata and views the arena payload zero-copy in-place
+let mut consumer = BlobConsumer::<u32>::attach("/dev/shm/orderbook_stream")?;
+let mut scratch_buffer = vec![0u8; 4096];
+if let Ok(meta) = consumer.recv_copy(&mut scratch_buffer) {
+    println!("Received snapshot for symbol {}", meta);
+}
+```
+
+### 7. Consumer Start Modes & Lock-Free SHM Checkpointing
+
+Consumers can configure where in the stream to begin reading, and persist their read cursors lock-free into `/dev/shm` (<10ns seqlock commit):
+
+```rust
+use ringfire::{RingConsumerBuilder, ConsumerStartMode, OffsetCheckpoint};
+
+let mut consumer = RingConsumerBuilder::new()
+    // Modes: Latest (instant jump), Head (wait for future), Oldest (replay backlog), Sequence(N)
+    .start_mode(ConsumerStartMode::Latest)
+    .attach::<MarketTicker>("/dev/shm/hft_ticker_stream")?;
+
+// Or attach with persistent offset checkpoint in /dev/shm:
+let mut persistent_consumer = RingConsumerBuilder::new()
+    .offset_path("/dev/shm/hft_ticker_stream_worker1.offset")
+    .attach::<MarketTicker>("/dev/shm/hft_ticker_stream")?;
+
+// In consumer loop, periodically or per-batch commit offset:
+persistent_consumer.commit_offset()?;
+```
+
+### 8. Lossless Backpressure Flow Control
+
+While default `ringfire` channels operate in `LatestWins` lossy mode (writer never blocks), streaming pipelines requiring zero message drops can enable `LosslessBackpressure`:
+
+```rust
+use ringfire::{RingProducerBuilder, FlowControl, RingConsumer};
+
+let mut producer = RingProducerBuilder::new()
+    .flow_control(FlowControl::LosslessBackpressure)
+    .create::<MarketTicker>("/dev/shm/reliable_stream", 4096)?;
+
+// Writer throttles (via spin/yield backoff) if slowest registered reader is about to be lapped:
+producer.push(&ticker);
+
+// Or use non-blocking try_push:
+match producer.try_push(&ticker) {
+    Ok(()) => println!("Pushed successfully"),
+    Err(RingfireError::BackpressureBufferFull) => println!("Slow reader lag detected, backpressure applied"),
+    Err(e) => return Err(e.into()),
+}
+```
+
+### 9. Multi-Channel Multiplexing (`RingMultiplexer` & `AsyncRingMultiplexer`)
+
+Multiplex across multiple distinct ring buffer streams with fair Round-Robin or strict Priority scheduling:
+
+```rust
+use ringfire::{RingConsumer, RingMultiplexer};
+
+let c1 = RingConsumer::<MarketTicker>::attach("/dev/shm/stream_btc")?;
+let c2 = RingConsumer::<MarketTicker>::attach("/dev/shm/stream_eth")?;
+
+let mut mux = RingMultiplexer::new();
+mux.add_channel(c1);
+mux.add_channel(c2);
+
+// Fair Round-Robin across all channels
+if let Some((channel_idx, ticker)) = mux.try_recv_any() {
+    println!("Channel {} received ticker {}", channel_idx, ticker.asset_id);
+}
+
+// Or Tokio async multiplexing:
+// let (idx, ticker) = async_mux.recv_any().await;
+```
+
+### 10. CLI Diagnostic & Monitoring Tool (`ringfire`)
+
+The bundled `ringfire` binary provides real-time terminal monitoring and inspection:
+
+```bash
+# View buffer configuration, sequence counters, and registered consumer lag
+cargo run --bin ringfire -- stat /dev/shm/hft_ticker_stream
+
+# Machine-readable JSON output for automated telemetry:
+cargo run --bin ringfire -- stat /dev/shm/hft_ticker_stream --json
+
+# Real-time interactive terminal dashboard with msg/s and MB/s throughput:
+cargo run --bin ringfire -- top /dev/shm/hft_ticker_stream --interval-ms 500
+
+# Dump recent slots and payloads in hex or ASCII:
+cargo run --bin ringfire -- dump /dev/shm/hft_ticker_stream --tail 10 --hex
+
+# Clean up dead reader slots from crashed processes:
+cargo run --bin ringfire -- prune /dev/shm/hft_ticker_stream
 ```
 
 ---

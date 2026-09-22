@@ -17,6 +17,7 @@ pub mod error;
 pub mod ffi;
 pub mod header;
 pub mod mpmc;
+pub mod multiplexer;
 pub mod registry;
 pub mod signature;
 pub mod spmc;
@@ -32,17 +33,21 @@ pub use blackboard::{BlackboardConsumer, BlackboardProducer};
 pub use blob::{BlobConsumer, BlobPacket, BlobProducer, BlobProducerBuilder, BlobRecvStatus};
 pub use checkpoint::OffsetCheckpoint;
 pub use error::{Result, RingfireError};
+pub use multiplexer::RingMultiplexer;
+#[cfg(feature = "tokio")]
+pub use multiplexer::AsyncRingMultiplexer;
 pub use header::{
     BlackboardHeader, BlackboardSlot, ReaderSlot, RingHeader, Slot, BLACKBOARD_MAGIC,
-    BLACKBOARD_VERSION, FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, FLAG_WITH_ARENA,
-    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+    BLACKBOARD_VERSION, FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS,
+    FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
+    RINGFIRE_VERSION,
 };
 pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
 pub use registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
 pub use signature::{compute_layout_signature, fnv1a64, LayoutSignature};
 pub use spmc::{
-    CleanupMode, ConsumerStartMode, RecvStatus, RingConsumer, RingConsumerBuilder, RingProducer,
-    RingProducerBuilder,
+    CleanupMode, ConsumerStartMode, FlowControl, RecvStatus, RingConsumer, RingConsumerBuilder,
+    RingProducer, RingProducerBuilder,
 };
 pub use tsc::CycleStamp;
 pub use wait::{BusySpin, FutexWait, WaitStrategy, YieldBackoff};
@@ -194,8 +199,8 @@ mod tests {
         assert_eq!(consumer.read(0).unwrap(), None);
 
         let bbo_btc = BboSnapshot {
-            bid_px: 82100_00,
-            ask_px: 82100_50,
+            bid_px: 8_210_000,
+            ask_px: 8_210_050,
             bid_sz: 500,
             ask_sz: 300,
         };
