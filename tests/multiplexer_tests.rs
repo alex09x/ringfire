@@ -1,6 +1,7 @@
 use ringfire::{RingMultiplexer, RingProducer};
 #[cfg(feature = "tokio")]
 use ringfire::AsyncRingMultiplexer;
+#[cfg(feature = "tokio")]
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,7 @@ fn test_multiplexer_priority_ordering() {
     let _ = std::fs::remove_file(&p_low);
 }
 
+#[cfg(feature = "tokio")]
 #[tokio::test]
 async fn test_async_multiplexer_tokio() {
     let dir = std::env::temp_dir();

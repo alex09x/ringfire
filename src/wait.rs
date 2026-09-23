@@ -73,6 +73,10 @@ impl WaitStrategy for YieldBackoff {
 
 /// Futex-based wait strategy for 0% CPU consumption when idle.
 /// Spins briefly (adaptive fast-path) before putting the calling thread to sleep in the kernel.
+///
+/// The producer's hot path deliberately has no full memory barrier, so a wake-up can be
+/// missed when a message is published at the exact moment the consumer goes to sleep.
+/// Sleeps are therefore always bounded: `timeout: None` means [`FutexWait::SAFETY_TIMEOUT`].
 #[derive(Debug, Clone, Copy)]
 pub struct FutexWait {
     spins: u32,
@@ -87,6 +91,9 @@ impl Default for FutexWait {
 }
 
 impl FutexWait {
+    /// Upper bound on a single sleep when no explicit timeout is configured.
+    pub const SAFETY_TIMEOUT: Duration = Duration::from_millis(10);
+
     pub fn new(spin_limit: u32, timeout: Option<Duration>) -> Self {
         Self {
             spins: 0,
@@ -119,7 +126,11 @@ impl WaitStrategy for FutexWait {
             return;
         }
 
-        sys_futex_wait(&header.futex_word, futex_val, self.timeout);
+        sys_futex_wait(
+            &header.futex_word,
+            futex_val,
+            Some(self.timeout.unwrap_or(Self::SAFETY_TIMEOUT)),
+        );
         header.waiting_consumers.fetch_sub(1, Ordering::SeqCst);
     }
 

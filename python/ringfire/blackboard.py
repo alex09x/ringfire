@@ -4,6 +4,8 @@ import ctypes
 import struct
 from typing import Optional, Type
 
+from .ring import _create_locked
+
 BLACKBOARD_MAGIC = 0x52494E4742424F52
 BLACKBOARD_VERSION = 1
 HEADER_SIZE = 128
@@ -29,6 +31,9 @@ class BlackboardConsumer:
 
         self.fd = os.open(path, os.O_RDWR)
         file_size = os.fstat(self.fd).st_size
+        if file_size < HEADER_SIZE:
+            os.close(self.fd)
+            raise ValueError(f"{path}: file too small ({file_size} bytes) for a blackboard header")
         self.mm = mmap.mmap(self.fd, file_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
 
         self.header = BlackboardHeader.from_buffer(self.mm, 0)
@@ -42,6 +47,8 @@ class BlackboardConsumer:
         self.slot_size = self.header.slot_size
         self.slot_count = self.header.slot_count
         self.slots_offset = HEADER_SIZE
+        if self.slot_size < 8 + self.value_size or HEADER_SIZE + self.slot_count * self.slot_size > file_size:
+            raise ValueError("Corrupt blackboard header: slots extend past the end of the file")
 
     def read(self, key: int) -> Optional[ctypes.Structure]:
         """Reads the snapshot for key using seqlock consistency validation."""
@@ -69,8 +76,10 @@ class BlackboardConsumer:
         return None
 
     def close(self):
+        self.header = None
         if hasattr(self, "mm") and self.mm is not None:
             self.mm.close()
+            self.mm = None
         if hasattr(self, "fd") and self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
@@ -95,18 +104,16 @@ class BlackboardProducer:
         self.slots_offset = HEADER_SIZE
 
         total_size = HEADER_SIZE + (slot_count * self.slot_size)
-        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o660)
-        os.ftruncate(self.fd, total_size)
+        self.fd = _create_locked(path, total_size)
         self.mm = mmap.mmap(self.fd, total_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
 
         self.header = BlackboardHeader.from_buffer(self.mm, 0)
-        self.header.magic = BLACKBOARD_MAGIC
         self.header.version = BLACKBOARD_VERSION
         self.header.value_size = self.value_size
         self.header.slot_size = self.slot_size
         self.header.slot_count = slot_count
-
-        self.mm[HEADER_SIZE:total_size] = b"\x00" * (total_size - HEADER_SIZE)
+        # Freshly created file is zero-filled; publish by writing magic last.
+        self.header.magic = BLACKBOARD_MAGIC
 
     def write(self, key: int, item: ctypes.Structure):
         """Writes or updates key using atomic seqlock."""
@@ -128,8 +135,10 @@ class BlackboardProducer:
         self.mm[slot_offset:slot_offset + 8] = struct.pack("<Q", write_s + 1)
 
     def close(self):
+        self.header = None
         if hasattr(self, "mm") and self.mm is not None:
             self.mm.close()
+            self.mm = None
         if hasattr(self, "fd") and self.fd >= 0:
             os.close(self.fd)
             self.fd = -1

@@ -19,9 +19,32 @@ pub const fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Compute a 64-bit layout signature for a given type `T`.
+/// `type_name` with every module path removed (`a::b::Foo<c::Bar>` -> `Foo<Bar>`), so the
+/// same struct defined in different crates (producer and consumer binaries) matches.
+fn short_type_name(full: &str) -> String {
+    let mut out = String::with_capacity(full.len());
+    let mut ident = String::new();
+    let mut chars = full.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            ident.clear();
+        } else {
+            out.push_str(&ident);
+            ident.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(&ident);
+    out
+}
+
+/// Compute a 64-bit layout signature for a given type `T` from its size, alignment and
+/// path-less type name.
 pub fn compute_layout_signature<T: 'static>() -> u64 {
-    let name = type_name::<T>();
+    let name = short_type_name(type_name::<T>());
     let size = size_of::<T>();
     let align = align_of::<T>();
 
@@ -70,5 +93,15 @@ mod tests {
         assert_ne!(sig_a, sig_b);
         assert_ne!(sig_a, sig_u64);
         assert_eq!(sig_a, StructA::layout_signature());
+    }
+
+    #[test]
+    fn test_signature_ignores_module_paths() {
+        assert_eq!(short_type_name("app_a::types::Trade"), "Trade");
+        assert_eq!(
+            short_type_name("alloc::vec::Vec<core::option::Option<my::T>>"),
+            "Vec<Option<T>>"
+        );
+        assert_eq!(short_type_name("[u8; 32]"), "[u8; 32]");
     }
 }

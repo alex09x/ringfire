@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use futures_core::Stream;
+use tokio::time::Sleep;
 
 use crate::error::Result;
 use crate::spmc::{RecvStatus, RingConsumer};
@@ -19,6 +21,9 @@ pub struct AsyncRingConsumer<T: Copy + 'static> {
     max_spins: u32,
     max_yields: u32,
     idle_sleep: Duration,
+    /// `Stream` backoff state: cooperative yields so far and the pending idle timer.
+    stream_yields: u32,
+    stream_sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T: Copy + 'static> AsyncRingConsumer<T> {
@@ -35,6 +40,8 @@ impl<T: Copy + 'static> AsyncRingConsumer<T> {
             max_spins: 32,
             max_yields: 8,
             idle_sleep: Duration::from_micros(50),
+            stream_yields: 0,
+            stream_sleep: None,
         }
     }
 
@@ -191,21 +198,37 @@ impl<T: Copy + 'static> AsyncRingConsumer<T> {
     }
 }
 
+/// The stream never ends. While idle it follows the same backoff as [`AsyncRingConsumer::recv`]:
+/// a short spin, a few cooperative yields, then `idle_sleep` timer waits, so an idle
+/// stream costs no CPU and spawns no tasks.
 impl<T: Copy + Unpin + 'static> Stream for AsyncRingConsumer<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(item) = self.inner.try_recv() {
-            return Poll::Ready(Some(item));
+        let this = &mut *self;
+        loop {
+            if let Some(sleep) = this.stream_sleep.as_mut() {
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.stream_sleep = None;
+                this.stream_yields = 0;
+            }
+
+            for _ in 0..=this.max_spins {
+                if let Some(item) = this.inner.try_recv() {
+                    this.stream_yields = 0;
+                    return Poll::Ready(Some(item));
+                }
+                core::hint::spin_loop();
+            }
+
+            if this.stream_yields < this.max_yields {
+                this.stream_yields += 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.stream_sleep = Some(Box::pin(tokio::time::sleep(this.idle_sleep)));
         }
-
-        // Wake task to poll again cooperatively on the Tokio scheduler
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            waker.wake();
-        });
-
-        Poll::Pending
     }
 }

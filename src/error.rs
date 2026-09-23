@@ -36,6 +36,10 @@ pub enum RingfireError {
     NoOffsetFileConfigured,
     /// Ring buffer is full under lossless backpressure flow control.
     BackpressureBufferFull,
+    /// Shared memory region is truncated, foreign, or its header points outside the mapping.
+    CorruptLayout(&'static str),
+    /// A blackboard slot stayed mid-write for too long (writer stalled or crashed).
+    WriterStalled { key: usize },
 }
 
 impl fmt::Display for RingfireError {
@@ -92,6 +96,10 @@ impl fmt::Display for RingfireError {
             }
             Self::BackpressureBufferFull => {
                 write!(f, "Ring buffer is full: slowest active reader has not caught up")
+            }
+            Self::CorruptLayout(what) => write!(f, "Corrupt shared memory layout: {}", what),
+            Self::WriterStalled { key } => {
+                write!(f, "Blackboard key {} stayed mid-write: writer stalled or crashed", key)
             }
         }
     }

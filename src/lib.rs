@@ -20,6 +20,7 @@ pub mod mpmc;
 pub mod multiplexer;
 pub mod registry;
 pub mod signature;
+mod shm;
 pub mod spmc;
 pub mod tsc;
 pub mod wait;
@@ -40,7 +41,7 @@ pub use header::{
     BlackboardHeader, BlackboardSlot, ReaderSlot, RingHeader, Slot, BLACKBOARD_MAGIC,
     BLACKBOARD_VERSION, FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS,
     FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
-    RINGFIRE_VERSION,
+    RINGFIRE_VERSION, SLOT_WRITING,
 };
 pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
 pub use registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
@@ -250,6 +251,7 @@ mod tests {
         assert_eq!(v1 + v2, 300);
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_tokio_async_consumer() {
         let tmp_path = std::env::temp_dir().join("test_tokio_async.shm");

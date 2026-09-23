@@ -8,7 +8,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -17,12 +16,13 @@ use memmap2::MmapMut;
 use crate::arena::{BlobRef, PayloadArena};
 use crate::error::{Result, RingfireError};
 use crate::header::{
-    ReaderSlot, RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, FLAG_WITH_ARENA,
-    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+    check_schema, validate_ring, ReaderSlot, RingHeader, RingLayout, Slot, FLAG_MODE_SPMC,
+    FLAG_POLICY_LATEST_WINS, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY,
 };
 use crate::registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
+use crate::shm::create_backing_file;
 use crate::signature::LayoutSignature;
-use crate::spmc::CleanupMode;
+use crate::spmc::{oldest_retained, read_slot, write_slot, CleanupMode, SlotRead};
 use crate::wait::wake_futex;
 
 /// Descriptor stored in each ring buffer slot.
@@ -153,48 +153,28 @@ impl<M: Copy + 'static> BlobProducer<M> {
         let total_file_size = arena_offset + arena_total;
         let path_buf = path.as_ref().to_path_buf();
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(options.mode)
-            .open(&path_buf)?;
-
-        if options.exclusive_lock {
-            let fd = file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                return Err(RingfireError::ProducerAlreadyExists);
-            }
-        }
-
-        file.set_len(total_file_size as u64)?;
+        let file = create_backing_file(&path_buf, options.mode, options.exclusive_lock, total_file_size as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let base_ptr = mmap.as_mut_ptr();
 
         let header_ptr = base_ptr.cast::<RingHeader>();
         unsafe {
-            header_ptr.write(RingHeader {
-                magic: RINGFIRE_MAGIC,
-                version: RINGFIRE_VERSION,
-                element_size: slot_size as u32,
-                capacity,
-                mask: capacity - 1,
-                write_seq: std::sync::atomic::AtomicU64::new(0),
-                claim_seq: std::sync::atomic::AtomicU64::new(0),
-                flags: FLAG_POLICY_LATEST_WINS | FLAG_MODE_SPMC | FLAG_WITH_ARENA | FLAG_WITH_REGISTRY,
-                futex_word: std::sync::atomic::AtomicU32::new(0),
-                waiting_consumers: std::sync::atomic::AtomicU32::new(0),
-                _align_pad: 0,
-                read_seq: std::sync::atomic::AtomicU64::new(0),
-                schema_sig: M::layout_signature(),
-                arena_offset: arena_offset as u64,
-                arena_size: arena_capacity as u64,
-                reader_registry_offset: registry_offset as u32,
-                reader_registry_count: max_readers as u32,
-                _pad: [0; 24],
-            });
+            RingHeader::initialize(
+                header_ptr,
+                &RingLayout {
+                    capacity,
+                    slot_size,
+                    flags: FLAG_POLICY_LATEST_WINS | FLAG_MODE_SPMC | FLAG_WITH_ARENA | FLAG_WITH_REGISTRY,
+                    schema_sig: M::layout_signature(),
+                    claim_seq: 0,
+                    read_seq: 0,
+                    registry_offset,
+                    registry_count: max_readers,
+                    slots_offset,
+                    arena_offset,
+                    arena_size: arena_capacity,
+                },
+            );
         }
 
         let registry = unsafe {
@@ -204,14 +184,14 @@ impl<M: Copy + 'static> BlobProducer<M> {
         let slots_ptr = unsafe { base_ptr.add(slots_offset).cast::<Slot<BlobPacket<M>>>() };
         for i in 0..capacity {
             unsafe {
-                let slot = slots_ptr.add(i as usize);
-                (*slot).seq = std::sync::atomic::AtomicU64::new(0);
+                (*slots_ptr.add(i as usize)).seq = std::sync::atomic::AtomicU64::new(0);
             }
         }
 
         let arena = unsafe {
             PayloadArena::init(base_ptr.add(arena_offset), arena_capacity)?
         };
+        unsafe { RingHeader::publish(header_ptr) };
 
         Ok(Self {
             path: path_buf,
@@ -229,29 +209,24 @@ impl<M: Copy + 'static> BlobProducer<M> {
         })
     }
 
+    #[inline(always)]
+    fn publish_packet(&mut self, packet: BlobPacket<M>) -> u64 {
+        let seq = self.seq;
+        unsafe {
+            write_slot(self.slots.add((seq & self.mask) as usize), seq, &packet);
+            (*self.header).write_seq.store(seq, Ordering::Release);
+            wake_futex(&*self.header, i32::MAX);
+        }
+        self.seq += 1;
+        seq
+    }
+
     /// Publishes a message with metadata and binary payload.
     /// Returns the assigned sequence number.
     #[inline]
     pub fn push(&mut self, meta: &M, payload: &[u8]) -> Result<u64> {
         let blob_ref = self.arena.write_blob(payload, 0)?;
-
-        let packet = BlobPacket {
-            meta: *meta,
-            blob_ref,
-        };
-
-        let idx = (self.seq & self.mask) as usize;
-        unsafe {
-            let slot = self.slots.add(idx);
-            std::ptr::copy_nonoverlapping(&packet, &mut (*slot).data, 1);
-            (*slot).seq.store(self.seq, Ordering::Release);
-            (*self.header).write_seq.store(self.seq, Ordering::Release);
-            wake_futex(&*self.header, 1);
-        }
-
-        let current_seq = self.seq;
-        self.seq += 1;
-        Ok(current_seq)
+        Ok(self.publish_packet(BlobPacket { meta: *meta, blob_ref }))
     }
 
     /// Publishes with zero-copy writing directly into the payload arena.
@@ -261,24 +236,7 @@ impl<M: Copy + 'static> BlobProducer<M> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let (blob_ref, result) = self.arena.write_blob_with(len, 0, f)?;
-
-        let packet = BlobPacket {
-            meta: *meta,
-            blob_ref,
-        };
-
-        let idx = (self.seq & self.mask) as usize;
-        unsafe {
-            let slot = self.slots.add(idx);
-            std::ptr::copy_nonoverlapping(&packet, &mut (*slot).data, 1);
-            (*slot).seq.store(self.seq, Ordering::Release);
-            (*self.header).write_seq.store(self.seq, Ordering::Release);
-            wake_futex(&*self.header, 1);
-        }
-
-        let current_seq = self.seq;
-        self.seq += 1;
-        Ok((current_seq, result))
+        Ok((self.publish_packet(BlobPacket { meta: *meta, blob_ref }), result))
     }
 
     /// Minimum sequence across all currently living registered readers.
@@ -313,15 +271,13 @@ impl<M: Copy + 'static> BlobProducer<M> {
 
 impl<M: Copy + 'static> Drop for BlobProducer<M> {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::flock(fd, libc::LOCK_UN);
-            }
-        }
-
         if self.cleanup_mode == CleanupMode::UnlinkOnDrop {
             let _ = std::fs::remove_file(&self.path);
+        }
+        if let Some(file) = self.file.take() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }
@@ -359,55 +315,37 @@ impl<M: Copy + 'static> BlobConsumer<M> {
 
     /// Attach to an existing blob ring buffer and register in the `ReaderRegistry`.
     pub fn attach_with_name<P: AsRef<Path>>(path: P, reader_name: &str) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let file = OpenOptions::new().read(true).write(true).open(path_ref)?;
+        let file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        let base_ptr = mmap.as_ptr();
 
-        let header_ptr = base_ptr.cast::<RingHeader>();
+        let view = unsafe {
+            validate_ring(
+                mmap.as_ptr(),
+                mmap.len(),
+                Some(std::mem::size_of::<Slot<BlobPacket<M>>>()),
+                std::mem::align_of::<Slot<BlobPacket<M>>>(),
+            )?
+        };
+        let header_ptr = mmap.as_ptr().cast::<RingHeader>();
         let header = unsafe { &*header_ptr };
-
-        if header.magic != RINGFIRE_MAGIC {
-            return Err(RingfireError::InvalidMagic {
-                expected: RINGFIRE_MAGIC,
-                actual: header.magic,
-            });
-        }
-        if header.version != RINGFIRE_VERSION {
-            return Err(RingfireError::VersionMismatch {
-                expected: RINGFIRE_VERSION,
-                actual: header.version,
-            });
-        }
-
-        let slot_size = std::mem::size_of::<Slot<BlobPacket<M>>>();
-        if header.element_size as usize != slot_size {
-            return Err(RingfireError::ElementSizeMismatch {
-                expected: header.element_size as usize,
-                actual: slot_size,
-            });
-        }
-
-        let expected_sig = M::layout_signature();
-        if header.schema_sig != 0 && header.schema_sig != expected_sig {
-            return Err(RingfireError::SchemaMismatch {
-                expected: header.schema_sig,
-                actual: expected_sig,
-                type_name: std::any::type_name::<M>(),
-            });
-        }
+        check_schema(header, M::layout_signature(), std::any::type_name::<M>())?;
 
         if header.arena_offset == 0 {
-            return Err(RingfireError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Shared memory queue does not contain a PayloadArena",
-            )));
+            return Err(RingfireError::CorruptLayout(
+                "shared memory queue does not contain a PayloadArena",
+            ));
+        }
+        let arena = unsafe {
+            PayloadArena::from_ptr(mmap.as_mut_ptr().add(header.arena_offset as usize))?
+        };
+        if arena.capacity() as u64 != header.arena_size {
+            return Err(RingfireError::CorruptLayout("arena header disagrees with ring header"));
         }
 
-        let capacity = header.capacity;
-        let mask = header.mask;
+        let capacity = view.capacity;
+        let slots_ptr = unsafe { mmap.as_ptr().add(view.slots_offset).cast::<Slot<BlobPacket<M>>>() };
+        let cursor = oldest_retained(header.write_seq.load(Ordering::Acquire), capacity);
 
-        // Locate registry
         let (registry, registration) = if header.reader_registry_offset != 0 {
             let reg = unsafe {
                 ReaderRegistry::from_ptr(
@@ -415,32 +353,11 @@ impl<M: Copy + 'static> BlobConsumer<M> {
                     header.reader_registry_count as usize,
                 )
             };
-            let reg_handle = reg.register(reader_name, 1).ok();
+            let reg_handle = reg.register(reader_name, cursor).ok();
             (Some(reg), reg_handle)
         } else {
             (None, None)
         };
-
-        // Locate slots
-        let registry_size = (header.reader_registry_count as usize) * std::mem::size_of::<ReaderSlot>();
-        let slots_offset = (header.reader_registry_offset as usize + registry_size + 127) & !127;
-        let slots_ptr = unsafe { base_ptr.add(slots_offset).cast::<Slot<BlobPacket<M>>>() };
-
-        // Locate arena
-        let arena = unsafe {
-            PayloadArena::from_ptr(mmap.as_mut_ptr().add(header.arena_offset as usize))?
-        };
-
-        let current_write = header.write_seq.load(Ordering::Acquire);
-        let cursor = if current_write > capacity {
-            current_write - capacity + 1
-        } else {
-            1
-        };
-
-        if let Some(ref reg) = registration {
-            reg.update_cursor(cursor);
-        }
 
         Ok(Self {
             _mmap: mmap,
@@ -450,79 +367,117 @@ impl<M: Copy + 'static> BlobConsumer<M> {
             registry,
             registration,
             capacity,
-            mask,
+            mask: view.mask,
             cursor,
             lapped_total: 0,
             _marker: PhantomData,
         })
     }
 
-    /// Read next blob message with explicit status.
-    #[inline]
-    pub fn recv_status(&mut self, meta: &mut M, out: &mut [u8]) -> Result<BlobRecvStatus> {
-        unsafe {
-            let mut skipped = 0;
-            let current_write = (*self.header).write_seq.load(Ordering::Acquire);
+    #[cold]
+    #[inline(never)]
+    fn skip_overwritten(&mut self, seen: u64) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        let oldest = oldest_retained(write_seq.max(seen), self.capacity);
+        if oldest > self.cursor {
+            let skipped = oldest - self.cursor;
+            self.cursor = oldest;
+            self.lapped_total += skipped;
+            skipped
+        } else {
+            0
+        }
+    }
 
-            if current_write > self.cursor && (current_write - self.cursor) >= self.capacity {
-                let oldest = current_write - self.capacity + 1;
-                skipped = oldest - self.cursor;
-                self.lapped_total += skipped;
-                self.cursor = oldest;
-            }
+    /// Drops the message at the cursor (its payload was overwritten or its descriptor is bogus).
+    #[cold]
+    #[inline(never)]
+    fn skip_current(&mut self) {
+        self.cursor += 1;
+        self.lapped_total += 1;
+    }
 
-            loop {
-                let idx = (self.cursor & self.mask) as usize;
-                let slot = self.slots.add(idx);
-                let s1 = (*slot).seq.load(Ordering::Acquire);
-
-                if s1 < self.cursor {
-                    return Ok(BlobRecvStatus::Empty);
-                }
-
-                if s1 > self.cursor {
-                    let slot_skipped = s1 - self.cursor;
-                    skipped += slot_skipped;
-                    self.lapped_total += slot_skipped;
-                    self.cursor = s1;
-                    continue;
-                }
-
-                // Copy slot packet (metadata + blob_ref)
-                let packet = (*slot).data;
-                let payload_len = packet.blob_ref.len as usize;
-
-                if out.len() < payload_len {
-                    return Err(RingfireError::BufferTooSmall {
-                        required: payload_len,
-                        provided: out.len(),
-                    });
-                }
-
-                // Copy payload from arena
-                self.arena.read_blob(packet.blob_ref, out)?;
-
-                // Two-phase consistency verification: slot sequence must match and arena not lapped
-                let s2 = (*slot).seq.load(Ordering::Acquire);
-                if s1 == s2 && !self.arena.is_lapped(packet.blob_ref) {
-                    *meta = packet.meta;
+    /// Core receive loop. `consume` gets the metadata and the payload slice while it still
+    /// lives in the arena; its result is kept only if the payload was not overwritten
+    /// during the call. Returns the result, the payload length and the skipped count.
+    #[inline(always)]
+    fn next_blob<R>(
+        &mut self,
+        mut check: impl FnMut(usize) -> Result<()>,
+        mut consume: impl FnMut(&M, &[u8]) -> R,
+    ) -> Result<Option<(R, usize, u64)>> {
+        let mut skipped = 0;
+        loop {
+            let slot = unsafe { self.slots.add((self.cursor & self.mask) as usize) };
+            match unsafe { read_slot(slot, self.cursor) } {
+                SlotRead::Item(packet) => {
+                    let blob_ref = packet.blob_ref;
+                    if !self.arena.is_in_bounds(blob_ref) || self.arena.is_lapped(blob_ref) {
+                        self.skip_current();
+                        skipped += 1;
+                        continue;
+                    }
+                    let len = blob_ref.len as usize;
+                    check(len)?;
+                    let result = self.arena.view_blob(blob_ref, |bytes| consume(&packet.meta, bytes));
+                    if self.arena.is_lapped(blob_ref) {
+                        self.skip_current();
+                        skipped += 1;
+                        continue;
+                    }
                     self.cursor += 1;
-
                     if let Some(ref reg) = self.registration {
                         reg.update_cursor(self.cursor);
                     }
-
-                    if skipped > 0 {
-                        return Ok(BlobRecvStatus::Lapped { skipped, payload_len });
-                    } else {
-                        return Ok(BlobRecvStatus::Ok { payload_len });
-                    }
+                    return Ok(Some((result, len, skipped)));
                 }
-
-                // Slot or arena was modified concurrently, re-read latest
-                core::hint::spin_loop();
+                SlotRead::Overwritten(seen) => {
+                    let s = self.skip_overwritten(seen);
+                    if s == 0 {
+                        return Ok(None);
+                    }
+                    skipped += s;
+                }
+                SlotRead::Pending => return Ok(None),
             }
         }
+    }
+
+    /// Read next blob message with explicit status.
+    ///
+    /// Messages whose payload was already overwritten in the arena are skipped and
+    /// counted as lapped. Returns `BufferTooSmall` (without consuming the message) if
+    /// `out` cannot hold the payload.
+    #[inline]
+    pub fn recv_status(&mut self, meta: &mut M, out: &mut [u8]) -> Result<BlobRecvStatus> {
+        let out_len = out.len();
+        let got = self.next_blob(
+            |len| {
+                if out_len < len {
+                    Err(RingfireError::BufferTooSmall {
+                        required: len,
+                        provided: out_len,
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            |m, bytes| {
+                out[..bytes.len()].copy_from_slice(bytes);
+                *m
+            },
+        )?;
+        Ok(match got {
+            Some((m, payload_len, 0)) => {
+                *meta = m;
+                BlobRecvStatus::Ok { payload_len }
+            }
+            Some((m, payload_len, skipped)) => {
+                *meta = m;
+                BlobRecvStatus::Lapped { skipped, payload_len }
+            }
+            None => BlobRecvStatus::Empty,
+        })
     }
 
     /// Non-blocking receive returning `Ok(Some(payload_bytes))` or `Ok(None)`.
@@ -536,47 +491,14 @@ impl<M: Copy + 'static> BlobConsumer<M> {
     }
 
     /// Inspect next blob payload in-place inside the arena closure.
+    ///
+    /// The closure reads shared memory the producer may be overwriting: if the payload
+    /// is lapped during the call, the result is discarded, the message is counted as
+    /// lapped and the next one is offered. Keep the closure free of side effects that
+    /// cannot be repeated, and treat the bytes as untrusted until it returns.
     #[inline]
     pub fn view<R>(&mut self, mut f: impl FnMut(&M, &[u8]) -> R) -> Result<Option<R>> {
-        unsafe {
-            let current_write = (*self.header).write_seq.load(Ordering::Acquire);
-
-            if current_write > self.cursor && (current_write - self.cursor) >= self.capacity {
-                let oldest = current_write - self.capacity + 1;
-                self.lapped_total += oldest - self.cursor;
-                self.cursor = oldest;
-            }
-
-            loop {
-                let idx = (self.cursor & self.mask) as usize;
-                let slot = self.slots.add(idx);
-                let s1 = (*slot).seq.load(Ordering::Acquire);
-
-                if s1 < self.cursor {
-                    return Ok(None);
-                }
-
-                if s1 > self.cursor {
-                    self.lapped_total += s1 - self.cursor;
-                    self.cursor = s1;
-                    continue;
-                }
-
-                let packet = (*slot).data;
-                let res = self.arena.view_blob(packet.blob_ref, |slice| f(&packet.meta, slice));
-
-                let s2 = (*slot).seq.load(Ordering::Acquire);
-                if s1 == s2 && !self.arena.is_lapped(packet.blob_ref) {
-                    self.cursor += 1;
-                    if let Some(ref reg) = self.registration {
-                        reg.update_cursor(self.cursor);
-                    }
-                    return Ok(Some(res));
-                }
-
-                core::hint::spin_loop();
-            }
-        }
+        Ok(self.next_blob(|_| Ok(()), |m, bytes| f(m, bytes))?.map(|(r, _, _)| r))
     }
 
     /// Current consumer sequence cursor.

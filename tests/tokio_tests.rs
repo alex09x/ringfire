@@ -1,3 +1,4 @@
+#![cfg(feature = "tokio")]
 use ringfire::{AsyncRingConsumer, RingProducer};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

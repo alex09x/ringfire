@@ -2,9 +2,15 @@
 //!
 //! Shared-memory registry for monitoring active consumers, tracking reader lag,
 //! calculating safe write headroom, and automatically reclaiming dead processes.
+//!
+//! A slot is owned while `pid != 0` and counts as a live reader while additionally
+//! `active == 1`. Ownership changes only through compare-and-swap on `pid`, so a scanner
+//! reclaiming a dead reader can never wipe out a registration that replaced it.
+//!
+//! Liveness is judged by PID: readers in another PID namespace (e.g. a different
+//! container) look dead to the producer and are reclaimed. Share the PID namespace
+//! (`--pid=host` / a shared pod) when using lossless flow control across containers.
 
-#[cfg(target_os = "linux")]
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use crate::error::{Result, RingfireError};
 use crate::header::ReaderSlot;
@@ -66,13 +72,17 @@ impl ReaderRegistry {
         self.count
     }
 
+    #[inline]
+    fn slot(&self, i: usize) -> &ReaderSlot {
+        unsafe { &*self.slots.add(i) }
+    }
+
     /// Register a new reader in the shared memory registry.
     pub fn register(&self, name: &str, initial_cursor: u64) -> Result<ReaderRegistration> {
         let current_pid = std::process::id();
 
-        // 1. Try to find a free slot (or reclaim dead process slot)
         for i in 0..self.count {
-            let slot = unsafe { &*self.slots.add(i) };
+            let slot = self.slot(i);
             let pid = slot.pid.load(Ordering::Acquire);
 
             let is_free = pid == 0;
@@ -84,6 +94,9 @@ impl ReaderRegistry {
                     .compare_exchange(pid, current_pid, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
+                // The slot may still carry the previous owner's active flag and cursor:
+                // hide it from scanners until the new cursor is in place.
+                slot.active.store(0, Ordering::Relaxed);
                 slot.cursor_seq.store(initial_cursor, Ordering::Relaxed);
                 slot.heartbeat_tsc.store(0, Ordering::Relaxed);
 
@@ -99,6 +112,7 @@ impl ReaderRegistry {
                 return Ok(ReaderRegistration {
                     slot_index: i,
                     slot: self.slots,
+                    pid: current_pid,
                 });
             }
         }
@@ -106,32 +120,43 @@ impl ReaderRegistry {
         Err(RingfireError::NoAvailableReaderSlots)
     }
 
-    /// Find the minimum sequence cursor across all active, alive readers.
-    pub fn min_reader_seq(&self) -> Option<u64> {
-        let mut min_seq = None;
+    /// Releases slot `i` if it is still owned by the dead process `pid`.
+    #[inline]
+    fn reclaim(&self, i: usize, pid: u32) -> bool {
+        self.slot(i)
+            .pid
+            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
 
+    /// Minimum cursor across registered readers, without checking process liveness.
+    ///
+    /// Cheap enough for the producer's flow-control path: one atomic load per slot, no
+    /// syscalls. Dead readers are reclaimed separately by [`Self::prune_dead_readers`].
+    #[inline]
+    pub fn min_cursor(&self) -> Option<u64> {
+        let mut min_seq: Option<u64> = None;
         for i in 0..self.count {
-            let slot = unsafe { &*self.slots.add(i) };
-            if slot.active.load(Ordering::Acquire) == 1 {
-                let pid = slot.pid.load(Ordering::Relaxed);
-                if is_process_alive(pid) {
-                    let seq = slot.cursor_seq.load(Ordering::Relaxed);
-                    min_seq = Some(min_seq.map_or(seq, |curr: u64| curr.min(seq)));
-                } else {
-                    // Mark dead reader inactive
-                    slot.active.store(0, Ordering::Release);
-                    slot.pid.store(0, Ordering::Release);
-                }
+            let slot = self.slot(i);
+            if slot.active.load(Ordering::Acquire) == 1 && slot.pid.load(Ordering::Acquire) != 0 {
+                let seq = slot.cursor_seq.load(Ordering::Acquire);
+                min_seq = Some(min_seq.map_or(seq, |curr| curr.min(seq)));
             }
         }
-
         min_seq
+    }
+
+    /// Find the minimum sequence cursor across all active, alive readers,
+    /// reclaiming slots of dead processes on the way.
+    pub fn min_reader_seq(&self) -> Option<u64> {
+        self.prune_dead_readers();
+        self.min_cursor()
     }
 
     /// Calculate the lag of the slowest active reader relative to `write_seq`.
     pub fn reader_lag(&self, write_seq: u64) -> u64 {
         match self.min_reader_seq() {
-            Some(min_seq) => write_seq.saturating_sub(min_seq),
+            Some(min_seq) => write_seq.saturating_sub(min_seq.saturating_sub(1)),
             None => 0,
         }
     }
@@ -140,8 +165,8 @@ impl ReaderRegistry {
     pub fn headroom(&self, write_seq: u64, ring_capacity: u64) -> u64 {
         match self.min_reader_seq() {
             Some(min_seq) => {
-                let lag = write_seq.saturating_sub(min_seq);
-                ring_capacity.saturating_sub(lag)
+                let unread = write_seq.saturating_sub(min_seq.saturating_sub(1));
+                ring_capacity.saturating_sub(unread)
             }
             None => ring_capacity,
         }
@@ -149,28 +174,24 @@ impl ReaderRegistry {
 
     /// List all currently active readers and their lag.
     pub fn active_readers(&self, write_seq: u64) -> Vec<ReaderInfo> {
+        self.prune_dead_readers();
         let mut result = Vec::new();
 
         for i in 0..self.count {
-            let slot = unsafe { &*self.slots.add(i) };
-            if slot.active.load(Ordering::Acquire) == 1 {
-                let pid = slot.pid.load(Ordering::Relaxed);
-                if is_process_alive(pid) {
-                    let cursor_seq = slot.cursor_seq.load(Ordering::Relaxed);
-                    let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
-                    let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
+            let slot = self.slot(i);
+            let pid = slot.pid.load(Ordering::Acquire);
+            if pid != 0 && slot.active.load(Ordering::Acquire) == 1 {
+                let cursor_seq = slot.cursor_seq.load(Ordering::Acquire);
+                let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
+                let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
 
-                    result.push(ReaderInfo {
-                        slot_index: i,
-                        pid,
-                        name,
-                        cursor_seq,
-                        lag: write_seq.saturating_sub(cursor_seq),
-                    });
-                } else {
-                    slot.active.store(0, Ordering::Release);
-                    slot.pid.store(0, Ordering::Release);
-                }
+                result.push(ReaderInfo {
+                    slot_index: i,
+                    pid,
+                    name,
+                    cursor_seq,
+                    lag: write_seq.saturating_sub(cursor_seq.saturating_sub(1)),
+                });
             }
         }
 
@@ -181,11 +202,8 @@ impl ReaderRegistry {
     pub fn prune_dead_readers(&self) -> usize {
         let mut pruned = 0;
         for i in 0..self.count {
-            let slot = unsafe { &*self.slots.add(i) };
-            let pid = slot.pid.load(Ordering::Acquire);
-            if pid != 0 && !is_process_alive(pid) {
-                slot.active.store(0, Ordering::Release);
-                slot.pid.store(0, Ordering::Release);
+            let pid = self.slot(i).pid.load(Ordering::Acquire);
+            if pid != 0 && !is_process_alive(pid) && self.reclaim(i, pid) {
                 pruned += 1;
             }
         }
@@ -197,17 +215,21 @@ impl ReaderRegistry {
 pub struct ReaderRegistration {
     slot_index: usize,
     slot: *mut ReaderSlot,
+    pid: u32,
 }
 
 unsafe impl Send for ReaderRegistration {}
 unsafe impl Sync for ReaderRegistration {}
 
 impl ReaderRegistration {
-    /// Update the reader's current sequence cursor.
+    /// Update the reader's cursor: the sequence it will read next.
+    ///
+    /// Release ordering: the producer may overwrite everything below `seq` as soon as it
+    /// observes this store, so all reads of those slots must have completed.
     #[inline]
     pub fn update_cursor(&self, seq: u64) {
         let slot = unsafe { &*self.slot.add(self.slot_index) };
-        slot.cursor_seq.store(seq, Ordering::Relaxed);
+        slot.cursor_seq.store(seq, Ordering::Release);
     }
 
     /// Index of this reader slot.
@@ -221,56 +243,86 @@ impl Drop for ReaderRegistration {
     fn drop(&mut self) {
         let slot = unsafe { &*self.slot.add(self.slot_index) };
         slot.active.store(0, Ordering::Release);
-        slot.pid.store(0, Ordering::Release);
+        let _ = slot
+            .pid
+            .compare_exchange(self.pid, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 }
 
-/// Check if a process with `pid` is currently alive.
+/// Check if a process with `pid` is currently alive (in this PID namespace).
 #[inline]
 pub fn is_process_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        Path::new(&format!("/proc/{}", pid)).exists()
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    // EPERM: the process exists but belongs to another user.
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_reader_registry_lifecycle() {
-        let count = 4;
+    fn with_registry(count: usize, f: impl FnOnce(&ReaderRegistry)) {
         let total_size = count * std::mem::size_of::<ReaderSlot>();
         let mut memory = vec![0u8; total_size + 128];
         let ptr = memory.as_mut_ptr();
         let offset = (64 - (ptr as usize % 64)) % 64;
-        let aligned_ptr = unsafe { ptr.add(offset) };
+        let registry = unsafe { ReaderRegistry::init(ptr.add(offset), count) };
+        f(&registry);
+    }
 
-        let registry = unsafe { ReaderRegistry::init(aligned_ptr, count) };
+    #[test]
+    fn test_reader_registry_lifecycle() {
+        with_registry(4, |registry| {
+            assert_eq!(registry.min_reader_seq(), None);
 
-        assert_eq!(registry.min_reader_seq(), None);
+            let reg1 = registry.register("worker-1", 100).unwrap();
+            assert_eq!(registry.min_reader_seq(), Some(100));
 
-        let reg1 = registry.register("worker-1", 100).unwrap();
-        assert_eq!(registry.min_reader_seq(), Some(100));
+            let reg2 = registry.register("worker-2", 150).unwrap();
+            assert_eq!(registry.min_reader_seq(), Some(100));
 
-        let reg2 = registry.register("worker-2", 150).unwrap();
-        assert_eq!(registry.min_reader_seq(), Some(100));
+            reg1.update_cursor(120);
+            assert_eq!(registry.min_reader_seq(), Some(120));
 
-        reg1.update_cursor(120);
-        assert_eq!(registry.min_reader_seq(), Some(120));
+            // cursor 120 = next to read, so 119 is consumed: 200 - 119 = 81 unread
+            assert_eq!(registry.reader_lag(200), 81);
+            assert_eq!(registry.headroom(200, 1024), 1024 - 81);
 
-        assert_eq!(registry.reader_lag(200), 80);
-        assert_eq!(registry.headroom(200, 1024), 1024 - 80);
+            drop(reg1);
+            assert_eq!(registry.min_reader_seq(), Some(150));
+            drop(reg2);
+            assert_eq!(registry.min_reader_seq(), None);
+        });
+    }
 
-        drop(reg1);
-        // worker-1 dropped, so min is now worker-2 at 150
-        assert_eq!(registry.min_reader_seq(), Some(150));
-        drop(reg2);
-        assert_eq!(registry.min_reader_seq(), None);
+    #[test]
+    fn test_dead_reader_reclaimed_without_touching_new_owner() {
+        with_registry(1, |registry| {
+            // Simulate a slot abandoned by a dead process.
+            let slot = registry.slot(0);
+            slot.pid.store(i32::MAX as u32 - 7, Ordering::Release);
+            slot.active.store(1, Ordering::Release);
+            slot.cursor_seq.store(5, Ordering::Release);
+
+            let reg = registry.register("fresh", 42).unwrap();
+            assert_eq!(reg.slot_index(), 0);
+            // A scanner that still believes the dead PID owns the slot must not free it.
+            assert!(!registry.reclaim(0, i32::MAX as u32 - 7));
+            assert_eq!(registry.min_reader_seq(), Some(42));
+        });
+    }
+
+    #[test]
+    fn test_registry_full() {
+        with_registry(1, |registry| {
+            let _a = registry.register("a", 1).unwrap();
+            assert!(matches!(
+                registry.register("b", 1),
+                Err(RingfireError::NoAvailableReaderSlots)
+            ));
+        });
     }
 }
