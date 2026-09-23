@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, Ordering};
+use std::time::{Duration, Instant};
 use memmap2::MmapMut;
 
 use crate::error::Result;
@@ -21,8 +22,11 @@ use crate::signature::LayoutSignature;
 use crate::spmc::{racy_copy, CleanupMode};
 use crate::wait::{wake_futex, WaitStrategy};
 
-/// Spins a producer waits for the previous lap of its slot before taking the slot over.
-const SLOT_TAKEOVER_SPINS: u32 = 1 << 16;
+/// Spins before a producer waiting on its slot starts checking the clock.
+const SLOT_SPINS_BEFORE_CLOCK: u32 = 1 << 12;
+/// How long a producer waits for the previous lap of its slot before taking it over
+/// (older lap) or dropping its own message (slot mid-write).
+const SLOT_STALL_DEADLINE: Duration = Duration::from_millis(10);
 
 /// Multi-producer writer for shared memory ring buffer.
 /// Allows multiple concurrent processes to safely publish messages into the same ring buffer.
@@ -142,7 +146,8 @@ impl<T: Copy + 'static> MpmcProducer<T> {
     ///
     /// Producers that land on the same slot one lap apart are serialized through the
     /// slot's sequence word, so two writers never interleave their payloads. A producer
-    /// that finds a newer lap already in its slot drops its (stale) message.
+    /// that finds a newer lap already in its slot drops its (stale) message, as does one
+    /// whose slot stays mid-write by another producer for more than 10 ms.
     #[inline(always)]
     pub fn push(&self, item: &T) -> u64 {
         unsafe {
@@ -150,15 +155,22 @@ impl<T: Copy + 'static> MpmcProducer<T> {
             let slot = self.slots.add((seq & self.mask) as usize);
             let prev_lap = seq.saturating_sub(self.capacity);
 
+            // Wait for the previous lap to be published, then own the slot via CAS: only
+            // the CAS winner writes, so payloads never interleave. A slot left at an older
+            // lap past the deadline (its producer died between claim and publish) is taken
+            // over by CAS as well. A slot that stays `SLOT_WRITING` is never taken over:
+            // its writer may only be descheduled, and two writers would tear the payload.
+            // After the deadline this message is dropped instead; readers skip the hole.
             let mut spins = 0u32;
+            let mut deadline: Option<Instant> = None;
+            let mut stalled = false;
             loop {
                 let cur = (*slot).seq.load(Ordering::Acquire);
                 if cur != SLOT_WRITING && cur > seq {
                     // A later lap already owns the slot: this message is obsolete.
                     return seq;
                 }
-                let takeover = spins >= SLOT_TAKEOVER_SPINS && cur != SLOT_WRITING;
-                if (cur == prev_lap || takeover)
+                if (cur == prev_lap || (stalled && cur != SLOT_WRITING))
                     && (*slot)
                         .seq
                         .compare_exchange(cur, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed)
@@ -166,19 +178,19 @@ impl<T: Copy + 'static> MpmcProducer<T> {
                 {
                     break;
                 }
-                spins = spins.saturating_add(1);
-                if spins > SLOT_TAKEOVER_SPINS * 2 {
-                    // The slot has been mid-write for a long time: its writer died.
-                    // Take it over rather than wedging every producer that maps here.
-                    if (*slot)
-                        .seq
-                        .compare_exchange(SLOT_WRITING, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        break;
+                spins = spins.wrapping_add(1);
+                if spins >= SLOT_SPINS_BEFORE_CLOCK && spins.is_multiple_of(64) {
+                    let limit = *deadline.get_or_insert_with(|| Instant::now() + SLOT_STALL_DEADLINE);
+                    if Instant::now() >= limit {
+                        if cur == SLOT_WRITING {
+                            return seq;
+                        }
+                        stalled = true;
                     }
+                    std::thread::yield_now();
+                } else {
+                    core::hint::spin_loop();
                 }
-                core::hint::spin_loop();
             }
 
             fence(Ordering::Release);

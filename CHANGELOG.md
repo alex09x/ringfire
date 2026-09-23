@@ -45,7 +45,9 @@ has a regression test in `tests/regression_tests.rs`.
   cursor and rescans only when approaching it or every half ring; liveness checks run only
   while blocked. Cost is on par with lossy mode.
 - **MPMC**: queue consumers hung on overwritten tickets; concurrent producers one lap apart
-  could interleave payloads in a slot. Slots are now taken over by CAS in lap order.
+  could interleave payloads in a slot. Slots are now taken over by CAS in lap order; a slot
+  that stays mid-write for over 10 ms is never taken over (its writer may just be
+  descheduled): the waiting producer drops its message instead of tearing the payload.
 - **Reader registry**: reclaiming a dead reader could wipe a registration that had just
   replaced it (non-CAS store); `update_cursor` used `Relaxed`, letting the producer
   overwrite a slot on AArch64 before the reader finished copying it.
