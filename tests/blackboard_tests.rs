@@ -1,5 +1,5 @@
 use ringfire::{BlackboardConsumer, BlackboardProducer};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -39,12 +39,14 @@ fn test_blackboard_tear_free_concurrent_reads_and_writes() {
     let mut producer = BlackboardProducer::<OrderbookLevel>::create(&tmp_path, num_symbols).unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
+    let reads_done = Arc::new(AtomicU64::new(0));
     let num_readers = 4;
     let mut reader_handles = Vec::new();
 
     for rid in 0..num_readers {
         let p = tmp_path.clone();
         let r_flag = Arc::clone(&running);
+        let r_count = Arc::clone(&reads_done);
         let handle = thread::spawn(move || {
             let consumer = BlackboardConsumer::<OrderbookLevel>::attach(&p).unwrap();
             let mut read_ops = 0u64;
@@ -59,14 +61,19 @@ fn test_blackboard_tear_free_concurrent_reads_and_writes() {
                     );
                 }
                 read_ops += 1;
+                r_count.fetch_add(1, Ordering::Relaxed);
             }
             read_ops
         });
         reader_handles.push(handle);
     }
 
-    // Heavy writes across all symbols
-    for iter in 1..=50_000 {
+    // Heavy writes across all symbols; keep writing until the readers (which may start
+    // late on a loaded machine) have overlapped with enough writes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut iter = 0usize;
+    while iter < 50_000 || (reads_done.load(Ordering::Relaxed) <= 50_000 && std::time::Instant::now() < deadline) {
+        iter += 1;
         let symbol_id = iter % num_symbols;
         let level = OrderbookLevel::new(iter as u64 * 10, iter as u64 * 5, (iter % 100) as u32);
         producer.write(symbol_id, &level).unwrap();

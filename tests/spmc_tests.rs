@@ -329,11 +329,12 @@ fn test_flow_control_lossless_backpressure() {
         (consumer, drained)
     });
 
-    // Blocking push(17) should unblock once reader drains items
+    // Blocking push(17) unblocks as soon as the reader drains its first item
     producer.push(&17);
-    assert_eq!(producer.headroom(), 7);
 
     let (mut consumer, drained) = drain_handle.join().unwrap();
+    // 8 drained, 17 published: 9 unread
+    assert_eq!(producer.headroom(), 7);
     assert_eq!(drained.len(), 8);
     assert_eq!(drained, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
