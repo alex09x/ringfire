@@ -1,15 +1,20 @@
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{fence, Ordering};
+use std::time::{Duration, Instant};
 use memmap2::MmapMut;
 
 use crate::error::{Result, RingfireError};
 use crate::header::{
     BlackboardHeader, BlackboardSlot, BLACKBOARD_MAGIC, BLACKBOARD_VERSION,
 };
-use crate::spmc::CleanupMode;
+use crate::shm::create_backing_file;
+use crate::spmc::{racy_copy, CleanupMode};
+
+/// How long a reader waits on a slot that stays mid-write before reporting
+/// [`RingfireError::WriterStalled`].
+const STALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Producer for a shared memory Blackboard state table.
 /// Provides O(1) tear-free updates using per-slot 64-bit seqlocks.
@@ -29,28 +34,26 @@ unsafe impl<V: Copy + Sync> Sync for BlackboardProducer<V> {}
 
 impl<V: Copy> BlackboardProducer<V> {
     /// Creates a new Blackboard table at `path` capable of holding `slot_count` keys.
+    ///
+    /// The producer holds an exclusive `flock` on the file; a second producer on the same
+    /// path fails with `ProducerAlreadyExists` without disturbing the live table.
     pub fn create<P: AsRef<Path>>(path: P, slot_count: usize) -> Result<Self> {
         let value_size = std::mem::size_of::<V>();
         let slot_size = std::mem::size_of::<BlackboardSlot<V>>();
         let total_size = std::mem::size_of::<BlackboardHeader>() + (slot_count * slot_size);
         let path_buf = path.as_ref().to_path_buf();
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o660)
-            .open(&path_buf)?;
-
-        file.set_len(total_size as u64)?;
+        if slot_count > u32::MAX as usize {
+            return Err(RingfireError::InvalidCapacity(slot_count as u64));
+        }
+        let file = create_backing_file(&path_buf, 0o660, true, total_size as u64)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let header_ptr = mmap.as_mut_ptr().cast::<BlackboardHeader>();
         unsafe {
             header_ptr.write(BlackboardHeader {
-                magic: BLACKBOARD_MAGIC,
+                magic: 0,
                 version: BLACKBOARD_VERSION,
                 value_size: value_size as u32,
                 slot_size: slot_size as u32,
@@ -72,6 +75,8 @@ impl<V: Copy> BlackboardProducer<V> {
                 (*slot).seqlock = std::sync::atomic::AtomicU64::new(0);
             }
         }
+        fence(Ordering::Release);
+        unsafe { std::ptr::write_volatile(&mut (*header_ptr).magic, BLACKBOARD_MAGIC) };
 
         Ok(Self {
             path: path_buf,
@@ -106,8 +111,10 @@ impl<V: Copy> BlackboardProducer<V> {
             let s = (*slot).seqlock.load(Ordering::Relaxed);
             let write_s = if (s & 1) == 0 { s + 1 } else { s + 2 };
 
-            // Step 1: Mark write in progress (odd seqlock)
-            (*slot).seqlock.store(write_s, Ordering::Release);
+            // Step 1: Mark write in progress (odd seqlock); the fence keeps the payload
+            // stores below from becoming visible before the odd marker.
+            (*slot).seqlock.store(write_s, Ordering::Relaxed);
+            fence(Ordering::Release);
 
             // Step 2: Write payload
             std::ptr::copy_nonoverlapping(val, &mut (*slot).value, 1);
@@ -152,14 +159,19 @@ impl<V: Copy> BlackboardConsumer<V> {
     pub fn attach<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
+        if mmap.len() < std::mem::size_of::<BlackboardHeader>() {
+            return Err(RingfireError::CorruptLayout("mapping smaller than the blackboard header"));
+        }
 
         let header_ptr = mmap.as_ptr().cast::<BlackboardHeader>();
         let header = unsafe { &*header_ptr };
 
-        if header.magic != BLACKBOARD_MAGIC {
+        let magic = unsafe { std::ptr::read_volatile(&header.magic) };
+        fence(Ordering::Acquire);
+        if magic != BLACKBOARD_MAGIC {
             return Err(RingfireError::InvalidMagic {
                 expected: BLACKBOARD_MAGIC,
-                actual: header.magic,
+                actual: magic,
             });
         }
 
@@ -179,6 +191,15 @@ impl<V: Copy> BlackboardConsumer<V> {
         }
 
         let slot_count = header.slot_count as usize;
+        if header.slot_size as usize != std::mem::size_of::<BlackboardSlot<V>>() {
+            return Err(RingfireError::CorruptLayout("blackboard slot stride mismatch"));
+        }
+        let end = slot_count
+            .checked_mul(header.slot_size as usize)
+            .and_then(|b| b.checked_add(std::mem::size_of::<BlackboardHeader>()));
+        if end.is_none_or(|e| e > mmap.len()) {
+            return Err(RingfireError::CorruptLayout("blackboard slots extend past the mapping"));
+        }
         let slots_ptr = unsafe {
             mmap.as_ptr()
                 .add(std::mem::size_of::<BlackboardHeader>())
@@ -195,7 +216,9 @@ impl<V: Copy> BlackboardConsumer<V> {
     }
 
     /// Reads the value for `key` in O(1) time using seqlock consistency validation.
-    /// Returns `None` if the slot has never been written.
+    /// Returns `None` if the slot has never been written, and
+    /// [`RingfireError::WriterStalled`] if the slot stays mid-write for over 100 ms
+    /// (the writer was descheduled for that long or died mid-update).
     #[inline]
     pub fn read(&self, key: usize) -> Result<Option<V>> {
         if key >= self.slot_count {
@@ -207,33 +230,33 @@ impl<V: Copy> BlackboardConsumer<V> {
 
         unsafe {
             let slot = self.slots.add(key);
-            let mut spins = 0;
+            let mut spins = 0u32;
+            let mut stalled_since: Option<Instant> = None;
             loop {
                 let s1 = (*slot).seqlock.load(Ordering::Acquire);
                 if s1 == 0 {
                     return Ok(None);
                 }
 
-                // If odd, writer is currently in progress
-                if s1 & 1 != 0 {
-                    core::hint::spin_loop();
-                    spins += 1;
-                    if spins > 10_000 {
-                        std::thread::yield_now();
+                if s1 & 1 == 0 {
+                    let val = racy_copy(&(*slot).value);
+                    fence(Ordering::Acquire);
+                    if (*slot).seqlock.load(Ordering::Relaxed) == s1 {
+                        return Ok(Some(val));
                     }
-                    continue;
                 }
 
-                // Read value
-                let val = std::ptr::read_volatile(&(*slot).value);
-
-                // Check seqlock didn't change
-                let s2 = (*slot).seqlock.load(Ordering::Acquire);
-                if s1 == s2 {
-                    return Ok(Some(val));
+                // Writer in progress (odd) or raced us: back off.
+                spins = spins.saturating_add(1);
+                if spins < 10_000 {
+                    core::hint::spin_loop();
+                } else {
+                    let since = *stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > STALL_TIMEOUT {
+                        return Err(RingfireError::WriterStalled { key });
+                    }
+                    std::thread::yield_now();
                 }
-
-                core::hint::spin_loop();
             }
         }
     }

@@ -1,7 +1,7 @@
 //! # CycleStamp
 //!
-//! Ultra-low-overhead hardware timestamping via `rdtscp`, providing cycle-accurate
-//! elapsed time measurement and CPU core / NUMA node awareness without kernel syscalls.
+//! Ultra-low-overhead hardware timestamping without kernel syscalls: `rdtscp` on x86-64
+//! (with CPU core / NUMA node from `TSC_AUX`) and the `cntvct_el0` generic timer on AArch64.
 
 /// Hardware cycle timestamp with core and NUMA node metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,17 +29,49 @@ impl CycleStamp {
                 numa_node: ((aux >> 12) & 0x00FF) as u16,
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            // Portable fallback: use monotonic clock ticks
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
-            let tsc = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            // Generic timer virtual count: constant-rate, readable from EL0 on Linux and macOS.
+            let tsc: u64;
+            unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) tsc, options(nomem, nostack)) };
             Self {
                 tsc,
                 core_id: 0,
                 numa_node: 0,
             }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            // Portable fallback: nanoseconds since the first call.
+            use std::sync::OnceLock;
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let tsc = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64;
+            Self {
+                tsc,
+                core_id: 0,
+                numa_node: 0,
+            }
+        }
+    }
+
+    /// Frequency of the counter behind [`CycleStamp::tsc`] in Hz, when the hardware reports it.
+    ///
+    /// AArch64 reads `cntfrq_el0`; x86-64 TSC frequency is not architecturally exposed
+    /// (returns `None`); the portable fallback counts nanoseconds (1 GHz).
+    pub fn counter_frequency_hz() -> Option<u64> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let freq: u64;
+            unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack)) };
+            Some(freq)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            None
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Some(1_000_000_000)
         }
     }
 

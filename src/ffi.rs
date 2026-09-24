@@ -1,18 +1,19 @@
-#![allow(clippy::missing_safety_doc, clippy::manual_div_ceil)]
+#![allow(clippy::missing_safety_doc)]
 
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::os::raw::c_char;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use memmap2::MmapMut;
 
 use crate::header::{
-    BlackboardHeader, RingHeader, BLACKBOARD_MAGIC, BLACKBOARD_VERSION,
-    FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+    validate_ring, BlackboardHeader, RingHeader, RingLayout, BLACKBOARD_MAGIC, BLACKBOARD_VERSION,
+    FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, SLOT_WRITING,
 };
+use crate::shm::create_backing_file;
+use crate::spmc::oldest_retained;
 use crate::wait::wake_futex;
 
 pub struct RingProducerRaw {
@@ -29,15 +30,18 @@ pub struct RingProducerRaw {
 
 pub struct RingConsumerRaw {
     _mmap: MmapMut,
-    _header: *const RingHeader,
+    header: *const RingHeader,
     slots_base: *const u8,
     slot_size: usize,
     element_size: usize,
+    capacity: u64,
     mask: u64,
     cursor: u64,
+    lapped_total: u64,
 }
 
 pub struct BlackboardRaw {
+    _file: File,
     _mmap: MmapMut,
     _header: *mut BlackboardHeader,
     slots_base: *mut u8,
@@ -48,96 +52,82 @@ pub struct BlackboardRaw {
     path: PathBuf,
 }
 
+/// Slot stride for an `element_size`-byte payload: 8-byte sequence + payload, 8-aligned.
+/// Matches `size_of::<Slot<T>>()` for any `T` with alignment <= 8.
+fn raw_slot_size(element_size: u32) -> usize {
+    (8 + element_size as usize).next_multiple_of(8)
+}
+
+unsafe fn path_from_c(path: *const c_char) -> Option<PathBuf> {
+    if path.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(path) }.to_str().ok().map(PathBuf::from)
+}
+
+/// Creates a ring for `element_size`-byte records. Returns NULL on invalid arguments, I/O
+/// failure, or if another producer holds the ring.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_producer_create(
     path: *const c_char,
     capacity: u64,
     element_size: u32,
 ) -> *mut RingProducerRaw {
-    unsafe {
-        if path.is_null() || !capacity.is_power_of_two() || element_size == 0 {
-            return std::ptr::null_mut();
-        }
-
-        let c_str = CStr::from_ptr(path);
-        let path_str = match c_str.to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        let path_buf = PathBuf::from(path_str);
-
-        let slot_size = ((8 + element_size as usize + 7) / 8) * 8;
-        let total_size = std::mem::size_of::<RingHeader>() + (capacity as usize * slot_size);
-
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o660)
-            .open(&path_buf)
-        {
-            Ok(f) => f,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let fd = file.as_raw_fd();
-        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            return std::ptr::null_mut();
-        }
-
-        if file.set_len(total_size as u64).is_err() {
-            return std::ptr::null_mut();
-        }
-
-        let mut mmap = match MmapMut::map_mut(&file) {
-            Ok(m) => m,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let header_ptr = mmap.as_mut_ptr().cast::<RingHeader>();
-        header_ptr.write(RingHeader {
-            magic: RINGFIRE_MAGIC,
-            version: RINGFIRE_VERSION,
-            element_size: slot_size as u32,
-            capacity,
-            mask: capacity - 1,
-            write_seq: AtomicU64::new(0),
-            claim_seq: AtomicU64::new(0),
-            flags: FLAG_POLICY_LATEST_WINS | FLAG_MODE_SPMC,
-            futex_word: std::sync::atomic::AtomicU32::new(0),
-            waiting_consumers: std::sync::atomic::AtomicU32::new(0),
-            _align_pad: 0,
-            read_seq: AtomicU64::new(0),
-            schema_sig: 0,
-            arena_offset: 0,
-            arena_size: 0,
-            reader_registry_offset: 0,
-            reader_registry_count: 0,
-            _pad: [0; 24],
-        });
-
-        let slots_base = mmap
-            .as_mut_ptr()
-            .add(std::mem::size_of::<RingHeader>());
-
-        for i in 0..capacity {
-            let slot_ptr = slots_base.add(i as usize * slot_size).cast::<AtomicU64>();
-            slot_ptr.write(AtomicU64::new(0));
-        }
-
-        Box::into_raw(Box::new(RingProducerRaw {
-            _path: path_buf,
-            _file: Some(file),
-            _mmap: mmap,
-            header: header_ptr,
-            slots_base,
-            slot_size,
-            element_size: element_size as usize,
-            mask: capacity - 1,
-            seq: 1,
-        }))
+    let Some(path_buf) = (unsafe { path_from_c(path) }) else {
+        return std::ptr::null_mut();
+    };
+    if !capacity.is_power_of_two() || element_size == 0 {
+        return std::ptr::null_mut();
     }
+
+    let slot_size = raw_slot_size(element_size);
+    let slots_offset = std::mem::size_of::<RingHeader>();
+    let total_size = slots_offset + (capacity as usize * slot_size);
+
+    let Ok(file) = create_backing_file(&path_buf, 0o660, true, total_size as u64) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(mut mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
+        return std::ptr::null_mut();
+    };
+
+    let header_ptr = mmap.as_mut_ptr().cast::<RingHeader>();
+    unsafe {
+        RingHeader::initialize(
+            header_ptr,
+            &RingLayout {
+                capacity,
+                slot_size,
+                flags: FLAG_POLICY_LATEST_WINS | FLAG_MODE_SPMC,
+                schema_sig: 0,
+                claim_seq: 0,
+                read_seq: 0,
+                registry_offset: 0,
+                registry_count: 0,
+                slots_offset,
+                arena_offset: 0,
+                arena_size: 0,
+            },
+        );
+    }
+
+    let slots_base = unsafe { mmap.as_mut_ptr().add(slots_offset) };
+    for i in 0..capacity as usize {
+        unsafe { slots_base.add(i * slot_size).cast::<AtomicU64>().write(AtomicU64::new(0)) };
+    }
+    unsafe { RingHeader::publish(header_ptr) };
+
+    Box::into_raw(Box::new(RingProducerRaw {
+        _path: path_buf,
+        _file: Some(file),
+        _mmap: mmap,
+        header: header_ptr,
+        slots_base,
+        slot_size,
+        element_size: element_size as usize,
+        mask: capacity - 1,
+        seq: 1,
+    }))
 }
 
 #[unsafe(no_mangle)]
@@ -145,133 +135,127 @@ pub unsafe extern "C" fn ringfire_producer_push(
     prod: *mut RingProducerRaw,
     data: *const u8,
 ) -> i32 {
+    if prod.is_null() || data.is_null() {
+        return -1;
+    }
     unsafe {
-        if prod.is_null() || data.is_null() {
-            return -1;
-        }
-
         let p = &mut *prod;
-        let idx = (p.seq & p.mask) as usize;
-        let slot_ptr = p.slots_base.add(idx * p.slot_size);
-        let seq_ptr = slot_ptr.cast::<AtomicU64>();
-        let data_ptr = slot_ptr.add(8);
+        let slot_ptr = p.slots_base.add((p.seq & p.mask) as usize * p.slot_size);
+        let seq_word = &*slot_ptr.cast::<AtomicU64>();
 
-        std::ptr::copy_nonoverlapping(data, data_ptr, p.element_size);
-        (*seq_ptr).store(p.seq, Ordering::Release);
+        seq_word.store(SLOT_WRITING, Ordering::Relaxed);
+        fence(Ordering::Release);
+        std::ptr::copy_nonoverlapping(data, slot_ptr.add(8), p.element_size);
+        seq_word.store(p.seq, Ordering::Release);
         (*p.header).write_seq.store(p.seq, Ordering::Release);
-        wake_futex(&*p.header, 1);
+        wake_futex(&*p.header, i32::MAX);
 
         p.seq += 1;
-        0
     }
+    0
 }
 
+/// Closes the producer. The ring file is left in place (a later create replaces it).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_producer_close(prod: *mut RingProducerRaw) {
-    unsafe {
-        if !prod.is_null() {
-            drop(Box::from_raw(prod));
-        }
+    if !prod.is_null() {
+        drop(unsafe { Box::from_raw(prod) });
     }
 }
 
+/// Attaches to a ring of `element_size`-byte records, starting at the oldest retained
+/// message. Returns NULL if the file is missing, not a v2 ring, or has another record size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_consumer_attach(
     path: *const c_char,
     element_size: u32,
 ) -> *mut RingConsumerRaw {
-    unsafe {
-        if path.is_null() || element_size == 0 {
-            return std::ptr::null_mut();
-        }
+    let Some(path_buf) = (unsafe { path_from_c(path) }) else {
+        return std::ptr::null_mut();
+    };
+    if element_size == 0 {
+        return std::ptr::null_mut();
+    }
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path_buf) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
+        return std::ptr::null_mut();
+    };
 
-        let c_str = CStr::from_ptr(path);
-        let path_str = match c_str.to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
+    let slot_size = raw_slot_size(element_size);
+    let Ok(view) = (unsafe { validate_ring(mmap.as_ptr(), mmap.len(), Some(slot_size), 8) }) else {
+        return std::ptr::null_mut();
+    };
+    let header = mmap.as_ptr().cast::<RingHeader>();
+    let write_seq = unsafe { (*header).write_seq.load(Ordering::Acquire) };
+    let slots_base = unsafe { mmap.as_ptr().add(view.slots_offset) };
 
-        let file = match OpenOptions::new().read(true).write(true).open(path_str) {
-            Ok(f) => f,
-            Err(_) => return std::ptr::null_mut(),
-        };
+    Box::into_raw(Box::new(RingConsumerRaw {
+        _mmap: mmap,
+        header,
+        slots_base,
+        slot_size,
+        element_size: element_size as usize,
+        capacity: view.capacity,
+        mask: view.mask,
+        cursor: oldest_retained(write_seq, view.capacity),
+        lapped_total: 0,
+    }))
+}
 
-        let mmap = match MmapMut::map_mut(&file) {
-            Ok(m) => m,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let header_ptr = mmap.as_ptr().cast::<RingHeader>();
-        let header = &*header_ptr;
-
-        if header.magic != RINGFIRE_MAGIC || header.version != RINGFIRE_VERSION {
-            return std::ptr::null_mut();
-        }
-
-        let slot_size = ((8 + element_size as usize + 7) / 8) * 8;
-        if header.element_size as usize != slot_size {
-            return std::ptr::null_mut();
-        }
-
-        let capacity = header.capacity;
-        let mask = header.mask;
-        let slots_base = mmap.as_ptr().add(std::mem::size_of::<RingHeader>());
-
-        let current_write = header.write_seq.load(Ordering::Acquire);
-        let cursor = if current_write > capacity {
-            current_write - capacity + 1
+impl RingConsumerRaw {
+    fn skip_overwritten(&mut self, seen: u64) -> bool {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        let oldest = oldest_retained(write_seq.max(seen), self.capacity);
+        if oldest > self.cursor {
+            self.lapped_total += oldest - self.cursor;
+            self.cursor = oldest;
+            true
         } else {
-            1
-        };
+            false
+        }
+    }
 
-        Box::into_raw(Box::new(RingConsumerRaw {
-            _mmap: mmap,
-            _header: header_ptr,
-            slots_base,
-            slot_size,
-            element_size: element_size as usize,
-            mask,
-            cursor,
-        }))
+    /// Copies the next message into `out`. Returns false when caught up.
+    unsafe fn next_into(&mut self, out: *mut u8) -> bool {
+        loop {
+            let want = self.cursor;
+            let slot_ptr = unsafe { self.slots_base.add((want & self.mask) as usize * self.slot_size) };
+            let seq_word = unsafe { &*slot_ptr.cast::<AtomicU64>() };
+            let s1 = seq_word.load(Ordering::Acquire);
+            let seen = if s1 == want {
+                unsafe { std::ptr::copy_nonoverlapping(slot_ptr.add(8), out, self.element_size) };
+                fence(Ordering::Acquire);
+                let s2 = seq_word.load(Ordering::Relaxed);
+                if s2 == want {
+                    self.cursor += 1;
+                    return true;
+                }
+                if s2 == SLOT_WRITING { 0 } else { s2 }
+            } else if s1 == SLOT_WRITING || s1 < want {
+                return false;
+            } else {
+                s1
+            };
+            if !self.skip_overwritten(seen) {
+                return false;
+            }
+        }
     }
 }
 
+/// Returns 1 if a message was copied into `out_data`, 0 if the ring is caught up, -1 on
+/// invalid arguments. Messages lost to lapping are skipped (see `ringfire_consumer_lapped_count`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_consumer_try_recv(
     cons: *mut RingConsumerRaw,
     out_data: *mut u8,
 ) -> i32 {
-    unsafe {
-        if cons.is_null() || out_data.is_null() {
-            return -1;
-        }
-
-        let c = &mut *cons;
-        let idx = (c.cursor & c.mask) as usize;
-        let slot_ptr = c.slots_base.add(idx * c.slot_size);
-        let seq_ptr = slot_ptr.cast::<AtomicU64>();
-        let s1 = (*seq_ptr).load(Ordering::Acquire);
-
-        if s1 < c.cursor {
-            return 0; // Empty
-        }
-
-        if s1 > c.cursor {
-            c.cursor = s1; // Lapped
-        }
-
-        let data_ptr = slot_ptr.add(8);
-        std::ptr::copy_nonoverlapping(data_ptr, out_data, c.element_size);
-
-        let s2 = (*seq_ptr).load(Ordering::Acquire);
-        if s1 != s2 {
-            c.cursor = s2;
-            return 0; // Overwritten during read, retry next time
-        }
-
-        c.cursor += 1;
-        1 // Success
+    if cons.is_null() || out_data.is_null() {
+        return -1;
     }
+    unsafe { (*cons).next_into(out_data) as i32 }
 }
 
 #[unsafe(no_mangle)]
@@ -280,52 +264,30 @@ pub unsafe extern "C" fn ringfire_consumer_recv_batch(
     out_buf: *mut u8,
     max_count: usize,
 ) -> usize {
-    unsafe {
-        if cons.is_null() || out_buf.is_null() || max_count == 0 {
-            return 0;
-        }
-
-        let c = &mut *cons;
-        let mut count = 0;
-
-        while count < max_count {
-            let idx = (c.cursor & c.mask) as usize;
-            let slot_ptr = c.slots_base.add(idx * c.slot_size);
-            let seq_ptr = slot_ptr.cast::<AtomicU64>();
-            let s1 = (*seq_ptr).load(Ordering::Acquire);
-
-            if s1 < c.cursor {
-                break;
-            }
-
-            if s1 > c.cursor {
-                c.cursor = s1;
-            }
-
-            let data_ptr = slot_ptr.add(8);
-            let dst = out_buf.add(count * c.element_size);
-            std::ptr::copy_nonoverlapping(data_ptr, dst, c.element_size);
-
-            let s2 = (*seq_ptr).load(Ordering::Acquire);
-            if s1 != s2 {
-                c.cursor = s2;
-                break;
-            }
-
-            c.cursor += 1;
-            count += 1;
-        }
-
-        count
+    if cons.is_null() || out_buf.is_null() {
+        return 0;
     }
+    let c = unsafe { &mut *cons };
+    let mut count = 0;
+    while count < max_count && unsafe { c.next_into(out_buf.add(count * c.element_size)) } {
+        count += 1;
+    }
+    count
+}
+
+/// Total number of messages this consumer skipped because the producer lapped it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ringfire_consumer_lapped_count(cons: *const RingConsumerRaw) -> u64 {
+    if cons.is_null() {
+        return 0;
+    }
+    unsafe { (*cons).lapped_total }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_consumer_close(cons: *mut RingConsumerRaw) {
-    unsafe {
-        if !cons.is_null() {
-            drop(Box::from_raw(cons));
-        }
+    if !cons.is_null() {
+        drop(unsafe { Box::from_raw(cons) });
     }
 }
 
@@ -335,46 +297,27 @@ pub unsafe extern "C" fn ringfire_blackboard_create(
     slot_count: usize,
     value_size: usize,
 ) -> *mut BlackboardRaw {
+    let Some(path_buf) = (unsafe { path_from_c(path) }) else {
+        return std::ptr::null_mut();
+    };
+    if slot_count == 0 || value_size == 0 || slot_count > u32::MAX as usize || value_size > u32::MAX as usize {
+        return std::ptr::null_mut();
+    }
+
+    let slot_size = (8 + value_size).next_multiple_of(64);
+    let total_size = std::mem::size_of::<BlackboardHeader>() + (slot_count * slot_size);
+
+    let Ok(file) = create_backing_file(&path_buf, 0o660, true, total_size as u64) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(mut mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
+        return std::ptr::null_mut();
+    };
+
+    let header_ptr = mmap.as_mut_ptr().cast::<BlackboardHeader>();
     unsafe {
-        if path.is_null() || slot_count == 0 || value_size == 0 {
-            return std::ptr::null_mut();
-        }
-
-        let c_str = CStr::from_ptr(path);
-        let path_str = match c_str.to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        let path_buf = PathBuf::from(path_str);
-
-        let raw_slot_size = 8 + value_size;
-        let slot_size = ((raw_slot_size + 63) / 64) * 64;
-        let total_size = std::mem::size_of::<BlackboardHeader>() + (slot_count * slot_size);
-
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o660)
-            .open(&path_buf)
-        {
-            Ok(f) => f,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        if file.set_len(total_size as u64).is_err() {
-            return std::ptr::null_mut();
-        }
-
-        let mut mmap = match MmapMut::map_mut(&file) {
-            Ok(m) => m,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let header_ptr = mmap.as_mut_ptr().cast::<BlackboardHeader>();
         header_ptr.write(BlackboardHeader {
-            magic: BLACKBOARD_MAGIC,
+            magic: 0,
             version: BLACKBOARD_VERSION,
             value_size: value_size as u32,
             slot_size: slot_size as u32,
@@ -382,27 +325,26 @@ pub unsafe extern "C" fn ringfire_blackboard_create(
             _reserved: [0; 2],
             _pad: [0; 88],
         });
-
-        let slots_base = mmap
-            .as_mut_ptr()
-            .add(std::mem::size_of::<BlackboardHeader>());
-
-        for i in 0..slot_count {
-            let seqlock_ptr = slots_base.add(i * slot_size).cast::<AtomicU64>();
-            seqlock_ptr.write(AtomicU64::new(0));
-        }
-
-        Box::into_raw(Box::new(BlackboardRaw {
-            _mmap: mmap,
-            _header: header_ptr,
-            slots_base,
-            slot_size,
-            value_size,
-            slot_count,
-            is_producer: true,
-            path: path_buf,
-        }))
     }
+
+    let slots_base = unsafe { mmap.as_mut_ptr().add(std::mem::size_of::<BlackboardHeader>()) };
+    for i in 0..slot_count {
+        unsafe { slots_base.add(i * slot_size).cast::<AtomicU64>().write(AtomicU64::new(0)) };
+    }
+    fence(Ordering::Release);
+    unsafe { std::ptr::write_volatile(&mut (*header_ptr).magic, BLACKBOARD_MAGIC) };
+
+    Box::into_raw(Box::new(BlackboardRaw {
+        _file: file,
+        _mmap: mmap,
+        _header: header_ptr,
+        slots_base,
+        slot_size,
+        value_size,
+        slot_count,
+        is_producer: true,
+        path: path_buf,
+    }))
 }
 
 #[unsafe(no_mangle)]
@@ -410,55 +352,54 @@ pub unsafe extern "C" fn ringfire_blackboard_attach(
     path: *const c_char,
     value_size: usize,
 ) -> *mut BlackboardRaw {
-    unsafe {
-        if path.is_null() || value_size == 0 {
-            return std::ptr::null_mut();
-        }
-
-        let c_str = CStr::from_ptr(path);
-        let path_str = match c_str.to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let file = match OpenOptions::new().read(true).write(true).open(path_str) {
-            Ok(f) => f,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let mmap = match MmapMut::map_mut(&file) {
-            Ok(m) => m,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let header_ptr = mmap.as_ptr().cast::<BlackboardHeader>();
-        let header = &*header_ptr;
-
-        if header.magic != BLACKBOARD_MAGIC || header.version != BLACKBOARD_VERSION {
-            return std::ptr::null_mut();
-        }
-
-        if header.value_size as usize != value_size {
-            return std::ptr::null_mut();
-        }
-
-        let slot_count = header.slot_count as usize;
-        let slot_size = header.slot_size as usize;
-        let slots_base = mmap
-            .as_ptr()
-            .add(std::mem::size_of::<BlackboardHeader>());
-
-        Box::into_raw(Box::new(BlackboardRaw {
-            _mmap: mmap,
-            _header: header_ptr as *mut BlackboardHeader,
-            slots_base: slots_base as *mut u8,
-            slot_size,
-            value_size,
-            slot_count,
-            is_producer: false,
-            path: PathBuf::from(path_str),
-        }))
+    let Some(path_buf) = (unsafe { path_from_c(path) }) else {
+        return std::ptr::null_mut();
+    };
+    if value_size == 0 {
+        return std::ptr::null_mut();
     }
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path_buf) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
+        return std::ptr::null_mut();
+    };
+    if mmap.len() < std::mem::size_of::<BlackboardHeader>() {
+        return std::ptr::null_mut();
+    }
+
+    let header_ptr = mmap.as_ptr().cast::<BlackboardHeader>();
+    let header = unsafe { &*header_ptr };
+    let magic = unsafe { std::ptr::read_volatile(&header.magic) };
+    fence(Ordering::Acquire);
+    if magic != BLACKBOARD_MAGIC || header.version != BLACKBOARD_VERSION {
+        return std::ptr::null_mut();
+    }
+    if header.value_size as usize != value_size {
+        return std::ptr::null_mut();
+    }
+
+    let slot_count = header.slot_count as usize;
+    let slot_size = header.slot_size as usize;
+    let end = slot_count
+        .checked_mul(slot_size)
+        .and_then(|b| b.checked_add(std::mem::size_of::<BlackboardHeader>()));
+    if slot_size < 8 + value_size || end.is_none_or(|e| e > mmap.len()) {
+        return std::ptr::null_mut();
+    }
+    let slots_base = unsafe { mmap.as_ptr().add(std::mem::size_of::<BlackboardHeader>()) };
+
+    Box::into_raw(Box::new(BlackboardRaw {
+        _file: file,
+        _mmap: mmap,
+        _header: header_ptr as *mut BlackboardHeader,
+        slots_base: slots_base as *mut u8,
+        slot_size,
+        value_size,
+        slot_count,
+        is_producer: false,
+        path: path_buf,
+    }))
 }
 
 #[unsafe(no_mangle)]
@@ -467,85 +408,82 @@ pub unsafe extern "C" fn ringfire_blackboard_write(
     key: usize,
     data: *const u8,
 ) -> i32 {
+    if bb.is_null() || data.is_null() {
+        return -1;
+    }
     unsafe {
-        if bb.is_null() || data.is_null() {
-            return -1;
-        }
-
         let b = &mut *bb;
         if key >= b.slot_count {
             return -1;
         }
 
         let slot_ptr = b.slots_base.add(key * b.slot_size);
-        let seqlock_ptr = slot_ptr.cast::<AtomicU64>();
-        let s = (*seqlock_ptr).load(Ordering::Relaxed);
+        let seqlock = &*slot_ptr.cast::<AtomicU64>();
+        let s = seqlock.load(Ordering::Relaxed);
         let write_s = if s % 2 == 0 { s + 1 } else { s + 2 };
 
-        (*seqlock_ptr).store(write_s, Ordering::Release);
-        let val_ptr = slot_ptr.add(8);
-        std::ptr::copy_nonoverlapping(data, val_ptr, b.value_size);
-        (*seqlock_ptr).store(write_s + 1, Ordering::Release);
-
-        0
+        seqlock.store(write_s, Ordering::Relaxed);
+        fence(Ordering::Release);
+        std::ptr::copy_nonoverlapping(data, slot_ptr.add(8), b.value_size);
+        seqlock.store(write_s + 1, Ordering::Release);
     }
+    0
 }
 
+/// Returns 1 if read, 0 if the key was never written, -1 on invalid arguments, and -2 if
+/// the slot stayed mid-write for over 100 ms (writer stalled or crashed).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_blackboard_read(
     bb: *const BlackboardRaw,
     key: usize,
     out_data: *mut u8,
 ) -> i32 {
+    if bb.is_null() || out_data.is_null() {
+        return -1;
+    }
     unsafe {
-        if bb.is_null() || out_data.is_null() {
-            return -1;
-        }
-
         let b = &*bb;
         if key >= b.slot_count {
             return -1;
         }
 
         let slot_ptr = b.slots_base.add(key * b.slot_size);
-        let seqlock_ptr = slot_ptr.cast::<AtomicU64>();
-        let val_ptr = slot_ptr.add(8);
+        let seqlock = &*slot_ptr.cast::<AtomicU64>();
 
-        let mut spins = 0;
+        let mut spins = 0u32;
+        let mut stalled_since: Option<Instant> = None;
         loop {
-            let s1 = (*seqlock_ptr).load(Ordering::Acquire);
+            let s1 = seqlock.load(Ordering::Acquire);
             if s1 == 0 {
-                return 0; // Unwritten
+                return 0;
             }
-
-            if s1 & 1 != 0 {
-                core::hint::spin_loop();
-                spins += 1;
-                if spins > 10_000 {
-                    std::thread::yield_now();
+            if s1 & 1 == 0 {
+                std::ptr::copy_nonoverlapping(slot_ptr.add(8), out_data, b.value_size);
+                fence(Ordering::Acquire);
+                if seqlock.load(Ordering::Relaxed) == s1 {
+                    return 1;
                 }
-                continue;
             }
-
-            std::ptr::copy_nonoverlapping(val_ptr, out_data, b.value_size);
-            let s2 = (*seqlock_ptr).load(Ordering::Acquire);
-            if s1 == s2 {
-                return 1; // Read successfully
+            spins = spins.saturating_add(1);
+            if spins < 10_000 {
+                core::hint::spin_loop();
+            } else {
+                let since = *stalled_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_millis(100) {
+                    return -2;
+                }
+                std::thread::yield_now();
             }
-
-            core::hint::spin_loop();
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ringfire_blackboard_close(bb: *mut BlackboardRaw) {
-    unsafe {
-        if !bb.is_null() {
-            let b = Box::from_raw(bb);
-            if b.is_producer {
-                let _ = std::fs::remove_file(&b.path);
-            }
+    if !bb.is_null() {
+        let b = unsafe { Box::from_raw(bb) };
+        if b.is_producer {
+            let _ = std::fs::remove_file(&b.path);
         }
     }
 }

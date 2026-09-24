@@ -1,13 +1,50 @@
 # ringfire 🔥
 
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.3.0-orange.svg)](https://crates.io/crates/ringfire)
+[![Crates.io](https://img.shields.io/crates/v/ringfire.svg)](https://crates.io/crates/ringfire)
 [![Documentation](https://docs.rs/ringfire/badge.svg)](https://docs.rs/ringfire)
+[![CI](https://github.com/alex09x/ringfire/actions/workflows/ci.yml/badge.svg)](https://github.com/alex09x/ringfire/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-brightgreen.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-brightgreen.svg)](https://www.rust-lang.org)
 
 **`ringfire`** is an ultra-low-latency, zero-copy, lock-free **Inter-Process Communication (IPC)** ring buffer and shared memory state bus for Linux.
 
 It is engineered for high-frequency trading (HFT) engines, real-time market data ingestion, telemetry buses, and performance-critical distributed pipelines where microsecond socket latencies and kernel overhead are unacceptable.
+
+## ⚡ Performance at a Glance
+
+**Round trip of a 64-byte message between two threads**, same machine, same harness
+(`cargo bench --bench ipc_compare`, AMD Ryzen 9 7950X, Linux 6.8, v0.4.0):
+
+| Transport | Round trip | vs. ringfire (spin) |
+| :--- | ---: | ---: |
+| **ringfire**, busy-spin readers | **0.32 µs** | 1× |
+| **ringfire**, `FutexWait` (sleeps in the kernel when idle) | **2.27 µs** | 7× |
+| Unix domain socket | 4.76 µs | 15× |
+| Pipe | 4.93 µs | 15× |
+| TCP loopback (`TCP_NODELAY`) | 10.28 µs | 32× |
+
+```mermaid
+xychart-beta
+    title "64-byte round trip, microseconds (lower is better)"
+    x-axis ["ringfire spin", "ringfire futex", "Unix socket", "Pipe", "TCP loopback"]
+    y-axis "µs" 0 --> 11
+    bar [0.32, 2.27, 4.76, 4.93, 10.28]
+```
+
+**Hot-path costs** (`cargo bench --bench throughput`, 64-byte messages):
+
+| Operation | Time | Rate |
+| :--- | ---: | ---: |
+| `push` (no reader attached) | 1.88 ns | 533 M msg/s |
+| `try_recv` | 6.4 ns | 156 M msg/s |
+| `recv_batch(32)` | 2.3 ns / msg | 431 M msg/s |
+| `push` with a reader draining on another core | 41 ns | 24 M msg/s |
+| Blackboard read / write (O(1) seqlock) | 2.1 / 1.1 ns | — |
+
+The last `push` row is the realistic cross-process figure: it is bound by moving cache lines
+between cores, and costs the same with lossless backpressure enabled (+0.8 ns). Every read is
+validated against concurrent overwrites; the regression suite verifies zero torn records under
+continuous lapping on x86-64 and AArch64. Full numbers: [Detailed Benchmarks](#-detailed-benchmarks-amd-ryzen-9-7950x-on-linux-booster).
 
 ---
 
@@ -15,13 +52,13 @@ It is engineered for high-frequency trading (HFT) engines, real-time market data
 
 When communicating between processes on the same host, developers usually default to Unix Domain Sockets (UDS), TCP loopback, pipes, ZeroMQ, or broker-based message queues (NATS, Redis). In high-throughput, low-latency environments, these primitives introduce severe architectural bottlenecks:
 
-| IPC Mechanism | Kernel Overhead | Memory Copies | Typical Latency | Backpressure / Crash Behavior |
+| IPC Mechanism | Kernel Overhead | Memory Copies | One-way Latency | Backpressure / Crash Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| **Unix Domain Sockets (UDS)** | 2 syscalls (`send`/`recv`) + context switch | User $\to$ Kernel $\to$ User (2 copies) | 2,000 – 15,000 ns (2–15 µs) | Socket buffer fills up; blocks producer or drops packets |
-| **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | 5,000 – 25,000 ns (5–25 µs) | Heavy CPU jitter, flow control stalls |
-| **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | 1,500 – 8,000 ns (1.5–8 µs) | Blocking write when pipe buffer (64 KB) fills |
-| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (50–500 µs) | High GC/memory pressure, single point of failure |
-| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **0 copies (in-place memory access)** | **< 30 nanoseconds** | **Writer is unblockable; crash-isolated** |
+| **Unix Domain Sockets (UDS)** | 2 syscalls (`send`/`recv`) + context switch | User $\to$ Kernel $\to$ User (2 copies) | ~2,400 ns measured (RTT / 2) | Socket buffer fills up; blocks producer or drops packets |
+| **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | ~5,100 ns measured (RTT / 2) | Heavy CPU jitter, flow control stalls |
+| **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | ~2,500 ns measured (RTT / 2) | Blocking write when pipe buffer (64 KB) fills |
+| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (typical, not measured) | High GC/memory pressure, single point of failure |
+| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **1 copy (payload into the slot)** | **~160 ns one-way (measured)** | **Writer never blocks (lossy) or throttles on the slowest reader (lossless); crash-isolated** |
 
 ### The Three Critical Pain Points:
 1. **The Syscall & Context Switch Tax**: Every `write()` and `read()` triggers CPU privilege elevation from user-space to kernel-space and back, polluting CPU L1/L2 caches and branch predictors.
@@ -38,7 +75,7 @@ When communicating between processes on the same host, developers usually defaul
 - **Atomic Acquire/Release Synchronization**: State is coordinated via 64-bit atomic sequence numbers using CPU-level memory barriers (`core::sync::atomic`), completely bypassing the operating system kernel.
 - **Single-Writer Freedom (`LatestWins` Policy)**: The producer always writes to the ring. Slow, paused, or dead consumers can never block, stall, or crash the producer. If a consumer falls behind the ring buffer capacity, it detects that it was lapped and skips cleanly to the live stream.
 - **Cache-Line Isolated Layout**: Memory structures are aligned to 128-byte cache lines to eliminate false sharing between producer write heads and consumer read heads.
-- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers can instantly inspect the latest state (e.g., current Best Bid & Offer for 500 coins) in ~5 nanoseconds without replaying historical events.
+- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers can instantly inspect the latest state (e.g., current Best Bid & Offer for 500 coins) in ~2 nanoseconds without replaying historical events.
 - **Polyglot First-Class Support**: Because the layout in `/dev/shm` is standard C-ABI memory, consumers can be written in Rust, C, C++, or Python (`mmap` + `ctypes`/`numpy`) with zero bridge penalty.
 
 ---
@@ -63,29 +100,38 @@ When communicating between processes on the same host, developers usually defaul
 │                                  ringfire                                   │
 │           • Inter-process lock-free ring buffer via /dev/shm                │
 │           • O(1) Shared State Blackboard (Seqlock)                          │
-│           • Sub-50ns latency, C11 header, Python zero-copy bindings         │
+│           • ~160 ns cross-core latency, C11 header, Python bindings         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Verified Benchmarks (AMD Ryzen 9 7950X on Linux `booster`)
+## 🚀 Detailed Benchmarks (AMD Ryzen 9 7950X on Linux `booster`)
 
 Benchmarked using Criterion directly against POSIX shared memory (`/dev/shm`) on host `booster` (16 Cores / 32 Threads, Linux 6.8):
 
-| Metric | Measured Value | Rate / Target |
+Measured with protocol v2 (v0.4.0), 64-byte messages:
+
+| Metric | Measured Value | Rate / Notes |
 | :--- | :--- | :--- |
-| **SPMC Single-Message Push** | **1.70 ns** | **588.70 Million msgs / sec** |
-| **SPMC Non-Blocking `try_recv`** | **11.94 ns** | **83.74 Million msgs / sec** |
-| **SPMC Batch Drain (`recv_batch(32)`)** | **262 ns** (8.1 ns / msg) | **121.9 Million msgs / sec** |
-| **Roundtrip Latency (Ping-Pong RTT)** | **245.80 ns** | ~61 ns one-way cross-thread IPC |
-| **Blackboard Seqlock Read (O(1))** | **4.09 ns** | Direct sub-5ns snapshot read |
-| **Blackboard Seqlock Write (O(1))** | **1.19 ns** | Instant atomic update |
-| **Multi-Process Saturation** | **1 writer + 8 readers** | 100% verified zero gaps / zero corruption |
+| **SPMC Single-Message Push** (no reader) | **1.88 ns** | 533 Million msgs / sec |
+| **SPMC Non-Blocking `try_recv`** | **6.41 ns** | 156 Million msgs / sec |
+| **SPMC Batch Drain (`recv_batch(32)`)** | **74.2 ns** (2.3 ns / msg) | 431 Million msgs / sec |
+| **Push with a reader draining on another core** | **41.2 ns** lossy / **42.0 ns** lossless | Cross-core cache-line transfer; the lossless gate adds < 1 ns |
+| **Roundtrip Latency (Ping-Pong RTT)** | **249.6 ns** | ~125 ns one-way cross-thread IPC |
+| **Blackboard Seqlock Read (O(1))** | **2.13 ns** | Tear-free snapshot read |
+| **Blackboard Seqlock Write (O(1))** | **1.13 ns** | Seqlock update |
+| **Multi-Process Saturation** | **1 writer + 8 readers** | Zero gaps / zero corruption |
+
+Single-threaded figures measure the instruction path with a warm cache; real cross-process
+throughput is bounded by the cross-core transfer shown in the "with a reader" row.
+`tests/regression_tests.rs` checks that no torn record is ever returned under continuous lapping.
 
 ---
 
 ## 📦 Quickstart (Rust)
+
+All snippets below are compiled and run in CI as [`examples/quickstart.rs`](examples/quickstart.rs) (`cargo run --example quickstart`).
 
 ### 1. Producer: Publish Fixed-Size Binary Records
 
@@ -112,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timestamp_ns: 1_726_870_000_000_000,
     };
 
-    // Pushes ticker directly to shared memory (1.70 ns)
+    // Pushes ticker directly to shared memory (~2 ns)
     producer.push(&ticker);
 
     Ok(())
@@ -162,11 +208,11 @@ use ringfire::{BlackboardProducer, BlackboardConsumer};
 
 // Producer updates snapshot table
 let mut bb_prod = BlackboardProducer::<MarketTicker>::create("/dev/shm/hft_state_table", 1024)?;
-bb_prod.write(42, &ticker)?; // 1.19 ns write
+bb_prod.write(42, &ticker)?; // ~1.1 ns write
 
 // Consumer reads instantaneous current state by asset ID
 let bb_cons = BlackboardConsumer::<MarketTicker>::attach("/dev/shm/hft_state_table")?;
-if let Some(state) = bb_cons.read(42)? { // 4.09 ns O(1) tear-free read
+if let Some(state) = bb_cons.read(42)? { // ~2.1 ns O(1) tear-free read
     println!("Current BBO for asset 42: bid={}, ask={}", state.bid_px, state.ask_px);
 }
 ```
@@ -183,10 +229,10 @@ let mut producer = RingProducer::<[u8; 64]>::create("/dev/shm/raw_stream", 65536
 let raw_bytes = [0xAAu8; 64];
 producer.push(&raw_bytes);
 
-// Consumer reads the 64 bytes and casts to struct in-place
+// Consumer reads the 64 bytes and decodes the struct (byte arrays are not aligned for it)
 let mut consumer = AsyncRingConsumer::<[u8; 64]>::attach("/dev/shm/raw_stream")?;
 let bytes: [u8; 64] = consumer.recv().await;
-let ticker: &MarketTicker = unsafe { &*(bytes.as_ptr() as *const MarketTicker) };
+let ticker: MarketTicker = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
 ```
 
 ### 6. Variable-Length Payloads (`BlobProducer` & `BlobConsumer`)
@@ -198,36 +244,44 @@ use ringfire::{BlobProducerBuilder, BlobConsumer};
 
 // Create a ring with 65,536 descriptor slots and a 16 MB byte arena
 let mut producer = BlobProducerBuilder::new(65536, 16 * 1024 * 1024)
-    .build::<u32>("/dev/shm/orderbook_stream")?;
+    .build::<u32, _>("/dev/shm/orderbook_stream")?;
 
 // Push variable-length JSON, protobuf, or raw bytes directly into the arena
 let raw_json = br#"{"event":"snapshot","bids":[[82000.5,1.2]],"asks":[[82001.0,0.8]]}"#;
-producer.push_blob(&42, raw_json)?;
+producer.push(&42, raw_json)?;
 
-// Consumer receives the metadata and views the arena payload zero-copy in-place
+// Consumer copies metadata + payload out of the arena, validated against overwrites
 let mut consumer = BlobConsumer::<u32>::attach("/dev/shm/orderbook_stream")?;
+let mut meta = 0u32;
 let mut scratch_buffer = vec![0u8; 4096];
-if let Ok(meta) = consumer.recv_copy(&mut scratch_buffer) {
-    println!("Received snapshot for symbol {}", meta);
+if let Some(len) = consumer.recv(&mut meta, &mut scratch_buffer)? {
+    println!("Received {} byte snapshot for symbol {}", len, meta);
 }
+
+// Or inspect in place: the closure's result is discarded if the arena laps during it
+let summary = consumer.view(|symbol, bytes| (*symbol, bytes.len()))?;
 ```
+
+If the arena wraps around before a consumer gets to a message (payloads larger than
+`arena_capacity / ring capacity` on average), that message is skipped and counted in
+`lapped_count()`; size the arena for the backlog you need to retain.
 
 ### 7. Consumer Start Modes & Lock-Free SHM Checkpointing
 
-Consumers can configure where in the stream to begin reading, and persist their read cursors lock-free into `/dev/shm` (<10ns seqlock commit):
+Consumers can configure where in the stream to begin reading, and persist their read cursors lock-free into `/dev/shm` (a single atomic store plus a timestamp):
 
 ```rust
-use ringfire::{RingConsumerBuilder, ConsumerStartMode, OffsetCheckpoint};
+use ringfire::{RingConsumerBuilder, ConsumerStartMode};
 
-let mut consumer = RingConsumerBuilder::new()
+let mut consumer = RingConsumerBuilder::<MarketTicker>::new()
     // Modes: Latest (instant jump), Head (wait for future), Oldest (replay backlog), Sequence(N)
     .start_mode(ConsumerStartMode::Latest)
-    .attach::<MarketTicker>("/dev/shm/hft_ticker_stream")?;
+    .attach("/dev/shm/hft_ticker_stream")?;
 
 // Or attach with persistent offset checkpoint in /dev/shm:
-let mut persistent_consumer = RingConsumerBuilder::new()
-    .offset_path("/dev/shm/hft_ticker_stream_worker1.offset")
-    .attach::<MarketTicker>("/dev/shm/hft_ticker_stream")?;
+let mut persistent_consumer = RingConsumerBuilder::<MarketTicker>::new()
+    .offset_file("/dev/shm/hft_ticker_stream_worker1.offset")
+    .attach("/dev/shm/hft_ticker_stream")?;
 
 // In consumer loop, periodically or per-batch commit offset:
 persistent_consumer.commit_offset()?;
@@ -238,11 +292,11 @@ persistent_consumer.commit_offset()?;
 While default `ringfire` channels operate in `LatestWins` lossy mode (writer never blocks), streaming pipelines requiring zero message drops can enable `LosslessBackpressure`:
 
 ```rust
-use ringfire::{RingProducerBuilder, FlowControl, RingConsumer};
+use ringfire::{RingProducerBuilder, FlowControl, RingfireError};
 
-let mut producer = RingProducerBuilder::new()
+let mut producer = RingProducerBuilder::new(4096)
     .flow_control(FlowControl::LosslessBackpressure)
-    .create::<MarketTicker>("/dev/shm/reliable_stream", 4096)?;
+    .build::<MarketTicker, _>("/dev/shm/reliable_stream")?;
 
 // Writer throttles (via spin/yield backoff) if slowest registered reader is about to be lapped:
 producer.push(&ticker);
@@ -255,6 +309,20 @@ match producer.try_push(&ticker) {
 }
 ```
 
+What the guarantee covers:
+- Only **Rust `RingConsumer`s registered in the ring's reader registry** hold the producer back
+  (default 32 slots, `RingProducerBuilder::max_readers`). On a lossless ring, attaching when
+  the registry is full fails with `NoAvailableReaderSlots`. Python and C readers do not
+  register and can be lapped.
+- A reader is protected from the moment the producer observes its registration (the
+  producer rescans at least every half ring); a reader starting from `Oldest` on a busy
+  ring can still find its first messages gone and reports them via `lapped_count()`.
+- Reader liveness is checked by PID. Readers in another PID namespace (a different
+  container) look dead to the producer and are dropped from the registry: share the PID
+  namespace when using lossless mode across containers.
+- The producer checks the registry only when it approaches the slowest cached cursor, so
+  the lossless hot path has no syscalls and costs under 1 ns over lossy mode.
+
 ### 9. Multi-Channel Multiplexing (`RingMultiplexer` & `AsyncRingMultiplexer`)
 
 Multiplex across multiple distinct ring buffer streams with fair Round-Robin or strict Priority scheduling:
@@ -266,8 +334,8 @@ let c1 = RingConsumer::<MarketTicker>::attach("/dev/shm/stream_btc")?;
 let c2 = RingConsumer::<MarketTicker>::attach("/dev/shm/stream_eth")?;
 
 let mut mux = RingMultiplexer::new();
-mux.add_channel(c1);
-mux.add_channel(c2);
+mux.add(c1);
+mux.add(c2);
 
 // Fair Round-Robin across all channels
 if let Some((channel_idx, ticker)) = mux.try_recv_any() {
@@ -307,13 +375,23 @@ In cross-process shared memory with a non-blocking writer (`LatestWins`), return
 - If a consumer holds a raw pointer to slot $K$, and the writer laps the buffer and begins overwriting slot $K$ on another CPU core, the consumer will observe a **torn read** (half old data, half new data).
 - In high-frequency trading and order book streaming, a torn read corrupts prices and sizes, leading to disastrous trading errors.
 
-### The `ringfire` Solution: Two-Phase Seqlock Validation
-`ringfire` enforces tear-free memory safety without locks:
-1. Consumer loads slot sequence $s_1$ with `Ordering::Acquire`.
-2. Copies the payload into the consumer's local registers/stack (takes **1 CPU clock cycle** for 32–64B via `vmovups`).
-3. Loads slot sequence $s_2$ with `Ordering::Acquire`.
-4. If $s_1 == s_2$, the copy is mathematically guaranteed to be **consistent, uncorrupted, and tear-free**.
-5. If $s_1 \neq s_2$ (writer updated the slot mid-read), the consumer immediately discards the partial copy and re-evaluates the latest sequence.
+### The `ringfire` Solution: Slot Seqlock (protocol v2)
+`ringfire` enforces tear-free reads without locks. The writer:
+1. Stores `SLOT_WRITING` (`u64::MAX`) into the slot sequence, then a release fence.
+2. Copies the payload.
+3. Stores the message sequence with `Ordering::Release`.
+
+The reader:
+1. Loads the slot sequence $s_1$ with `Ordering::Acquire`; proceeds only if $s_1$ is the
+   sequence it wants.
+2. Copies the payload into its own stack/registers.
+3. Issues an acquire fence and reloads the sequence $s_2$.
+4. If $s_1 = s_2$, the copy is consistent. Otherwise the writer lapped the reader
+   mid-copy: the copy is discarded and the reader jumps to the oldest retained message,
+   counting the gap in `lapped_count()`.
+
+Before v0.4.0 the writer skipped step 1, so a reader exactly one slot short of being
+lapped could accept a half-overwritten payload; the regression suite now hammers this case.
 
 > [!WARNING]
 > **Anti-Pattern: Returning Raw Pointers into Shared Memory (`*const T`)**
@@ -328,16 +406,30 @@ In cross-process shared memory with a non-blocking writer (`LatestWins`), return
 
 `ringfire` supports selectable wait strategies depending on CPU budget:
 
-- **`WaitStrategy::BusySpin`**: Sub-30ns reaction time. Spins tightly on CPU (`core::hint::spin_loop()`). Recommended for dedicated HFT cores.
-- **`WaitStrategy::YieldBackoff`**: Spins for $K$ iterations then calls `std::thread::yield_now()`. Balanced CPU usage with ~150ns reaction time.
-- **`WaitStrategy::Futex`**: Sleeps on Linux `futex` when the queue is idle. Consumes 0% CPU when waiting, wakes up via atomic event signaling.
+- **`BusySpin`**: Sub-30ns reaction time. Spins tightly on CPU (`core::hint::spin_loop()`). Recommended for dedicated HFT cores.
+- **`YieldBackoff`**: Spins for $K$ iterations then calls `std::thread::yield_now()`. Balanced CPU usage with ~150ns reaction time.
+- **`FutexWait`**: Sleeps on Linux `futex` when the queue is idle (timed sleep elsewhere). Near-0% CPU while waiting. The producer fast path has no full barrier, so a wake-up can rarely be missed; every sleep is therefore bounded (10 ms when no timeout is set).
 
 ---
 
 ## 🐍 Polyglot Access (C / C++ / Python)
 
-- **C11 Header**: Include `include/ringfire.h` in any C/C++ project without linking overhead.
-- **Python (`ringfire-py`)**: Read shared memory slots directly via Python `mmap` and `ctypes.Structure` with no serialization penalty.
+- **C11 Header**: Include `include/ringfire.h` in any C/C++ project without linking overhead (header-only consumer), or link the `cdylib`/`staticlib` for the FFI producer, consumer and blackboard.
+- **Python (`python/ringfire`)**: `RingConsumer`, `RingProducer`, `BlobConsumer` (zero-copy `try_recv` or validated `try_recv_copy`) and the blackboard, via `mmap` + `ctypes.Structure`.
+
+All bindings speak **protocol v2** and locate slots through the header's `slots_offset`; v1 and
+v2 peers refuse each other (`VersionMismatch`) instead of misreading memory. Python producers
+rely on x86-64 store ordering (Python has no fences); use a Rust or C producer on AArch64.
+
+## 📐 Delivery Semantics at a Glance
+
+| Channel | Producer blocks? | Slow consumer | Delivery |
+| :--- | :--- | :--- | :--- |
+| `RingProducer` (default `LossyLatestWins`) | Never | Lapped: skips to the oldest retained message, `lapped_count()` | At-most-once per reader, in order |
+| `RingProducer` + `LosslessBackpressure` | When the slowest registered reader is a full ring behind | Holds the producer | Exactly-once, in order, for registered Rust readers |
+| `BlobProducer` / `BlobConsumer` | Never | Skips messages whose ring slot **or arena bytes** were overwritten | At-most-once per reader, in order |
+| `MpmcProducer` / `MpmcQueueConsumer` | Never | Overrun items are dropped, `dropped_count()` | At-most-once, each item to one consumer |
+| `BlackboardProducer` / `BlackboardConsumer` | Never | Always reads the latest value | Latest-value snapshot per key |
 
 ---
 

@@ -5,6 +5,84 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-22
+
+Correctness release. The v0.3.0 review found torn reads, hangs, file truncation and
+layout bugs across the Rust core, FFI, C header, Python bindings and CLI; each fix below
+has a regression test in `tests/regression_tests.rs`.
+
+### Breaking
+- **Wire protocol v2 (`RINGFIRE_VERSION = 2`)**: v1 and v2 readers/writers refuse each other.
+  - Writers mark a slot `SLOT_WRITING` (`u64::MAX`) before overwriting its payload.
+  - `RingHeader` gains `slots_offset` (taken from padding; header is still 128 bytes).
+    Rust, FFI, C and Python readers locate slots through it instead of guessing.
+- `LayoutSignature` hashes the type name without module paths, so the same struct defined
+  in two crates matches. Signatures differ from v0.3.0 (irrelevant across the protocol bump).
+- `MpmcQueueConsumer` delivery is documented and implemented as at-most-once: overrun
+  items are dropped and counted (`dropped_count()`) instead of hanging the consumer.
+- `ReaderRegistry::reader_lag` / `headroom` (and the `RingProducer`/`BlobProducer`
+  wrappers) take the last published sequence and count unread messages consistently;
+  `BlobProducer::reader_lag` was off by one.
+- Attaching a `RingConsumer` to a `LosslessBackpressure` ring whose registry is full now
+  fails with `NoAvailableReaderSlots` instead of silently leaving the reader unprotected.
+- `ringfire_blackboard_read` (FFI) returns `-2` and `BlackboardConsumer::read` returns
+  `RingfireError::WriterStalled` when a slot stays mid-write for over 100 ms.
+
+### Fixed
+- **Torn reads** (all readers): a reader one slot short of being lapped accepted payloads
+  the writer was overwriting (1875 torn out of 16.9M reads in 3 s on a 7950X). Fixed by
+  the v2 slot marker plus acquire/release fences for AArch64.
+- **`BlobConsumer` hang**: `recv`/`view` spun forever once the arena wrapped before the
+  descriptor ring did. Lapped payloads are now skipped and counted; descriptors are
+  bounds-checked before the arena is touched.
+- **Live ring truncation**: a second `create` on a live path truncated the file before
+  failing the `flock`, so the running producer and readers hit `SIGBUS`. All producers
+  (ring, blob, MPMC, blackboard, FFI, Python) now lock first; a stale ring from a dead
+  producer is replaced by a fresh inode so orphaned readers stay consistent.
+- **`push_batch` ignored `LosslessBackpressure`.**
+- **Lossless producer cost**: every `push` scanned the registry and checked each
+  reader's liveness via `/proc` (about 830 ns per push+recv). The producer now caches the slowest
+  cursor and rescans only when approaching it or every half ring; liveness checks run only
+  while blocked. Cost is on par with lossy mode.
+- **MPMC**: queue consumers hung on overwritten tickets; concurrent producers one lap apart
+  could interleave payloads in a slot. Slots are now taken over by CAS in lap order; a slot
+  that stays mid-write for over 10 ms is never taken over (its writer may just be
+  descheduled): the waiting producer drops its message instead of tearing the payload.
+- **Reader registry**: reclaiming a dead reader could wipe a registration that had just
+  replaced it (non-CAS store); `update_cursor` used `Relaxed`, letting the producer
+  overwrite a slot on AArch64 before the reader finished copying it.
+- **Blackboard**: writer/reader fences for AArch64; readers no longer spin forever on a
+  slot left odd by a crashed writer.
+- **Attach validation**: truncated or foreign files are rejected (`CorruptLayout`) instead
+  of being read out of bounds; the header magic is published last.
+- **Python**: `BlobConsumer` read the arena mask from the `reserved` counter (wrong
+  payloads for most offsets) and never checked for arena lapping; added
+  `try_recv_copy`. Producers take an exclusive `flock`.
+- **C header / FFI consumer** ignored the reader registry offset and read registry bytes
+  as slots on lossless and blob rings. The C header struct is updated to the v2 layout.
+- **CLI**: `dump` printed the header as slots on rings without a registry; the retained
+  window was off by one; JSON output did not escape strings; `prune` used non-CAS stores.
+- **`AsyncRingConsumer` as `Stream`** spawned a Tokio task per pending poll and busy-looped
+  while idle; it now yields a few times and then waits on a timer.
+- **`FutexWait` lost wake-ups**: a consumer going to sleep could miss a message published at
+  the same instant and sleep for the full timeout (50 ms by default; about 1 in 1000 round
+  trips in a ping-pong, averaging 53 µs per round trip). Fixed with an asymmetric barrier:
+  producers register with `membarrier(REGISTER_GLOBAL_EXPEDITED)` and a consumer issues
+  `membarrier(GLOBAL_EXPEDITED)` before sleeping, so the producer hot path stays barrier-free.
+  Futex ping-pong round trip: 2.3 µs (Unix socket: 4.8 µs). Sleeps stay bounded as a fallback
+  (`timeout: None` = 10 ms) for producers that cannot register.
+- `SPMC` producers wake all sleeping readers (broadcast), not just one.
+- `CycleStamp` on AArch64 reads `cntvct_el0` (it was a +1 counter); added
+  `CycleStamp::counter_frequency_hz()`.
+- `ConsumerStartMode::Sequence(0)` no longer reports a phantom lapped message.
+
+### Added
+- `tests/regression_tests.rs` (19 tests), `examples/quickstart.rs` (README snippets, run in CI).
+- `benches/ipc_compare.rs`: 64-byte round trip over ringfire (spin and futex), Unix socket,
+  pipe and TCP loopback, measured with one harness; results at the top of the README.
+- `rust-version = "1.88"` (edition 2024, let-chains).
+- GitHub Actions CI: Linux x86-64 and macOS AArch64, clippy with and without `tokio`.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

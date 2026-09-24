@@ -158,8 +158,9 @@ fn test_reader_registry_multi_reader_monitoring() {
 
     // Min reader seq must reflect the slowest reader (c2 at 6)
     assert_eq!(producer.min_reader_seq(), Some(6));
-    assert_eq!(producer.reader_lag(), 14); // 20 - 6 = 14 messages behind
-    assert_eq!(producer.headroom(), 128 - 14);
+    // c2 consumed 1..=5, so 6..=20 (15 messages) are still unread
+    assert_eq!(producer.reader_lag(), 15);
+    assert_eq!(producer.headroom(), 128 - 15);
 
     let active = producer.active_readers();
     assert_eq!(active.len(), 2);

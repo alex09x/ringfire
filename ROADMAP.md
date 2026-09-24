@@ -24,46 +24,68 @@ The library is **strictly general-purpose**: it does not embed application-speci
 
 ## Architecture & Data Layout
 
-### 1. Memory-Mapped File Header (`RingHeader`)
-The shared memory region (`/dev/shm/<name>`) begins with a 128-byte cache-line aligned header:
+### 1. Memory-Mapped File Header (`RingHeader`, protocol v2)
+The shared memory region (`/dev/shm/<name>`) begins with a 128-byte cache-line aligned header.
+Producers write `magic` last, so a reader never attaches to a half-initialized ring.
 
 ```rust
 #[repr(C, align(128))]
 pub struct RingHeader {
-    pub magic: u64,             // 0x5249_4E47_4649_5245 ("RINGFIRE")
-    pub version: u32,           // Protocol version (1)
-    pub element_size: u32,      // Fixed payload size in bytes
-    pub capacity: u64,          // Number of slots (must be power of 2)
-    pub mask: u64,              // capacity - 1
-    pub write_seq: AtomicU64,   // Highest published sequence number
-    pub flags: u32,             // Control flags (e.g., lossy vs backpressure)
-    pub _pad: [u8; 84],         // Padding to prevent false sharing
+    pub magic: u64,                  // 0x5249_4E47_4649_5245 ("RINGFIRE"), written last
+    pub version: u32,                // Protocol version (2)
+    pub element_size: u32,           // Slot<T> stride in bytes
+    pub capacity: u64,               // Number of slots (power of 2)
+    pub mask: u64,                   // capacity - 1
+    pub write_seq: AtomicU64,        // Highest published sequence number
+    pub claim_seq: AtomicU64,        // MPMC: next ticket to claim
+    pub flags: u32,                  // Policy / mode / arena / registry flags
+    pub futex_word: AtomicU32,       // Futex notification word
+    pub waiting_consumers: AtomicU32,// Sleeping consumers
+    pub _align_pad: u32,
+    pub read_seq: AtomicU64,         // MPMC work queue: next ticket to consume
+    pub schema_sig: u64,             // Layout fingerprint of T (0 = unverified)
+    pub arena_offset: u64,           // PayloadArena offset (0 = none)
+    pub arena_size: u64,             // PayloadArena capacity in bytes
+    pub reader_registry_offset: u32, // ReaderRegistry offset (0 = none)
+    pub reader_registry_count: u32,  // ReaderRegistry slots
+    pub slots_offset: u64,           // Offset of slot 0: readers never guess the layout
+    pub _pad: [u8; 16],
 }
 ```
 
+Every reader (Rust, FFI, C header, Python, CLI) validates magic, version, slot stride,
+capacity/mask, and that the slots, registry and arena all fit inside the mapping.
+
 ### 2. Slot Structure (`Slot<T>`)
-Slots are laid out contiguously immediately following the header:
+Slots start at `slots_offset`:
 
 ```rust
 #[repr(C)]
 pub struct Slot<T> {
-    pub seq: AtomicU64,         // Monotonically increasing sequence number
-    pub data: T,                // Fixed-size payload (T: Copy or [u8; N])
+    pub seq: AtomicU64,  // 0 = never written, u64::MAX = being overwritten, N = holds message N
+    pub data: T,         // Fixed-size payload (T: Copy or [u8; N])
 }
 ```
 
 ### 3. Publishing Protocol (Single Producer)
-1. Producer determines target slot index: `idx = seq & mask`.
-2. Writes data directly into `slot.data` (zero-copy memory copy).
-3. Executes atomic store with `Ordering::Release` on `slot.seq`.
-4. Updates global `header.write_seq` with `Ordering::Release`.
+1. `idx = seq & mask`.
+2. `slot.seq.store(SLOT_WRITING, Relaxed)`; `fence(Release)`.
+3. Copy the payload into `slot.data`.
+4. `slot.seq.store(seq, Release)`, then `header.write_seq.store(seq, Release)`.
+
+Multiple producers (MPMC) claim tickets from `claim_seq` and take the slot over with a CAS
+from the previous lap's sequence to `SLOT_WRITING`, so writers one lap apart never interleave.
 
 ### 4. Consumption Protocol (Multi Consumer)
-1. Consumer maintains local `cursor`.
-2. Inspects `slot.seq` with `Ordering::Acquire`.
-3. If `slot.seq == cursor`: reads `slot.data` and increments `cursor`.
-4. If `slot.seq > cursor`: consumer fell behind (lapped). Jumps cursor to `slot.seq` (latest-wins) and records lap counter.
-5. If `slot.seq < cursor`: slot not yet published.
+1. `s1 = slot.seq.load(Acquire)`.
+2. `s1 == cursor`: copy the payload, `fence(Acquire)`, `s2 = slot.seq.load(Relaxed)`;
+   accept only if `s2 == cursor`, then advance.
+3. `s1 < cursor` or `s1 == SLOT_WRITING`: not published yet (caught up).
+4. `s1 > cursor`, or the copy was invalidated: lapped. Jump to the oldest retained
+   message (`max(write_seq, s1) - capacity + 1`) and add the gap to the lapped counter.
+
+Readers registered in the `ReaderRegistry` publish their cursor with `Release` after
+copying, which is what lets a `LosslessBackpressure` producer reuse slots safely.
 
 ---
 
@@ -143,3 +165,22 @@ pub struct Slot<T> {
   - `dump`: Inspect recent slots and hex/ASCII payload snippets.
   - `prune`: Clean up dead reader slots whose processes have terminated.
 
+
+### Phase 8: Correctness Hardening & Protocol v2 (v0.4.0)
+- [x] **Protocol v2**: `SLOT_WRITING` marker makes every reader tear-free; explicit `slots_offset`.
+- [x] **Acquire/Release fences for AArch64** in slot, blackboard and registry protocols.
+- [x] **Safe producer creation**: `flock` before any modification; stale rings replaced by a new inode.
+- [x] **Layout validation** on every attach path (Rust, FFI, C, Python, CLI).
+- [x] **Blob arena lapping**: skip and count, never hang; bounds-checked descriptors.
+- [x] **Lossless backpressure without syscalls**: cached gating sequence, liveness checks only while blocked.
+- [x] **MPMC**: CAS slot takeover in lap order; queue consumers drop overrun tickets instead of hanging.
+- [x] **Registry**: CAS-only ownership changes; refusing unprotected readers on lossless rings.
+- [x] **Regression suite** (`tests/regression_tests.rs`) and CI on Linux x86-64 + macOS AArch64.
+
+### Phase 9: Next
+- [ ] **Container-safe liveness**: heartbeat-based reader liveness (PID checks fail across PID namespaces).
+- [ ] **Lossless MPMC work queue**: producers gate on `read_seq` for exactly-once delivery.
+- [ ] **Python / C registry participation** so non-Rust readers are protected by lossless flow control.
+- [ ] **Lossless blob channel**: gate both descriptor ring and arena on the slowest reader.
+- [ ] **Model checking**: `loom` models of the slot, registry and MPMC protocols; fuzzing of attach/validation.
+- [ ] **Benchmarks for lossless mode and cross-core latency with pinned threads.**

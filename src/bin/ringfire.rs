@@ -16,10 +16,44 @@ use std::time::{Duration, Instant};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use ringfire::header::{
-    BlackboardHeader, ReaderSlot, RingHeader, BLACKBOARD_MAGIC, FLAG_MODE_MPMC, FLAG_MODE_SPMC,
-    FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
+    validate_ring, BlackboardHeader, ReaderSlot, RingHeader, RingView, BLACKBOARD_MAGIC,
+    FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA,
+    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, SLOT_WRITING,
 };
 use ringfire::registry::is_process_alive;
+
+/// JSON string literal for `s` (quotes, backslashes and control characters escaped).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Maps `path` read-only and validates it as a ring.
+fn map_ring(path: &str) -> Result<(Mmap, RingView), Box<dyn std::error::Error>> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let view = unsafe { validate_ring(mmap.as_ptr(), mmap.len(), None, 8)? };
+    Ok((mmap, view))
+}
+
+/// Retained window `[oldest, newest]` of a ring, or `None` if nothing was published.
+fn retained_window(write_seq: u64, capacity: u64) -> Option<(u64, u64)> {
+    if write_seq == 0 {
+        None
+    } else {
+        Some((write_seq.saturating_sub(capacity - 1).max(1), write_seq))
+    }
+}
 
 fn print_usage() {
     eprintln!(
@@ -163,12 +197,13 @@ fn read_readers(mmap: &Mmap, header: &RingHeader, write_seq: u64) -> Vec<ReaderS
         let active = slot.active.load(Ordering::Acquire);
         let pid = slot.pid.load(Ordering::Acquire);
 
-        if active != 0 || pid != 0 {
-            let cursor = slot.cursor_seq.load(Ordering::Relaxed);
+        if pid != 0 && active != 0 {
+            let cursor = slot.cursor_seq.load(Ordering::Acquire);
             let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
             let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
             let alive = if pid != 0 { is_process_alive(pid) } else { false };
-            let lag = write_seq.saturating_sub(cursor);
+            // cursor = next sequence to read, so everything from it to write_seq is unread
+            let lag = write_seq.saturating_sub(cursor.saturating_sub(1));
 
             readers.push(ReaderSnapshot {
                 slot_index: i,
@@ -209,6 +244,8 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
         .into());
     }
 
+    drop(mmap);
+    let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let write_seq = header.write_seq.load(Ordering::Acquire);
     let claim_seq = header.claim_seq.load(Ordering::Acquire);
@@ -216,13 +253,12 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
     let waiting = header.waiting_consumers.load(Ordering::Relaxed);
     let futex = header.futex_word.load(Ordering::Relaxed);
 
-    let oldest_seq = write_seq.saturating_sub(header.capacity);
-    let active_messages = write_seq.min(header.capacity);
-    let utilization_pct = if header.capacity > 0 {
-        (active_messages as f64 / header.capacity as f64) * 100.0
-    } else {
-        0.0
+    let window = retained_window(write_seq, view.capacity);
+    let (oldest_seq, active_messages) = match window {
+        Some((oldest, newest)) => (oldest, newest - oldest + 1),
+        None => (0, 0),
     };
+    let utilization_pct = (active_messages as f64 / view.capacity as f64) * 100.0;
 
     let is_mpmc = (header.flags & FLAG_MODE_MPMC) != 0;
     let is_spmc = (header.flags & FLAG_MODE_SPMC) != 0;
@@ -251,7 +287,7 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
 
     if json {
         println!("{{");
-        println!("  \"path\": \"{}\",", path_str);
+        println!("  \"path\": {},", json_str(path_str));
         println!("  \"file_size\": {},", file_len);
         println!("  \"magic\": \"0x{:016X}\",", header.magic);
         println!("  \"version\": {},", header.version);
@@ -293,7 +329,7 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
             println!("    {{");
             println!("      \"slot\": {},", r.slot_index);
             println!("      \"pid\": {},", r.pid);
-            println!("      \"name\": \"{}\",", r.name);
+            println!("      \"name\": {},", json_str(&r.name));
             println!("      \"cursor\": {},", r.cursor_seq);
             println!("      \"lag\": {},", r.lag);
             println!("      \"alive\": {}", r.alive);
@@ -329,7 +365,13 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
         println!("   Claim Sequence:    {}", claim_seq);
         println!("   Read Sequence:     {}", read_seq);
     }
-    println!("   Retained Window:   [{} .. {}] ({} slots, {:.1}% filled)", oldest_seq, write_seq, active_messages, utilization_pct);
+    match window {
+        Some((oldest, newest)) => println!(
+            "   Retained Window:   [{} .. {}] ({} slots, {:.1}% filled)",
+            oldest, newest, active_messages, utilization_pct
+        ),
+        None => println!("   Retained Window:   (empty: nothing published yet)"),
+    }
     println!("   Sleeping Readers:  {} (Futex word: {})", waiting, futex);
 
     if has_arena {
@@ -383,7 +425,7 @@ fn print_blackboard_stat(
     if json {
         println!("{{");
         println!("  \"type\": \"Blackboard\",");
-        println!("  \"path\": \"{}\",", path_str);
+        println!("  \"path\": {},", json_str(path_str));
         println!("  \"file_size\": {},", file_len);
         println!("  \"version\": {},", header.version);
         println!("  \"slot_count\": {},", header.slot_count);
@@ -407,15 +449,7 @@ fn print_blackboard_stat(
 }
 
 fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(path_str);
-    let file = OpenOptions::new().read(true).open(path)?;
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-
-    let magic = unsafe { *(mmap.as_ptr() as *const u64) };
-    if magic != RINGFIRE_MAGIC {
-        return Err(format!("File '{}' is not a ringfire ring buffer", path_str).into());
-    }
-
+    let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let is_lossless = (header.flags & FLAG_POLICY_LOSSLESS_BACKPRESSURE) != 0;
     let mode = if (header.flags & FLAG_MODE_MPMC) != 0 {
@@ -443,13 +477,11 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
         let rate_msg_sec = if dt > 0.0 { delta_seq as f64 / dt } else { 0.0 };
         let rate_mb_sec = (rate_msg_sec * header.element_size as f64) / (1024.0 * 1024.0);
 
-        let oldest_seq = write_seq.saturating_sub(header.capacity);
-        let active_slots = write_seq.min(header.capacity);
-        let utilization = if header.capacity > 0 {
-            (active_slots as f64 / header.capacity as f64) * 100.0
-        } else {
-            0.0
+        let (oldest_seq, active_slots) = match retained_window(write_seq, view.capacity) {
+            Some((oldest, newest)) => (oldest, newest - oldest + 1),
+            None => (0, 0),
         };
+        let utilization = (active_slots as f64 / view.capacity as f64) * 100.0;
 
         let readers = read_readers(&mmap, header, write_seq);
 
@@ -483,50 +515,35 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
 }
 
 fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(path_str);
-    let file = OpenOptions::new().read(true).open(path)?;
-    let metadata = file.metadata()?;
-    let file_len = metadata.len();
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-
-    let magic = unsafe { *(mmap.as_ptr() as *const u64) };
-    if magic != RINGFIRE_MAGIC {
-        return Err(format!("File '{}' is not a ringfire ring buffer", path_str).into());
-    }
-
+    let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let write_seq = header.write_seq.load(Ordering::Acquire);
-    let capacity = header.capacity;
-    let element_size = header.element_size as usize;
+    let element_size = view.slot_size;
 
-    let registry_size = header.reader_registry_count as usize * std::mem::size_of::<ReaderSlot>();
-    let slots_offset = (header.reader_registry_offset as usize + registry_size + 127) & !127;
-
-    if file_len < (slots_offset + capacity as usize * element_size) as u64 {
-        return Err("File too short for configured slots".into());
-    }
-
-    let start_seq = if write_seq > tail as u64 {
-        write_seq - tail as u64 + 1
-    } else {
-        1
+    let Some((oldest, newest)) = retained_window(write_seq, view.capacity) else {
+        println!("Ring is empty: nothing published yet (capacity {}).", view.capacity);
+        return Ok(());
     };
+    let start_seq = newest.saturating_sub(tail.max(1) as u64 - 1).max(oldest);
 
-    println!("Dumping slots from seq {} to seq {} (capacity {}):", start_seq, write_seq, capacity);
+    println!("Dumping slots from seq {} to seq {} (capacity {}):", start_seq, newest, view.capacity);
     println!("{:<8}  {:<8}  {:<10}  Payload", "Seq", "SlotIdx", "SlotSeq");
     println!("--------------------------------------------------------------------------------");
 
-    for seq in start_seq..=write_seq {
-        let slot_idx = (seq & header.mask) as usize;
-        let slot_byte_offset = slots_offset + slot_idx * element_size;
-        let slot_ptr = unsafe { mmap.as_ptr().add(slot_byte_offset) };
-        let slot_seq = unsafe { (*(slot_ptr as *const std::sync::atomic::AtomicU64)).load(Ordering::Acquire) };
-
-        let data_slice = if element_size > 8 {
-            &mmap[slot_byte_offset + 8..slot_byte_offset + element_size]
-        } else {
-            &[]
+    for seq in start_seq..=newest {
+        let slot_idx = (seq & view.mask) as usize;
+        let slot_byte_offset = view.slots_offset + slot_idx * element_size;
+        let slot_seq = unsafe {
+            (*(mmap.as_ptr().add(slot_byte_offset) as *const std::sync::atomic::AtomicU64))
+                .load(Ordering::Acquire)
         };
+        let slot_seq_str = if slot_seq == SLOT_WRITING {
+            "WRITING".to_string()
+        } else {
+            slot_seq.to_string()
+        };
+
+        let data_slice = &mmap[slot_byte_offset + 8..slot_byte_offset + element_size];
 
         let payload_str = if hex {
             let hex_preview = data_slice.iter().take(16).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
@@ -536,7 +553,7 @@ fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::e
             format!("\"{}\" ({} bytes)", printable, data_slice.len())
         };
 
-        println!("{:<8}  {:<8}  {:<10}  {}", seq, slot_idx, slot_seq, payload_str);
+        println!("{:<8}  {:<8}  {:<10}  {}", seq, slot_idx, slot_seq_str, payload_str);
     }
 
     Ok(())
@@ -546,11 +563,7 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(path_str);
     let file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-    let magic = unsafe { *(mmap.as_ptr() as *const u64) };
-    if magic != RINGFIRE_MAGIC {
-        return Err(format!("File '{}' is not a ringfire ring buffer", path_str).into());
-    }
+    unsafe { validate_ring(mmap.as_ptr(), mmap.len(), None, 8)? };
 
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     if header.reader_registry_offset == 0 || header.reader_registry_count == 0 {
@@ -564,15 +577,20 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pruned = 0;
     for i in 0..reg_count {
-        let slot = unsafe { &mut *base_ptr.add(i) };
+        let slot = unsafe { &*base_ptr.add(i) };
         let pid = slot.pid.load(Ordering::Acquire);
         if pid != 0 && !is_process_alive(pid) {
             let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
             let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
-            println!("Pruning dead reader slot {}: PID {} ({})", i, pid, name);
-            slot.active.store(0, Ordering::Release);
-            slot.pid.store(0, Ordering::Release);
-            pruned += 1;
+            // CAS so a reader that re-registered in this slot meanwhile is left alone.
+            if slot
+                .pid
+                .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                println!("Pruning dead reader slot {}: PID {} ({})", i, pid, name);
+                pruned += 1;
+            }
         }
     }
 

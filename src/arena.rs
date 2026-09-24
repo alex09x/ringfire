@@ -10,7 +10,7 @@
 //!   boundary are automatically aligned to index 0, ensuring every `BlobRef` maps
 //!   to a strictly contiguous memory slice (`&[u8]`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use crate::error::{Result, RingfireError};
 
 /// 16-byte descriptor referencing a payload stored in `PayloadArena`.
@@ -108,6 +108,9 @@ impl PayloadArena {
         }
 
         let mask = unsafe { (*header).mask as usize };
+        if mask != capacity - 1 {
+            return Err(RingfireError::CorruptLayout("arena mask does not match its capacity"));
+        }
         let data = unsafe { ptr.add(std::mem::size_of::<ArenaHeader>()) };
 
         Ok(Self {
@@ -133,10 +136,11 @@ impl PayloadArena {
         if len == 0 {
             return Ok(BlobRef::EMPTY);
         }
-        if len > self.capacity {
+        let max_len = self.capacity.min(u32::MAX as usize);
+        if len > max_len {
             return Err(RingfireError::ArenaPayloadTooLarge {
                 len,
-                max_capacity: self.capacity,
+                max_capacity: max_len,
             });
         }
 
@@ -162,6 +166,9 @@ impl PayloadArena {
                 .compare_exchange_weak(curr, next, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                // Readers detect overwritten blobs by re-reading `reserved` after copying:
+                // the reservation must be visible before any byte of the new blob.
+                fence(Ordering::Release);
                 return Ok(BlobRef {
                     offset: actual_offset,
                     len: len as u32,
@@ -205,6 +212,9 @@ impl PayloadArena {
         if len == 0 {
             return Ok(0);
         }
+        if !self.is_in_bounds(blob_ref) {
+            return Err(RingfireError::CorruptLayout("blob reference outside the arena"));
+        }
         if out.len() < len {
             return Err(RingfireError::BufferTooSmall {
                 required: len,
@@ -219,20 +229,35 @@ impl PayloadArena {
 
     /// Inspect payload in-place without copying.
     #[inline]
+    ///
+    /// # Panics
+    /// If `blob_ref` does not lie inside the arena (see [`Self::is_in_bounds`]).
     pub fn view_blob<R>(&self, blob_ref: BlobRef, f: impl FnOnce(&[u8]) -> R) -> R {
+        assert!(self.is_in_bounds(blob_ref), "blob reference outside the arena");
         if blob_ref.is_empty() {
             f(&[])
         } else {
-            let src = self.slice(blob_ref);
-            f(src)
+            f(self.slice(blob_ref))
         }
     }
 
-    /// Check if a `BlobRef` has been overwritten by the producer wrapping around.
+    /// Check if a `BlobRef` has been (or is being) overwritten by the producer wrapping around.
+    ///
+    /// To validate a copy, call this *after* reading the bytes: the acquire fence orders
+    /// the copy before the re-read of the reservation counter.
     #[inline]
     pub fn is_lapped(&self, blob_ref: BlobRef) -> bool {
-        let curr = unsafe { (*self.header).reserved.load(Ordering::Acquire) };
+        fence(Ordering::Acquire);
+        let curr = unsafe { (*self.header).reserved.load(Ordering::Relaxed) };
         curr.saturating_sub(blob_ref.offset) > self.capacity as u64
+    }
+
+    /// Whether `blob_ref` describes a slice that lies entirely inside the arena.
+    /// A descriptor read from shared memory must pass this before it is dereferenced.
+    #[inline]
+    pub fn is_in_bounds(&self, blob_ref: BlobRef) -> bool {
+        let start = (blob_ref.offset & self.mask as u64) as usize;
+        start + blob_ref.len as usize <= self.capacity
     }
 
     #[inline]

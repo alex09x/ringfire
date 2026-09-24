@@ -1,18 +1,18 @@
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{fence, Ordering};
 use memmap2::MmapMut;
 
 use crate::checkpoint::OffsetCheckpoint;
 use crate::error::{Result, RingfireError};
 use crate::header::{
-    RingHeader, Slot, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, FLAG_POLICY_LOSSLESS_BACKPRESSURE,
-    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, RINGFIRE_VERSION,
+    check_schema, validate_ring, RingHeader, RingLayout, Slot, FLAG_MODE_MPMC, FLAG_MODE_SPMC,
+    FLAG_POLICY_LATEST_WINS, FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_REGISTRY, SLOT_WRITING,
 };
 use crate::registry::{ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
+use crate::shm::create_backing_file;
 use crate::signature::LayoutSignature;
 use crate::wait::{wake_futex, WaitStrategy};
 
@@ -109,6 +109,10 @@ pub struct RingProducer<T: Copy + 'static> {
     capacity: u64,
     mask: u64,
     seq: u64,
+    /// Lossless mode: `seq` may be published without consulting the registry while
+    /// `seq < gate_limit`. Derived from the slowest reader's cursor at the last scan.
+    gate_limit: u64,
+    blocked_polls: u32,
     cleanup_mode: CleanupMode,
     flow_control: FlowControl,
     registry: Option<ReaderRegistry>,
@@ -117,6 +121,73 @@ pub struct RingProducer<T: Copy + 'static> {
 }
 
 unsafe impl<T: Copy + Send + 'static> Send for RingProducer<T> {}
+
+/// Writes `item` into `slot` as message `seq` using the v2 slot protocol: mark the slot
+/// [`SLOT_WRITING`], copy the payload, then publish `seq`.
+///
+/// # Safety
+/// `slot` must be valid for writes and not concurrently written by another producer.
+#[inline(always)]
+pub(crate) unsafe fn write_slot<T>(slot: *mut Slot<T>, seq: u64, item: &T) {
+    unsafe {
+        (*slot).seq.store(SLOT_WRITING, Ordering::Relaxed);
+        fence(Ordering::Release);
+        std::ptr::copy_nonoverlapping(item, &mut (*slot).data, 1);
+        (*slot).seq.store(seq, Ordering::Release);
+    }
+}
+
+/// Outcome of reading one slot.
+pub(crate) enum SlotRead<T> {
+    /// The slot held message `want` and was copied without interference.
+    Item(T),
+    /// Message `want` is not published yet (or the slot is mid-write).
+    Pending,
+    /// Message `want` was overwritten; carries the newer sequence observed (0 if unknown).
+    Overwritten(u64),
+}
+
+/// Copies a payload the writer may be overwriting concurrently.
+///
+/// The copy is only trusted after the caller re-checks the slot sequence behind an acquire
+/// fence. A plain `memcpy` (vector loads) is used on purpose: `read_volatile` on an
+/// aggregate lowers to byte-by-byte loads, which doubled `try_recv` latency for 64-byte T.
+///
+/// # Safety
+/// `src` must be valid for reads of `T`.
+#[inline(always)]
+pub(crate) unsafe fn racy_copy<T: Copy>(src: *const T) -> T {
+    let mut out = std::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 1);
+        out.assume_init()
+    }
+}
+
+/// Reads message `want` from `slot`, rejecting torn copies.
+///
+/// # Safety
+/// `slot` must be valid for reads.
+#[inline(always)]
+pub(crate) unsafe fn read_slot<T: Copy>(slot: *const Slot<T>, want: u64) -> SlotRead<T> {
+    unsafe {
+        let s1 = (*slot).seq.load(Ordering::Acquire);
+        if s1 == want {
+            let data = racy_copy(&(*slot).data);
+            fence(Ordering::Acquire);
+            let s2 = (*slot).seq.load(Ordering::Relaxed);
+            if s2 == want {
+                SlotRead::Item(data)
+            } else {
+                SlotRead::Overwritten(if s2 == SLOT_WRITING { 0 } else { s2 })
+            }
+        } else if s1 == SLOT_WRITING || s1 < want {
+            SlotRead::Pending
+        } else {
+            SlotRead::Overwritten(s1)
+        }
+    }
+}
 
 impl<T: Copy + 'static> RingProducer<T> {
     /// Creates a new shared memory ring buffer at `path` with `capacity` slots.
@@ -135,97 +206,61 @@ impl<T: Copy + 'static> RingProducer<T> {
             return Err(RingfireError::InvalidCapacity(capacity));
         }
 
-        let max_readers = options.max_readers;
-        let registry_bytes = if max_readers > 0 {
-            max_readers * std::mem::size_of::<crate::header::ReaderSlot>()
-        } else {
-            0
-        };
-
+        let mut max_readers = options.max_readers;
+        if options.flow_control == FlowControl::LosslessBackpressure && max_readers == 0 {
+            max_readers = DEFAULT_MAX_READERS;
+        }
+        let header_size = std::mem::size_of::<RingHeader>();
+        let registry_bytes = max_readers * std::mem::size_of::<crate::header::ReaderSlot>();
         let slot_size = std::mem::size_of::<Slot<T>>();
-        let total_size = std::mem::size_of::<RingHeader>() + registry_bytes + (capacity as usize * slot_size);
+        let slot_align = std::mem::align_of::<Slot<T>>().max(64);
+        let slots_offset = (header_size + registry_bytes).next_multiple_of(slot_align);
+        let total_size = slots_offset + (capacity as usize * slot_size);
 
         let path_buf = path.as_ref().to_path_buf();
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(options.mode)
-            .open(&path_buf)?;
-
-        if options.exclusive_lock {
-            let fd = file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                return Err(RingfireError::ProducerAlreadyExists);
-            }
-        }
-
-        file.set_len(total_size as u64)?;
-
+        let file = create_backing_file(&path_buf, options.mode, options.exclusive_lock, total_size as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let flags = (match options.flow_control {
             FlowControl::LossyLatestWins => FLAG_POLICY_LATEST_WINS,
             FlowControl::LosslessBackpressure => FLAG_POLICY_LOSSLESS_BACKPRESSURE,
         }) | FLAG_MODE_SPMC
-            | (if max_readers > 0 {
-                FLAG_WITH_REGISTRY
-            } else {
-                0
-            });
+            | (if max_readers > 0 { FLAG_WITH_REGISTRY } else { 0 });
 
-        let header_ptr = mmap.as_mut_ptr().cast::<RingHeader>();
+        let base = mmap.as_mut_ptr();
+        let header_ptr = base.cast::<RingHeader>();
         unsafe {
-            header_ptr.write(RingHeader {
-                magic: RINGFIRE_MAGIC,
-                version: RINGFIRE_VERSION,
-                element_size: slot_size as u32,
-                capacity,
-                mask: capacity - 1,
-                write_seq: std::sync::atomic::AtomicU64::new(0),
-                claim_seq: std::sync::atomic::AtomicU64::new(0),
-                flags,
-                futex_word: std::sync::atomic::AtomicU32::new(0),
-                waiting_consumers: std::sync::atomic::AtomicU32::new(0),
-                _align_pad: 0,
-                read_seq: std::sync::atomic::AtomicU64::new(0),
-                schema_sig: T::layout_signature(),
-                arena_offset: 0,
-                arena_size: 0,
-                reader_registry_offset: if max_readers > 0 {
-                    std::mem::size_of::<RingHeader>() as u32
-                } else {
-                    0
+            RingHeader::initialize(
+                header_ptr,
+                &RingLayout {
+                    capacity,
+                    slot_size,
+                    flags,
+                    schema_sig: T::layout_signature(),
+                    claim_seq: 0,
+                    read_seq: 0,
+                    registry_offset: if max_readers > 0 { header_size } else { 0 },
+                    registry_count: max_readers,
+                    slots_offset,
+                    arena_offset: 0,
+                    arena_size: 0,
                 },
-                reader_registry_count: max_readers as u32,
-                _pad: [0; 24],
-            });
+            );
         }
 
         let registry = if max_readers > 0 {
-            let reg_ptr = unsafe { mmap.as_mut_ptr().add(std::mem::size_of::<RingHeader>()) };
-            let reg = unsafe { ReaderRegistry::init(reg_ptr, max_readers) };
-            Some(reg)
+            Some(unsafe { ReaderRegistry::init(base.add(header_size), max_readers) })
         } else {
             None
         };
 
-        let slots_ptr = unsafe {
-            mmap.as_mut_ptr()
-                .add(std::mem::size_of::<RingHeader>() + registry_bytes)
-                .cast::<Slot<T>>()
-        };
-
-        // Initialize slots sequence numbers to 0
+        let slots_ptr = unsafe { base.add(slots_offset).cast::<Slot<T>>() };
         for i in 0..capacity {
             unsafe {
-                let slot = slots_ptr.add(i as usize);
-                (*slot).seq = std::sync::atomic::AtomicU64::new(0);
+                (*slots_ptr.add(i as usize)).seq = std::sync::atomic::AtomicU64::new(0);
             }
         }
+        unsafe { RingHeader::publish(header_ptr) };
 
         Ok(Self {
             path: path_buf,
@@ -236,6 +271,8 @@ impl<T: Copy + 'static> RingProducer<T> {
             capacity,
             mask: capacity - 1,
             seq: 1,
+            gate_limit: 0,
+            blocked_polls: 0,
             cleanup_mode: options.cleanup_mode,
             flow_control: options.flow_control,
             registry,
@@ -243,27 +280,31 @@ impl<T: Copy + 'static> RingProducer<T> {
         })
     }
 
+    #[inline(always)]
+    fn write_one(&mut self, item: &T) {
+        let idx = (self.seq & self.mask) as usize;
+        unsafe { write_slot(self.slots.add(idx), self.seq, item) };
+        self.seq += 1;
+    }
+
+    #[inline(always)]
+    fn publish_progress(&self) {
+        unsafe {
+            (*self.header).write_seq.store(self.seq - 1, Ordering::Release);
+            wake_futex(&*self.header, i32::MAX);
+        }
+    }
+
     /// Publishes a message into the ring buffer.
     /// Under `FlowControl::LosslessBackpressure`, waits if writing would overwrite the slowest active registered reader.
     /// Uses release ordering so consumers see the complete payload.
     #[inline(always)]
     pub fn push(&mut self, item: &T) {
-        if self.flow_control == FlowControl::LosslessBackpressure {
+        if self.flow_control == FlowControl::LosslessBackpressure && self.seq >= self.gate_limit {
             self.wait_for_headroom();
         }
-
-        let idx = (self.seq & self.mask) as usize;
-        unsafe {
-            let slot = self.slots.add(idx);
-            std::ptr::copy_nonoverlapping(item, &mut (*slot).data, 1);
-            (*slot).seq.store(self.seq, Ordering::Release);
-            (*self.header).write_seq.store(self.seq, Ordering::Release);
-
-            if (*self.header).waiting_consumers.load(Ordering::Relaxed) > 0 {
-                wake_futex(&*self.header, 1);
-            }
-        }
-        self.seq += 1;
+        self.write_one(item);
+        self.publish_progress();
     }
 
     /// Attempts to publish a message into the ring buffer without blocking.
@@ -272,40 +313,67 @@ impl<T: Copy + 'static> RingProducer<T> {
     #[inline]
     pub fn try_push(&mut self, item: &T) -> Result<()> {
         if self.flow_control == FlowControl::LosslessBackpressure
-            && let Some(min_seq) = self.registry.as_ref().and_then(|reg| reg.min_reader_seq())
+            && self.seq >= self.gate_limit
+            && !self.refresh_gate()
         {
-            let next_seq = self.seq;
-            if next_seq >= self.capacity && (next_seq - self.capacity + 1) > min_seq {
-                return Err(RingfireError::BackpressureBufferFull);
+            self.blocked_polls = self.blocked_polls.wrapping_add(1);
+            if self.blocked_polls.is_multiple_of(1024)
+                && let Some(reg) = self.registry.as_ref()
+                && reg.prune_dead_readers() > 0
+                && self.refresh_gate()
+            {
+                self.push(item);
+                return Ok(());
             }
+            return Err(RingfireError::BackpressureBufferFull);
         }
         self.push(item);
         Ok(())
     }
 
+    /// Rescans the registry and recomputes `gate_limit`. Returns whether `self.seq` may be
+    /// published now.
+    ///
+    /// The limit is also capped at half a ring ahead so readers registering later are
+    /// picked up within `capacity / 2` messages.
+    #[cold]
+    #[inline(never)]
+    fn refresh_gate(&mut self) -> bool {
+        let rescan_window = (self.capacity / 2).max(1);
+        let min = self.registry.as_ref().and_then(|reg| reg.min_cursor());
+        let limit = match min {
+            Some(min_cursor) => (min_cursor + self.capacity).min(self.seq + rescan_window),
+            None => self.seq + rescan_window,
+        };
+        self.gate_limit = limit;
+        self.seq < limit
+    }
+
     /// Blocks until there is room to write without overwriting the slowest active registered reader.
     #[cold]
     #[inline(never)]
-    pub fn wait_for_headroom(&self) {
-        if let Some(ref reg) = self.registry {
-            let mut spins = 0u32;
-            loop {
-                if let Some(min_seq) = reg.min_reader_seq() {
-                    let next_seq = self.seq;
-                    if next_seq >= self.capacity && (next_seq - self.capacity + 1) > min_seq {
-                        spins += 1;
-                        if spins < 100 {
-                            core::hint::spin_loop();
-                        } else if spins < 1000 {
-                            std::thread::yield_now();
-                        } else {
-                            reg.prune_dead_readers();
-                            std::thread::sleep(std::time::Duration::from_micros(10));
-                        }
-                        continue;
-                    }
+    pub fn wait_for_headroom(&mut self) {
+        if self.registry.is_none() || self.refresh_gate() {
+            return;
+        }
+        // Readers sleeping on the futex must see everything published so far, or a
+        // producer blocked mid-batch and a sleeping reader would wait on each other.
+        self.publish_progress();
+        let mut spins = 0u32;
+        loop {
+            spins = spins.saturating_add(1);
+            if spins < 100 {
+                core::hint::spin_loop();
+            } else if spins < 1000 {
+                std::thread::yield_now();
+            } else {
+                if let Some(reg) = self.registry.as_ref() {
+                    reg.prune_dead_readers();
                 }
-                break;
+                std::thread::sleep(std::time::Duration::from_micros(10));
+            }
+            if self.refresh_gate() {
+                return;
             }
         }
     }
@@ -326,45 +394,38 @@ impl<T: Copy + 'static> RingProducer<T> {
     #[inline]
     pub fn headroom(&self) -> u64 {
         if let Some(ref reg) = self.registry {
-            reg.headroom(self.seq, self.capacity)
+            reg.headroom(self.seq - 1, self.capacity)
         } else {
             self.capacity
         }
     }
 
-    /// Maximum lag across all active readers in messages.
+    /// Unread message count of the slowest active reader.
     #[inline]
     pub fn reader_lag(&self) -> u64 {
         if let Some(ref reg) = self.registry {
-            reg.reader_lag(self.seq)
+            reg.reader_lag(self.seq - 1)
         } else {
             0
         }
     }
 
     /// Publishes a batch of messages consecutively into the ring buffer.
-    /// Amortizes header write sequence and futex wake syscalls.
+    /// Amortizes the header write sequence update and futex wake.
+    /// Honors `FlowControl::LosslessBackpressure` per message.
     #[inline]
     pub fn push_batch(&mut self, items: &[T]) {
         if items.is_empty() {
             return;
         }
-
+        let lossless = self.flow_control == FlowControl::LosslessBackpressure;
         for item in items {
-            let idx = (self.seq & self.mask) as usize;
-            unsafe {
-                let slot = self.slots.add(idx);
-                std::ptr::copy_nonoverlapping(item, &mut (*slot).data, 1);
-                (*slot).seq.store(self.seq, Ordering::Release);
+            if lossless && self.seq >= self.gate_limit {
+                self.wait_for_headroom();
             }
-            self.seq += 1;
+            self.write_one(item);
         }
-
-        let last_seq = self.seq - 1;
-        unsafe {
-            (*self.header).write_seq.store(last_seq, Ordering::Release);
-            wake_futex(&*self.header, 1);
-        }
+        self.publish_progress();
     }
 
     /// Sequence number of the last published message (0 if no messages pushed yet).
@@ -399,14 +460,14 @@ impl<T: Copy + 'static> RingProducer<T> {
 
 impl<T: Copy + 'static> Drop for RingProducer<T> {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::flock(fd, libc::LOCK_UN);
-            }
-        }
+        // Unlink while still holding the lock so no new producer can adopt the path first.
         if self.cleanup_mode == CleanupMode::UnlinkOnDrop {
             let _ = std::fs::remove_file(&self.path);
+        }
+        if let Some(file) = self.file.take() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }
@@ -537,6 +598,8 @@ pub struct RingConsumer<T: Copy + 'static> {
     mask: u64,
     cursor: u64,
     lapped_total: u64,
+    /// Ring written by multiple producers: a slot can stay unpublished (dead producer).
+    multi_producer: bool,
     checkpoint: Option<OffsetCheckpoint>,
     registry: Option<ReaderRegistry>,
     registration: Option<ReaderRegistration>,
@@ -596,117 +659,58 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
         options: RingConsumerBuilder<T>,
     ) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
-
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
+        let view = unsafe {
+            validate_ring(
+                mmap.as_ptr(),
+                mmap.len(),
+                Some(std::mem::size_of::<Slot<T>>()),
+                std::mem::align_of::<Slot<T>>(),
+            )?
+        };
         let header_ptr = mmap.as_ptr().cast::<RingHeader>();
         let header = unsafe { &*header_ptr };
+        check_schema(header, T::layout_signature(), std::any::type_name::<T>())?;
 
-        if header.magic != RINGFIRE_MAGIC {
-            return Err(RingfireError::InvalidMagic {
-                expected: RINGFIRE_MAGIC,
-                actual: header.magic,
-            });
-        }
-
-        if header.version != RINGFIRE_VERSION {
-            return Err(RingfireError::VersionMismatch {
-                expected: RINGFIRE_VERSION,
-                actual: header.version,
-            });
-        }
-
-        let slot_size = std::mem::size_of::<Slot<T>>();
-        if header.element_size as usize != slot_size {
-            return Err(RingfireError::ElementSizeMismatch {
-                expected: header.element_size as usize,
-                actual: slot_size,
-            });
-        }
-
-        let expected_sig = T::layout_signature();
-        if header.schema_sig != 0 && header.schema_sig != expected_sig {
-            return Err(RingfireError::SchemaMismatch {
-                expected: header.schema_sig,
-                actual: expected_sig,
-                type_name: std::any::type_name::<T>(),
-            });
-        }
-
-        let capacity = header.capacity;
-        let mask = header.mask;
-        let slots_offset = if header.reader_registry_offset != 0 {
-            header.reader_registry_offset as usize
-                + (header.reader_registry_count as usize * std::mem::size_of::<crate::header::ReaderSlot>())
-        } else {
-            std::mem::size_of::<RingHeader>()
-        };
-        let slots_ptr = unsafe {
-            mmap.as_ptr()
-                .add(slots_offset)
-                .cast::<Slot<T>>()
-        };
+        let capacity = view.capacity;
+        let slots_ptr = unsafe { mmap.as_ptr().add(view.slots_offset).cast::<Slot<T>>() };
 
         let current_write = header.write_seq.load(Ordering::Acquire);
-        let oldest = if current_write > capacity {
-            current_write - capacity + 1
-        } else {
-            1
+        let oldest = oldest_retained(current_write, capacity);
+        let resolve = |mode: &ConsumerStartMode| match *mode {
+            ConsumerStartMode::Latest => (current_write.max(1), 0),
+            ConsumerStartMode::Head => (current_write + 1, 0),
+            ConsumerStartMode::Oldest => (oldest, 0),
+            ConsumerStartMode::Sequence(seq) => {
+                let seq = seq.max(1);
+                if seq < oldest { (oldest, oldest - seq) } else { (seq, 0) }
+            }
         };
 
-        let (checkpoint, cursor, lapped_total) = if options.offset_file.is_some() || options.consumer_name.is_some() {
-            let name = options.consumer_name.as_deref().unwrap_or("consumer");
-            let cp = if let Some(ref offset_path) = options.offset_file {
-                OffsetCheckpoint::open_or_create(offset_path, name).map_err(RingfireError::Io)?
+        let (checkpoint, cursor, lapped_total) =
+            if options.offset_file.is_some() || options.consumer_name.is_some() {
+                let name = options.consumer_name.as_deref().unwrap_or("consumer");
+                let cp = if let Some(ref offset_path) = options.offset_file {
+                    OffsetCheckpoint::open_or_create(offset_path, name).map_err(RingfireError::Io)?
+                } else {
+                    OffsetCheckpoint::for_consumer(&path, name).map_err(RingfireError::Io)?
+                };
+
+                let (target_cur, lapped) = match cp.load() {
+                    Some(saved_seq) => {
+                        let target = saved_seq + 1;
+                        if target < oldest { (oldest, oldest - target) } else { (target, 0) }
+                    }
+                    None => resolve(&options.start_mode),
+                };
+                (Some(cp), target_cur, lapped)
             } else {
-                OffsetCheckpoint::for_consumer(&path, name).map_err(RingfireError::Io)?
+                let (target_cur, lapped) = resolve(&options.start_mode);
+                (None, target_cur, lapped)
             };
 
-            let (target_cur, lapped) = match cp.load() {
-                Some(saved_seq) => {
-                    let target = saved_seq + 1;
-                    if target < oldest {
-                        (oldest, oldest - target)
-                    } else {
-                        (target, 0)
-                    }
-                }
-                None => match options.start_mode {
-                    ConsumerStartMode::Latest => {
-                        let cur = if current_write > 0 { current_write } else { 1 };
-                        (cur, 0)
-                    }
-                    ConsumerStartMode::Head => (current_write + 1, 0),
-                    ConsumerStartMode::Oldest => (oldest, 0),
-                    ConsumerStartMode::Sequence(seq) => {
-                        if seq < oldest {
-                            (oldest, oldest - seq)
-                        } else {
-                            (seq, 0)
-                        }
-                    }
-                },
-            };
-            (Some(cp), target_cur, lapped)
-        } else {
-            let (target_cur, lapped) = match options.start_mode {
-                ConsumerStartMode::Latest => {
-                    let cur = if current_write > 0 { current_write } else { 1 };
-                    (cur, 0)
-                }
-                ConsumerStartMode::Head => (current_write + 1, 0),
-                ConsumerStartMode::Oldest => (oldest, 0),
-                ConsumerStartMode::Sequence(seq) => {
-                    if seq < oldest {
-                        (oldest, oldest - seq)
-                    } else {
-                        (seq, 0)
-                    }
-                }
-            };
-            (None, target_cur, lapped)
-        };
-
+        let lossless = header.flags & FLAG_POLICY_LOSSLESS_BACKPRESSURE != 0;
         let (registry, registration) = if header.reader_registry_offset != 0 {
             let reg = unsafe {
                 ReaderRegistry::from_ptr(
@@ -715,75 +719,117 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
                 )
             };
             let reg_name = options.consumer_name.as_deref().unwrap_or("consumer");
-            let reg_handle = reg.register(reg_name, cursor).ok();
+            let reg_handle = match reg.register(reg_name, cursor) {
+                Ok(handle) => Some(handle),
+                // A lossless ring cannot protect an unregistered reader: refuse instead of
+                // silently degrading to lossy delivery.
+                Err(e) if lossless => return Err(e),
+                Err(_) => None,
+            };
             (Some(reg), reg_handle)
         } else {
             (None, None)
         };
 
-        Ok(Self {
+        let mut consumer = Self {
             _mmap: mmap,
             header: header_ptr,
             slots: slots_ptr,
             capacity,
-            mask,
+            mask: view.mask,
             cursor,
             lapped_total,
+            multi_producer: header.flags & FLAG_MODE_MPMC != 0,
             checkpoint,
             registry,
             registration,
             _marker: PhantomData,
-        })
+        };
+        // The producer may have overwritten the start position between computing it and
+        // registering: from here on the registration protects us, so re-check once.
+        if consumer.registration.is_some() {
+            consumer.skip_overwritten(0);
+        }
+        Ok(consumer)
+    }
+
+    /// Advances the cursor past messages that can no longer be read because the writer
+    /// lapped this reader. `seen` is a newer sequence observed in the cursor's slot.
+    /// Returns the number of skipped messages.
+    #[cold]
+    #[inline(never)]
+    fn skip_overwritten(&mut self, seen: u64) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        let oldest = oldest_retained(write_seq.max(seen), self.capacity);
+        if oldest > self.cursor {
+            let skipped = oldest - self.cursor;
+            self.cursor = oldest;
+            self.lapped_total += skipped;
+            if let Some(ref reg) = self.registration {
+                reg.update_cursor(self.cursor);
+            }
+            skipped
+        } else {
+            0
+        }
+    }
+
+    /// Reads the next message, skipping over lapped ones. Returns the item (if any) and
+    /// the number of messages skipped on the way.
+    #[inline(always)]
+    fn next_item(&mut self) -> (Option<T>, u64) {
+        let mut skipped = 0;
+        loop {
+            let slot = unsafe { self.slots.add((self.cursor & self.mask) as usize) };
+            match unsafe { read_slot(slot, self.cursor) } {
+                SlotRead::Item(data) => {
+                    self.cursor += 1;
+                    return (Some(data), skipped);
+                }
+                SlotRead::Overwritten(seen) => {
+                    let s = self.skip_overwritten(seen);
+                    if s == 0 {
+                        return (None, skipped);
+                    }
+                    skipped += s;
+                }
+                SlotRead::Pending => {
+                    // Normally just "caught up". With multiple producers a slot can stay
+                    // unpublished (producer died mid-publish): once the writer is a full
+                    // ring ahead, the message is gone either way.
+                    if !self.multi_producer {
+                        return (None, skipped);
+                    }
+                    let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+                    if write_seq >= self.cursor + self.capacity {
+                        let s = self.skip_overwritten(0);
+                        if s > 0 {
+                            skipped += s;
+                            continue;
+                        }
+                    }
+                    return (None, skipped);
+                }
+            }
+        }
     }
 
     /// Attempts to read the next message with explicit status (Ok, Empty, or Lapped).
     #[inline]
     pub fn recv_status(&mut self) -> RecvStatus<T> {
-        unsafe {
-            let mut skipped = 0;
-            let current_write = (*self.header).write_seq.load(Ordering::Acquire);
-
-            // If reader fell behind by more than buffer capacity, jump to oldest available
-            if current_write > self.cursor && (current_write - self.cursor) >= self.capacity {
-                let oldest = current_write - self.capacity + 1;
-                skipped = oldest - self.cursor;
-                self.lapped_total += skipped;
-                self.cursor = oldest;
+        let (item, skipped) = self.next_item();
+        match item {
+            Some(data) => {
+                if let Some(ref reg) = self.registration {
+                    reg.update_cursor(self.cursor);
+                }
+                if skipped > 0 {
+                    RecvStatus::Lapped { skipped, item: data }
+                } else {
+                    RecvStatus::Ok(data)
+                }
             }
-
-            let idx = (self.cursor & self.mask) as usize;
-            let slot = self.slots.add(idx);
-            let s1 = (*slot).seq.load(Ordering::Acquire);
-
-            if s1 < self.cursor {
-                return RecvStatus::Empty;
-            }
-
-            if s1 > self.cursor {
-                let slot_skipped = s1 - self.cursor;
-                skipped += slot_skipped;
-                self.lapped_total += slot_skipped;
-                self.cursor = s1;
-            }
-
-            let data = std::ptr::read_volatile(&(*slot).data);
-            let s2 = (*slot).seq.load(Ordering::Acquire);
-
-            if s1 != s2 {
-                // Writer updated the slot concurrently during read
-                self.cursor = s2;
-                return RecvStatus::Empty;
-            }
-
-            self.cursor += 1;
-            if let Some(ref reg) = self.registration {
-                reg.update_cursor(self.cursor);
-            }
-            if skipped > 0 {
-                RecvStatus::Lapped { skipped, item: data }
-            } else {
-                RecvStatus::Ok(data)
-            }
+            None => RecvStatus::Empty,
         }
     }
 
@@ -801,45 +847,21 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     /// Returns the number of messages read.
     #[inline]
     pub fn recv_batch(&mut self, buf: &mut [T]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-
         let mut count = 0;
         while count < buf.len() {
-            let idx = (self.cursor & self.mask) as usize;
-            unsafe {
-                let slot = self.slots.add(idx);
-                let s1 = (*slot).seq.load(Ordering::Acquire);
-
-                if s1 < self.cursor {
-                    break;
+            match self.next_item().0 {
+                Some(data) => {
+                    buf[count] = data;
+                    count += 1;
                 }
-
-                if s1 > self.cursor {
-                    let skipped = s1 - self.cursor;
-                    self.lapped_total += skipped;
-                    self.cursor = s1;
-                }
-
-                let data = std::ptr::read_volatile(&(*slot).data);
-                let s2 = (*slot).seq.load(Ordering::Acquire);
-
-                if s1 != s2 {
-                    self.cursor = s2;
-                    break;
-                }
-
-                buf[count] = data;
-                self.cursor += 1;
-                count += 1;
+                None => break,
             }
         }
-
-        if let Some(ref reg) = self.registration {
+        if count > 0
+            && let Some(ref reg) = self.registration
+        {
             reg.update_cursor(self.cursor);
         }
-
         count
     }
 
@@ -877,11 +899,7 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     /// Returns the count of skipped messages.
     pub fn jump_to_oldest(&mut self) -> u64 {
         let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
-        let oldest = if write_seq > self.capacity {
-            write_seq - self.capacity + 1
-        } else {
-            1
-        };
+        let oldest = oldest_retained(write_seq, self.capacity);
         if oldest > self.cursor {
             let skipped = oldest - self.cursor;
             self.lapped_total += skipped;
@@ -931,11 +949,8 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     /// the number of skipped messages.
     pub fn seek(&mut self, target_seq: u64) -> u64 {
         let current_write = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
-        let oldest = if current_write > self.capacity {
-            current_write - self.capacity + 1
-        } else {
-            1
-        };
+        let oldest = oldest_retained(current_write, self.capacity);
+        let target_seq = target_seq.max(1);
         let skipped = if target_seq < oldest {
             let s = oldest - target_seq;
             self.lapped_total += s;
@@ -1006,4 +1021,10 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
     pub fn last_processed_sequence(&self) -> u64 {
         self.cursor.saturating_sub(1)
     }
+}
+
+/// Oldest sequence still retained in a ring of `capacity` slots whose newest message is `write_seq`.
+#[inline]
+pub(crate) fn oldest_retained(write_seq: u64, capacity: u64) -> u64 {
+    if write_seq >= capacity { write_seq - capacity + 1 } else { 1 }
 }
