@@ -107,6 +107,7 @@ impl<T: Copy + 'static> MpmcProducer<T> {
 
     /// Attaches an additional producer to an existing MPMC shared memory ring buffer.
     pub fn attach<P: AsRef<Path>>(path: P) -> Result<Self> {
+        crate::wait::register_producer_barrier();
         let path_buf = path.as_ref().to_path_buf();
         let file = OpenOptions::new().read(true).write(true).open(&path_buf)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };

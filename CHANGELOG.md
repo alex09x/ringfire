@@ -64,15 +64,23 @@ has a regression test in `tests/regression_tests.rs`.
   window was off by one; JSON output did not escape strings; `prune` used non-CAS stores.
 - **`AsyncRingConsumer` as `Stream`** spawned a Tokio task per pending poll and busy-looped
   while idle; it now yields a few times and then waits on a timer.
-- `FutexWait` sleeps are always bounded (`timeout: None` = 10 ms), covering the rare missed
-  wake-up the barrier-free producer fast path allows.
+- **`FutexWait` lost wake-ups**: a consumer going to sleep could miss a message published at
+  the same instant and sleep for the full timeout (50 ms by default; about 1 in 1000 round
+  trips in a ping-pong, averaging 53 µs per round trip). Fixed with an asymmetric barrier:
+  producers register with `membarrier(REGISTER_GLOBAL_EXPEDITED)` and a consumer issues
+  `membarrier(GLOBAL_EXPEDITED)` before sleeping, so the producer hot path stays barrier-free.
+  Futex ping-pong round trip: 2.3 µs (Unix socket: 4.8 µs). Sleeps stay bounded as a fallback
+  (`timeout: None` = 10 ms) for producers that cannot register.
 - `SPMC` producers wake all sleeping readers (broadcast), not just one.
 - `CycleStamp` on AArch64 reads `cntvct_el0` (it was a +1 counter); added
   `CycleStamp::counter_frequency_hz()`.
 - `ConsumerStartMode::Sequence(0)` no longer reports a phantom lapped message.
 
 ### Added
-- `tests/regression_tests.rs` (18 tests), `examples/quickstart.rs` (README snippets, run in CI).
+- `tests/regression_tests.rs` (19 tests), `examples/quickstart.rs` (README snippets, run in CI).
+- `benches/ipc_compare.rs`: 64-byte round trip over ringfire (spin and futex), Unix socket,
+  pipe and TCP loopback, measured with one harness; results at the top of the README.
+- `rust-version = "1.88"` (edition 2024, let-chains).
 - GitHub Actions CI: Linux x86-64 and macOS AArch64, clippy with and without `tokio`.
 
 ## [0.3.0] - 2026-09-22

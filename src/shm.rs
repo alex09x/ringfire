@@ -17,6 +17,7 @@ use crate::error::{Result, RingfireError};
 ///
 /// Without `exclusive_lock` the file is truncated in place (legacy behaviour).
 pub(crate) fn create_backing_file(path: &Path, mode: u32, exclusive_lock: bool, size: u64) -> Result<File> {
+    crate::wait::register_producer_barrier();
     if !exclusive_lock {
         let file = OpenOptions::new()
             .read(true)

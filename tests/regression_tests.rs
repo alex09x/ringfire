@@ -549,3 +549,37 @@ async fn r15_idle_stream_does_not_busy_poll() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(counter.0.load(Ordering::Relaxed), polls - 1);
 }
+
+/// R16: `FutexWait` never loses a wake-up. Both sides go to sleep immediately (no spin)
+/// with a 10 s timeout, so a single missed wake-up stalls the ping-pong for 10 s.
+/// Before the asymmetric barrier, roughly 1 in 1000 round trips hit the full timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn r16_futex_wait_no_lost_wakeups() {
+    use ringfire::FutexWait;
+    let fwd = tmp("futex_fwd");
+    let rev = tmp("futex_rev");
+    let mut prod_fwd = RingProducer::<u64>::create(&fwd, 1024).unwrap();
+    let mut prod_rev = RingProducer::<u64>::create(&rev, 1024).unwrap();
+    let mut cons_fwd = RingConsumer::<u64>::attach(&fwd).unwrap();
+    let mut cons_rev = RingConsumer::<u64>::attach(&rev).unwrap();
+    let rounds = 20_000u64;
+
+    let echo = std::thread::spawn(move || {
+        let mut wait = FutexWait::new(0, Some(Duration::from_secs(10)));
+        for _ in 0..rounds {
+            let v = cons_fwd.recv_blocking(&mut wait);
+            prod_rev.push(&v);
+        }
+    });
+    let start = Instant::now();
+    let mut wait = FutexWait::new(0, Some(Duration::from_secs(10)));
+    for i in 0..rounds {
+        prod_fwd.push(&i);
+        assert_eq!(cons_rev.recv_blocking(&mut wait), i);
+    }
+    echo.join().unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("r16: {} futex round trips in {:?}", rounds, elapsed);
+    assert!(elapsed < Duration::from_secs(8), "a wake-up was lost: {:?}", elapsed);
+}

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 use std::time::Duration;
 use crate::header::RingHeader;
 
@@ -74,9 +74,11 @@ impl WaitStrategy for YieldBackoff {
 /// Futex-based wait strategy for 0% CPU consumption when idle.
 /// Spins briefly (adaptive fast-path) before putting the calling thread to sleep in the kernel.
 ///
-/// The producer's hot path deliberately has no full memory barrier, so a wake-up can be
-/// missed when a message is published at the exact moment the consumer goes to sleep.
-/// Sleeps are therefore always bounded: `timeout: None` means [`FutexWait::SAFETY_TIMEOUT`].
+/// Lost wake-ups are prevented with an asymmetric barrier: producers keep a barrier-free
+/// hot path, and a consumer about to sleep issues `membarrier(GLOBAL_EXPEDITED)` (Linux
+/// 4.16+), which forces a full barrier on every producer process. Producers that cannot
+/// register (Python, kernels without `membarrier`, seccomp-restricted containers) fall back
+/// to bounded sleeps: `timeout: None` means [`FutexWait::SAFETY_TIMEOUT`].
 #[derive(Debug, Clone, Copy)]
 pub struct FutexWait {
     spins: u32,
@@ -120,6 +122,10 @@ impl WaitStrategy for FutexWait {
         let futex_val = header.futex_word.load(Ordering::Acquire);
         header.waiting_consumers.fetch_add(1, Ordering::SeqCst);
 
+        // Either the producer's last publish is visible after this barrier, or its next
+        // check of `waiting_consumers` sees our registration and wakes us.
+        producer_barrier();
+
         // Re-check write_seq after registering as waiting to avoid lost wakeups
         if header.write_seq.load(Ordering::Acquire) >= cursor {
             header.waiting_consumers.fetch_sub(1, Ordering::SeqCst);
@@ -144,6 +150,9 @@ impl WaitStrategy for FutexWait {
 /// Called by the producer after publishing a message if `waiting_consumers > 0`.
 #[inline]
 pub fn wake_futex(header: &RingHeader, count: i32) {
+    // Light side of the asymmetric barrier: keep the compiler from hoisting this load above
+    // the publish; the CPU-level ordering comes from the consumer's `membarrier`.
+    compiler_fence(Ordering::SeqCst);
     if header.waiting_consumers.load(Ordering::Relaxed) > 0 {
         header.futex_word.fetch_add(1, Ordering::Release);
         sys_futex_wake(&header.futex_word, count);
@@ -200,4 +209,31 @@ fn sys_futex_wake(addr: &AtomicU32, count: i32) {
 #[cfg(not(target_os = "linux"))]
 fn sys_futex_wake(_addr: &AtomicU32, _count: i32) {
     // No-op on fallback platform; sleeping threads wake on timeout
+}
+
+#[cfg(target_os = "linux")]
+const MEMBARRIER_CMD_GLOBAL_EXPEDITED: libc::c_long = 1 << 1;
+#[cfg(target_os = "linux")]
+const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: libc::c_long = 1 << 2;
+
+/// Registers this process as a producer for the consumers' asymmetric barrier.
+/// Idempotent; failures (old kernel, seccomp) leave consumers on bounded sleeps.
+pub(crate) fn register_producer_barrier() {
+    #[cfg(target_os = "linux")]
+    {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| unsafe {
+            libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0);
+        });
+    }
+}
+
+/// Heavy side of the asymmetric barrier: a full memory barrier on every running thread of
+/// every registered producer process.
+#[inline]
+fn producer_barrier() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0);
+    }
 }

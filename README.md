@@ -1,13 +1,50 @@
 # ringfire 🔥
 
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.3.0-orange.svg)](https://crates.io/crates/ringfire)
+[![Crates.io](https://img.shields.io/crates/v/ringfire.svg)](https://crates.io/crates/ringfire)
 [![Documentation](https://docs.rs/ringfire/badge.svg)](https://docs.rs/ringfire)
+[![CI](https://github.com/alex09x/ringfire/actions/workflows/ci.yml/badge.svg)](https://github.com/alex09x/ringfire/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-brightgreen.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-brightgreen.svg)](https://www.rust-lang.org)
 
 **`ringfire`** is an ultra-low-latency, zero-copy, lock-free **Inter-Process Communication (IPC)** ring buffer and shared memory state bus for Linux.
 
 It is engineered for high-frequency trading (HFT) engines, real-time market data ingestion, telemetry buses, and performance-critical distributed pipelines where microsecond socket latencies and kernel overhead are unacceptable.
+
+## ⚡ Performance at a Glance
+
+**Round trip of a 64-byte message between two threads**, same machine, same harness
+(`cargo bench --bench ipc_compare`, AMD Ryzen 9 7950X, Linux 6.8, v0.4.0):
+
+| Transport | Round trip | vs. ringfire (spin) |
+| :--- | ---: | ---: |
+| **ringfire**, busy-spin readers | **0.32 µs** | 1× |
+| **ringfire**, `FutexWait` (sleeps in the kernel when idle) | **2.27 µs** | 7× |
+| Unix domain socket | 4.76 µs | 15× |
+| Pipe | 4.93 µs | 15× |
+| TCP loopback (`TCP_NODELAY`) | 10.28 µs | 32× |
+
+```mermaid
+xychart-beta
+    title "64-byte round trip, microseconds (lower is better)"
+    x-axis ["ringfire spin", "ringfire futex", "Unix socket", "Pipe", "TCP loopback"]
+    y-axis "µs" 0 --> 11
+    bar [0.32, 2.27, 4.76, 4.93, 10.28]
+```
+
+**Hot-path costs** (`cargo bench --bench throughput`, 64-byte messages):
+
+| Operation | Time | Rate |
+| :--- | ---: | ---: |
+| `push` (no reader attached) | 1.88 ns | 533 M msg/s |
+| `try_recv` | 6.4 ns | 156 M msg/s |
+| `recv_batch(32)` | 2.3 ns / msg | 431 M msg/s |
+| `push` with a reader draining on another core | 41 ns | 24 M msg/s |
+| Blackboard read / write (O(1) seqlock) | 2.1 / 1.1 ns | — |
+
+The last `push` row is the realistic cross-process figure: it is bound by moving cache lines
+between cores, and costs the same with lossless backpressure enabled (+0.8 ns). Every read is
+validated against concurrent overwrites; the regression suite verifies zero torn records under
+continuous lapping on x86-64 and AArch64. Full numbers: [Detailed Benchmarks](#-detailed-benchmarks-amd-ryzen-9-7950x-on-linux-booster).
 
 ---
 
@@ -15,13 +52,13 @@ It is engineered for high-frequency trading (HFT) engines, real-time market data
 
 When communicating between processes on the same host, developers usually default to Unix Domain Sockets (UDS), TCP loopback, pipes, ZeroMQ, or broker-based message queues (NATS, Redis). In high-throughput, low-latency environments, these primitives introduce severe architectural bottlenecks:
 
-| IPC Mechanism | Kernel Overhead | Memory Copies | Typical Latency | Backpressure / Crash Behavior |
+| IPC Mechanism | Kernel Overhead | Memory Copies | One-way Latency | Backpressure / Crash Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| **Unix Domain Sockets (UDS)** | 2 syscalls (`send`/`recv`) + context switch | User $\to$ Kernel $\to$ User (2 copies) | 2,000 – 15,000 ns (2–15 µs) | Socket buffer fills up; blocks producer or drops packets |
-| **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | 5,000 – 25,000 ns (5–25 µs) | Heavy CPU jitter, flow control stalls |
-| **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | 1,500 – 8,000 ns (1.5–8 µs) | Blocking write when pipe buffer (64 KB) fills |
-| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (50–500 µs) | High GC/memory pressure, single point of failure |
-| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **0 copies (in-place memory access)** | **< 30 nanoseconds** | **Writer is unblockable; crash-isolated** |
+| **Unix Domain Sockets (UDS)** | 2 syscalls (`send`/`recv`) + context switch | User $\to$ Kernel $\to$ User (2 copies) | ~2,400 ns measured (RTT / 2) | Socket buffer fills up; blocks producer or drops packets |
+| **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | ~5,100 ns measured (RTT / 2) | Heavy CPU jitter, flow control stalls |
+| **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | ~2,500 ns measured (RTT / 2) | Blocking write when pipe buffer (64 KB) fills |
+| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (typical, not measured) | High GC/memory pressure, single point of failure |
+| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **1 copy (payload into the slot)** | **~160 ns one-way (measured)** | **Writer never blocks (lossy) or throttles on the slowest reader (lossless); crash-isolated** |
 
 ### The Three Critical Pain Points:
 1. **The Syscall & Context Switch Tax**: Every `write()` and `read()` triggers CPU privilege elevation from user-space to kernel-space and back, polluting CPU L1/L2 caches and branch predictors.
@@ -38,7 +75,7 @@ When communicating between processes on the same host, developers usually defaul
 - **Atomic Acquire/Release Synchronization**: State is coordinated via 64-bit atomic sequence numbers using CPU-level memory barriers (`core::sync::atomic`), completely bypassing the operating system kernel.
 - **Single-Writer Freedom (`LatestWins` Policy)**: The producer always writes to the ring. Slow, paused, or dead consumers can never block, stall, or crash the producer. If a consumer falls behind the ring buffer capacity, it detects that it was lapped and skips cleanly to the live stream.
 - **Cache-Line Isolated Layout**: Memory structures are aligned to 128-byte cache lines to eliminate false sharing between producer write heads and consumer read heads.
-- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers can instantly inspect the latest state (e.g., current Best Bid & Offer for 500 coins) in ~5 nanoseconds without replaying historical events.
+- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers can instantly inspect the latest state (e.g., current Best Bid & Offer for 500 coins) in ~2 nanoseconds without replaying historical events.
 - **Polyglot First-Class Support**: Because the layout in `/dev/shm` is standard C-ABI memory, consumers can be written in Rust, C, C++, or Python (`mmap` + `ctypes`/`numpy`) with zero bridge penalty.
 
 ---
@@ -63,13 +100,13 @@ When communicating between processes on the same host, developers usually defaul
 │                                  ringfire                                   │
 │           • Inter-process lock-free ring buffer via /dev/shm                │
 │           • O(1) Shared State Blackboard (Seqlock)                          │
-│           • Sub-50ns latency, C11 header, Python zero-copy bindings         │
+│           • ~160 ns cross-core latency, C11 header, Python bindings         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Verified Benchmarks (AMD Ryzen 9 7950X on Linux `booster`)
+## 🚀 Detailed Benchmarks (AMD Ryzen 9 7950X on Linux `booster`)
 
 Benchmarked using Criterion directly against POSIX shared memory (`/dev/shm`) on host `booster` (16 Cores / 32 Threads, Linux 6.8):
 
