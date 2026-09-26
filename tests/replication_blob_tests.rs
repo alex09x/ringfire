@@ -192,36 +192,41 @@ fn blob_source_arena_lapping_never_corrupts_the_mirror() {
     let _ = std::fs::remove_file(&source);
     let _ = std::fs::remove_file(&copy);
 
-    // A small arena flooded without pauses: payloads are overwritten before the server
-    // can copy them, so records are lost, but whatever the mirror delivers must be intact
-    // and strictly increasing.
+    // A 256-slot ring over a 64 KiB arena, flooded before the mirror connects: the oldest
+    // retained descriptors name payloads the arena has long overwritten. Those records
+    // must turn into gaps, everything else must arrive intact and strictly in order, and
+    // the live stream that follows must be complete.
     let max = 1500;
     let mut producer = BlobProducer::<Meta>::create(&source, 256, 1 << 16).unwrap();
+    let flood = 50_000u64;
+    for seq in 1..=flood {
+        push(&mut producer, seq, max);
+    }
     let addr = start_server(&source, None);
     let mut mirror = Mirror::builder()
         .start(MirrorStart::Oldest)
         .connect(addr, &copy)
         .unwrap();
+    assert!(mirror.first_sequence() <= flood);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();
         (mirror.sequence(), mirror.gaps())
     });
     let mut consumer = BlobConsumer::<Meta>::attach(&copy).unwrap();
-    let n = 50_000u64;
-    let pusher = thread::spawn(move || {
-        for seq in 1..=n {
-            push(&mut producer, seq, max);
+    let live = flood + 2_000;
+    for seq in flood + 1..=live {
+        push(&mut producer, seq, max);
+        if seq.is_multiple_of(50) {
+            thread::sleep(Duration::from_micros(200));
         }
-        thread::sleep(Duration::from_secs(2));
-        producer
-    });
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut out = vec![0u8; max + 1];
     let mut meta = Meta::default();
     let mut last = 0u64;
     let mut delivered = 0u64;
-    while last < n {
+    while last < live {
         match consumer.recv_status(&mut meta, &mut out).unwrap() {
             BlobRecvStatus::Ok { payload_len: len }
             | BlobRecvStatus::Lapped {
@@ -243,17 +248,19 @@ fn blob_source_arena_lapping_never_corrupts_the_mirror() {
                 delivered += 1;
             }
             BlobRecvStatus::Empty => {
-                assert!(Instant::now() < deadline, "stalled at {} of {}", last, n);
+                assert!(Instant::now() < deadline, "stalled at {} of {}", last, live);
                 std::hint::spin_loop();
             }
         }
     }
-    let _producer = pusher.join().unwrap();
-    assert!(delivered <= n);
+    assert!(
+        delivered < 256 + 2_000,
+        "the flooded arena cannot have kept every retained payload"
+    );
     handle.shutdown().unwrap();
     let (seq, gaps) = runner.join().unwrap();
-    assert_eq!(seq, n);
-    assert!(gaps > 0, "a flooded 64 KiB arena must lose history");
+    assert_eq!(seq, live);
+    assert!(gaps > 0, "overwritten payloads must be reported as gaps");
     let _ = std::fs::remove_file(&copy);
 }
 

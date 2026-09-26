@@ -69,10 +69,12 @@ fn main() {
     let mut iface = Ipv4Addr::UNSPECIFIED;
     let mut linger_us: Option<u64> = None;
     let mut warmup_ms = 1500u64;
+    let mut burst = 1u64;
     let mut i = 1;
     while i + 1 < args.len() {
         match args[i].as_str() {
             "--linger-us" => linger_us = Some(args[i + 1].parse().unwrap()),
+            "--burst" => burst = args[i + 1].parse::<u64>().unwrap().max(1),
             "--warmup-ms" => warmup_ms = args[i + 1].parse().unwrap(),
             "--role" => role = args[i + 1].clone(),
             "--bind" => bind = args[i + 1].clone(),
@@ -171,7 +173,8 @@ fn main() {
             });
             let epoch = Instant::now();
             let now_ns = move || epoch.elapsed().as_nanos() as u64;
-            let period = Duration::from_nanos(1_000_000_000 / rate.max(1));
+            // `rate` records per second, published `burst` at a time back to back.
+            let period = Duration::from_nanos(1_000_000_000 * burst / rate.max(1));
             let total = rate * seconds;
             // Give the peer's mirror time to connect to our server (it retries every
             // 200 ms), or its `Latest` start would miss the first records.
@@ -180,15 +183,17 @@ fn main() {
                 let start = Instant::now();
                 let mut next = start;
                 for seq in 1..=total {
-                    while Instant::now() < next {
-                        core::hint::spin_loop();
+                    if (seq - 1) % burst == 0 {
+                        while Instant::now() < next {
+                            core::hint::spin_loop();
+                        }
+                        next += period;
                     }
                     out.push(&Msg {
                         sent_ns: now_ns(),
                         seq,
                         _pad: [0; 40],
                     });
-                    next += period;
                 }
                 (out, start.elapsed())
             }));
@@ -228,8 +233,9 @@ fn main() {
             handle.shutdown().unwrap();
             let (datagrams, naks, retransmitted, gaps) = mirror_thread.join().unwrap();
             println!(
-                "rate {} msg/s x {} s: pushed {} in {:.2} s ({:.0} msg/s achieved), echoed {} ({:.3}%), lost {}, disorder {}, reader lapped {}",
+                "rate {} msg/s (bursts of {}) x {} s: pushed {} in {:.2} s ({:.0} msg/s achieved), echoed {} ({:.3}%), lost {}, disorder {}, reader lapped {}",
                 rate,
+                burst,
                 seconds,
                 total,
                 push_elapsed.as_secs_f64(),

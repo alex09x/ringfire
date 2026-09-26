@@ -491,8 +491,11 @@ No record was lost or reordered at any point (5 million records at 1 M/s). The c
 between 20,000 and 50,000 messages/s without linger is the per-datagram cost of the
 kernel path (about 40,000 datagrams/s sustained on these hosts): a frame per record is a
 system call and a packet per record. Linger fills frames (26 records fit a 1472-byte
-datagram) at the price of the wait; the default is adaptive, which batches only while
-frames go out back to back, up to 50 µs. Near 1 M/s the 1500-byte MTU is the limit and
+datagram) at the price of the wait. The default is adaptive pacing: frames leave at most
+once per 50 µs unless full, and a record that arrives later than that after the previous
+frame goes out at once, so a quiet or bursty stream pays nothing (1,000/s: 55 µs p50,
+bursts of four: 62 µs p50) while a steady 20,000/s stream pays about 35 µs; pass
+`--linger-us 0` for such streams if that matters. Near 1 M/s the 1500-byte MTU is the limit and
 jumbo frames raise it six-fold. A receiver that cannot keep up loses datagrams faster than
 `NAK` retransmission brings them back, so size the mirror host for the rate. Going below
 the kernel stack means bypassing it (`AF_XDP`, DPDK, Onload), which is the planned next

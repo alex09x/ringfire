@@ -147,9 +147,10 @@ const _: () = assert!(
 /// Datagrams one `Mirror::step` processes before returning: small enough that a caller
 /// interleaving its own work sees new records within a few frames.
 const DATAGRAMS_PER_STEP: usize = 32;
-/// Adaptive linger: when the previous frame went out less than this long ago, the sender
-/// keeps collecting for up to the same time before sending the next one.
-const ADAPTIVE_LINGER: Duration = Duration::from_micros(50);
+/// Adaptive pacing: frames leave at most once per this interval unless full. A record that
+/// arrives later than this after the previous frame goes out at once, so quiet and
+/// moderate streams are not delayed; under load the datagram rate stays near 20,000/s.
+const ADAPTIVE_PACE: Duration = Duration::from_micros(50);
 
 /// Geometry of a ring as exchanged during the handshake: everything a mirror needs to
 /// create an identical ring.
@@ -848,9 +849,8 @@ impl SourceRing {
     }
 
     /// [`SourceRing::collect`] that, once it has something, keeps collecting for up to
-    /// `linger` until the frame is full. Trades a few microseconds for far fewer sends
-    /// under load: without it a sender that keeps up with the producer puts one or two
-    /// records in every frame and pays a system call for each.
+    /// `linger` until the frame is full. Fewer, fuller frames under load; every frame
+    /// costs a system call and a packet.
     fn collect_lingering(
         &self,
         cursor: u64,
@@ -1097,8 +1097,8 @@ pub struct ReplicaServer {
     session: u8,
 }
 
-/// Decides how long the next frame may be held to fill up: a fixed setting, or the
-/// adaptive rule (batch only while frames go out back to back).
+/// Decides how long a frame may be held to fill up: a fixed setting, or adaptive pacing
+/// (see [`ADAPTIVE_PACE`]).
 #[derive(Clone, Copy)]
 struct Linger {
     fixed: Option<Duration>,
@@ -1109,15 +1109,15 @@ impl Linger {
     fn new(fixed: Option<Duration>) -> Self {
         Self {
             fixed,
-            last_send: Instant::now() - ADAPTIVE_LINGER,
+            last_send: Instant::now() - ADAPTIVE_PACE,
         }
     }
 
+    /// How long the next frame may wait for more records.
     fn current(&self) -> Duration {
         match self.fixed {
             Some(fixed) => fixed,
-            None if self.last_send.elapsed() < ADAPTIVE_LINGER => ADAPTIVE_LINGER,
-            None => Duration::ZERO,
+            None => ADAPTIVE_PACE.saturating_sub(self.last_send.elapsed()),
         }
     }
 
@@ -1150,10 +1150,11 @@ impl ReplicaServer {
 
     /// After finding new records, keep collecting for up to this long until a frame is
     /// full before sending it. Zero sends every record as soon as it is seen. The default
-    /// (`None`) is adaptive: no waiting while frames are sparse, up to 50 µs while they
-    /// go out back to back. Each frame costs a system call and a packet, so at
-    /// 100,000 messages/s unbatched frames alone push latency past a millisecond on a
-    /// kernel network stack; see the stress example.
+    /// (`None`) is adaptive pacing: frames leave at most once per 50 µs unless full, and a
+    /// record arriving later than that after the previous frame goes out at once. Each
+    /// frame costs a system call and a packet, so at 100,000 messages/s unbatched frames
+    /// alone push latency past a millisecond on a kernel network stack; see the stress
+    /// example.
     pub fn linger(mut self, linger: Option<Duration>) -> Self {
         self.linger = linger;
         self
