@@ -415,8 +415,14 @@ let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code a
   rings whose sequence numbers may have holes; a Rust `RingConsumer` then skips to the
   next message present instead of waiting for a sequence that will never arrive.
 * **Own binary protocol**: a 16-byte frame header, up to 65,535 records per `DATA`
-  frame, `HEARTBEAT` while idle. The frame table is in `src/replication.rs`. Rings with a
-  payload arena (`BlobProducer`) are not supported yet.
+  frame, `HEARTBEAT` while idle. The frame table is in `src/replication.rs`.
+* **Fixed-size and variable-length records.** A `RingProducer` ring is copied slot for
+  slot. A `BlobProducer` ring (descriptor ring plus payload arena) is copied record for
+  record: each blob keeps its bytes, length, flags and sequence and lands in the mirror's
+  own arena, which no reader can tell apart. A blob whose bytes the source already
+  overwrote is skipped with a `GAP`, exactly as a lapped local `BlobConsumer` would skip
+  it. Blobs larger than one datagram ride IP fragmentation; blobs larger than the host's
+  datagram limit reach mirrors through the `NAK` path over TCP.
 * **UDP multicast** (`--multicast GROUP:PORT`): the source sends each `DATA` frame once,
   as one datagram, and every mirror receives it, so the cost does not grow with the number
   of mirrors. The TCP connection stays for the handshake and for retransmission: a mirror

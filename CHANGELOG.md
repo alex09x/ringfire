@@ -30,9 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release fixes: multicast heartbeats announcing a sequence whose datagram had not been
   sent yet (spurious NAKs under load), and `Mirror::step` draining datagrams without bound
   so a caller interleaving its own work never got control back.
-- `FLAG_SPARSE` (0x0400): rings whose sequence numbers may have holes. `RingConsumer`
-  skips to the next message present instead of waiting on a hole (checked every 64 empty
-  polls, only on sparse rings; other rings are unchanged).
+- **Blob rings are mirrored too** (`BlobProducer` / `BlobConsumer`): the `GEOMETRY` frame
+  carries the arena, `DATA` records carry the descriptor followed by the blob bytes, the
+  mirror writes blobs into its own arena and rewrites the descriptor's location. A blob
+  overwritten at the source before it could be copied becomes a `GAP`. Oversized blobs
+  (beyond the MTU, or beyond what the host lets a datagram be) still arrive, over TCP.
+- `FLAG_SPARSE` (0x0400): rings whose sequence numbers may have holes. `RingConsumer` and
+  `BlobConsumer` skip to the next message present instead of waiting on a hole (checked
+  every 64 empty polls, only on sparse rings; other rings are unchanged).
 - `RingfireError::Unsupported` and `RingfireError::Protocol`.
 - `examples/replication_latency.rs`: one-way latency and burst throughput over loopback.
 

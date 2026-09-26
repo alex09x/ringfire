@@ -182,7 +182,7 @@ copying, which is what lets a `LosslessBackpressure` producer reuse slots safely
 - [x] **`FLAG_SPARSE`** and hole skipping in `RingConsumer` for rings that join a stream mid-way.
 - [x] **UDP multicast transport** with NAK-based retransmission from the source ring (one datagram for every mirror), in-order hold-back of overtaking datagrams, heartbeat-detected tail loss, per-source session byte.
 - [ ] Kernel bypass for the multicast path (`AF_XDP` / DPDK / Onload): the two kernel network stacks are about 27 µs of the LAN one-way latency.
-- [ ] Mirror rings with a payload arena (`BlobProducer` streams).
+- [x] **Mirror rings with a payload arena** (`BlobProducer` streams): descriptor plus blob bytes on the wire, blobs re-placed in the mirror's arena, lost payloads become `GAP`s, oversized blobs fall back to TCP.
 - [ ] `FLAG_SPARSE` awareness in the C header and Python readers.
 
 ### Phase 10: Next

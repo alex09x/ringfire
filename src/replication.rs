@@ -25,7 +25,10 @@
 //!   that sequence numbers may have holes (a mirror that joined mid-stream starts at the
 //!   source's current sequence), so they skip to the next message present instead of
 //!   waiting for one that will never arrive.
-//! * Rings with a payload arena ([`BlobProducer`](crate::BlobProducer)) are not supported.
+//! * Fixed-size records (`RingProducer`) and variable-length ones
+//!   ([`BlobProducer`](crate::BlobProducer), a descriptor ring plus a payload arena) are
+//!   both mirrored. A blob keeps its bytes, length, flags and sequence; only its position
+//!   in the mirror's arena differs, which no reader can observe.
 //!
 //! ## Wire protocol (version 1)
 //!
@@ -38,8 +41,8 @@
 //! | kind | direction | `seq` | payload |
 //! |---|---|---|---|
 //! | `HELLO` 1 | mirror → source | first wanted sequence: `0` = only new messages, `u64::MAX` = oldest retained, otherwise resume from there | magic u64, version u32, pad u32 |
-//! | `GEOMETRY` 2 | source → mirror | first sequence that will be sent; flag bit 0 = the wanted sequence was ahead of the source (restart), bit 1 = a `MULTICAST` frame follows | capacity u64, element_size u32, flags u32, schema_sig u64, registry_count u32, slots_offset u32 |
-//! | `DATA` 3 | source → mirror | sequence of the first record | `count` records of `element_size - 8` bytes |
+//! | `GEOMETRY` 2 | source → mirror | first sequence that will be sent; flag bit 0 = the wanted sequence was ahead of the source (restart), bit 1 = a `MULTICAST` frame follows | capacity u64, element_size u32, flags u32, schema_sig u64, registry_count u32, slots_offset u32, arena_offset u64, arena_size u64 |
+//! | `DATA` 3 | source → mirror | sequence of the first record | `count` records: the slot payload (`element_size - 8` bytes), followed for arena rings by the blob bytes the descriptor names |
 //! | `GAP` 4 | source → mirror | next sequence that will be sent | none |
 //! | `HEARTBEAT` 5 | source → mirror | last sequence published by the source | none |
 //!
@@ -74,12 +77,14 @@ use std::net::{
 };
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use memmap2::{Mmap, MmapMut};
 
+use crate::arena::{ArenaHeader, BlobRef, PayloadArena};
 use crate::error::{Result, RingfireError};
 use crate::header::{
     FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS, FLAG_SPARSE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY,
@@ -103,8 +108,14 @@ pub const DEFAULT_MTU: usize = 1472;
 
 const FRAME_HEADER_LEN: usize = 16;
 const HELLO_LEN: usize = 16;
-const GEOMETRY_LEN: usize = 32;
+const GEOMETRY_LEN: usize = 48;
 const NAK_LEN: usize = 8;
+/// Size of the [`BlobRef`] that ends every arena-ring descriptor.
+const BLOB_REF_LEN: usize = 16;
+/// Largest UDP payload the kernel will send (IPv4, after fragmentation).
+const UDP_MAX_PAYLOAD: usize = 65_507;
+/// Frame budget on a TCP stream.
+const TCP_FRAME_BYTES: usize = 1 << 20;
 const MULTICAST_LEN: usize = 16;
 const KIND_HELLO: u8 = 1;
 const KIND_GEOMETRY: u8 = 2;
@@ -128,6 +139,11 @@ const NAK_MAX: u64 = u16::MAX as u64;
 const PENDING_MAX: usize = 8192;
 /// How long a mirror sleeps in `poll` between checks when not busy-polling.
 const POLL_SLICE: Duration = Duration::from_millis(10);
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "the replication protocol carries native slot bytes and assumes little-endian hosts"
+);
+
 /// Datagrams one `Mirror::step` processes before returning: small enough that a caller
 /// interleaving its own work sees new records within a few frames.
 const DATAGRAMS_PER_STEP: usize = 32;
@@ -145,6 +161,10 @@ pub struct Geometry {
     pub schema_sig: u64,
     pub registry_count: u32,
     pub slots_offset: u32,
+    /// Byte offset of the payload arena (0 = fixed-size records only).
+    pub arena_offset: u64,
+    /// Capacity of the payload arena in bytes (0 = none).
+    pub arena_size: u64,
 }
 
 impl Geometry {
@@ -156,12 +176,20 @@ impl Geometry {
             schema_sig: header.schema_sig,
             registry_count: header.reader_registry_count,
             slots_offset: view.slots_offset as u32,
+            arena_offset: header.arena_offset,
+            arena_size: header.arena_size,
         }
     }
 
-    /// Bytes of payload per record (the slot minus its sequence word).
+    /// Bytes of slot payload per record (the slot minus its sequence word). For arena
+    /// rings this is the descriptor; the blob bytes follow it on the wire.
     pub fn payload_len(&self) -> usize {
         self.element_size as usize - 8
+    }
+
+    /// Whether records carry a variable-length payload in an arena (`BlobProducer` rings).
+    pub fn has_arena(&self) -> bool {
+        self.arena_offset != 0
     }
 
     /// Same slot layout: a ring with this layout can hold this geometry's records.
@@ -171,6 +199,8 @@ impl Geometry {
             && self.schema_sig == other.schema_sig
             && self.registry_count == other.registry_count
             && self.slots_offset == other.slots_offset
+            && self.arena_offset == other.arena_offset
+            && self.arena_size == other.arena_size
     }
 
     fn mirror_flags(&self) -> u32 {
@@ -182,6 +212,18 @@ impl Geometry {
             } else {
                 0
             }
+            | if self.has_arena() { FLAG_WITH_ARENA } else { 0 }
+    }
+
+    /// Bytes the whole mapping takes.
+    fn total_len(&self) -> usize {
+        if self.has_arena() {
+            self.arena_offset as usize
+                + std::mem::size_of::<ArenaHeader>()
+                + self.arena_size as usize
+        } else {
+            self.slots_offset as usize + self.capacity as usize * self.element_size as usize
+        }
     }
 
     fn encode(&self, out: &mut [u8; GEOMETRY_LEN]) {
@@ -191,6 +233,8 @@ impl Geometry {
         out[16..24].copy_from_slice(&self.schema_sig.to_le_bytes());
         out[24..28].copy_from_slice(&self.registry_count.to_le_bytes());
         out[28..32].copy_from_slice(&self.slots_offset.to_le_bytes());
+        out[32..40].copy_from_slice(&self.arena_offset.to_le_bytes());
+        out[40..48].copy_from_slice(&self.arena_size.to_le_bytes());
     }
 
     fn decode(b: &[u8; GEOMETRY_LEN]) -> Result<Self> {
@@ -201,6 +245,8 @@ impl Geometry {
             schema_sig: u64::from_le_bytes(b[16..24].try_into().unwrap()),
             registry_count: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             slots_offset: u32::from_le_bytes(b[28..32].try_into().unwrap()),
+            arena_offset: u64::from_le_bytes(b[32..40].try_into().unwrap()),
+            arena_size: u64::from_le_bytes(b[40..48].try_into().unwrap()),
         };
         if !g.capacity.is_power_of_two() {
             return Err(RingfireError::Protocol(
@@ -219,12 +265,39 @@ impl Geometry {
                 "geometry slots offset is misplaced",
             ));
         }
-        if (g.capacity as usize)
+        let Some(slots_end) = (g.capacity as usize)
             .checked_mul(g.element_size as usize)
             .and_then(|b| b.checked_add(g.slots_offset as usize))
-            .is_none()
-        {
+        else {
             return Err(RingfireError::Protocol("geometry does not fit in memory"));
+        };
+        if g.has_arena() {
+            if (g.arena_offset as usize) < slots_end || !g.arena_offset.is_multiple_of(64) {
+                return Err(RingfireError::Protocol(
+                    "geometry arena offset is misplaced",
+                ));
+            }
+            if !g.arena_size.is_power_of_two() || g.arena_size < 64 {
+                return Err(RingfireError::Protocol(
+                    "geometry arena size is not a power of two",
+                ));
+            }
+            if g.payload_len() < BLOB_REF_LEN {
+                return Err(RingfireError::Protocol(
+                    "geometry arena ring has no blob descriptor",
+                ));
+            }
+            if (g.arena_offset as usize)
+                .checked_add(std::mem::size_of::<ArenaHeader>())
+                .and_then(|b| b.checked_add(g.arena_size as usize))
+                .is_none()
+            {
+                return Err(RingfireError::Protocol("geometry does not fit in memory"));
+            }
+        } else if g.arena_size != 0 {
+            return Err(RingfireError::Protocol(
+                "geometry arena size without an arena",
+            ));
         }
         Ok(g)
     }
@@ -532,10 +605,93 @@ fn send_datagram(sock: &UdpSocket, dest: SocketAddrV4, bytes: &[u8]) -> io::Resu
 // Raw ring access (element type unknown)
 // ---------------------------------------------------------------------------------------
 
+/// Outcome of reading one record.
 enum RawRead {
     Item,
     Pending,
     Overwritten(u64),
+    /// The descriptor was intact but its payload had already been overwritten in the
+    /// arena (or pointed outside it): the record is gone for good.
+    Lost,
+}
+
+/// What one `collect` gathered.
+struct Collected {
+    count: usize,
+    lapped: Option<u64>,
+    /// The record after the collected ones is lost (see [`RawRead::Lost`]).
+    lost: bool,
+}
+
+/// The blob descriptor stored at the end of a record's slot payload.
+fn blob_ref_at(payload: &[u8]) -> BlobRef {
+    let b = &payload[payload.len() - BLOB_REF_LEN..];
+    BlobRef {
+        offset: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        len: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        flags: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+    }
+}
+
+fn put_blob_ref(payload: &mut [u8], r: BlobRef) {
+    let n = payload.len();
+    let b = &mut payload[n - BLOB_REF_LEN..];
+    b[0..8].copy_from_slice(&r.offset.to_le_bytes());
+    b[8..12].copy_from_slice(&r.len.to_le_bytes());
+    b[12..16].copy_from_slice(&r.flags.to_le_bytes());
+}
+
+/// Read-only view of the source ring's payload arena.
+struct ArenaView {
+    header: *const ArenaHeader,
+    data: *const u8,
+    capacity: u64,
+    mask: u64,
+}
+
+impl ArenaView {
+    /// # Safety
+    /// `base` must map a validated ring whose header names an arena.
+    unsafe fn open(base: *const u8, geometry: &Geometry) -> Result<Self> {
+        let header = unsafe { base.add(geometry.arena_offset as usize) }.cast::<ArenaHeader>();
+        let (capacity, mask) = unsafe { ((*header).capacity, (*header).mask) };
+        if capacity != geometry.arena_size || mask != capacity - 1 {
+            return Err(RingfireError::CorruptLayout(
+                "arena header disagrees with ring header",
+            ));
+        }
+        Ok(Self {
+            header,
+            data: unsafe { header.cast::<u8>().add(std::mem::size_of::<ArenaHeader>()) },
+            capacity,
+            mask,
+        })
+    }
+
+    fn in_bounds(&self, r: BlobRef) -> bool {
+        (r.offset & self.mask) + r.len as u64 <= self.capacity
+    }
+
+    /// Appends the bytes `r` names to `out`. The copy is only trustworthy if
+    /// [`ArenaView::is_lapped`] is false afterwards.
+    fn copy_into(&self, r: BlobRef, out: &mut Vec<u8>) {
+        let len = r.len as usize;
+        out.reserve(len);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.data.add((r.offset & self.mask) as usize),
+                out.as_mut_ptr().add(out.len()),
+                len,
+            );
+            out.set_len(out.len() + len);
+        }
+    }
+
+    fn is_lapped(&self, r: BlobRef) -> bool {
+        fence(Ordering::Acquire);
+        let reserved = unsafe { (*self.header).reserved.load(Ordering::Relaxed) };
+        reserved.saturating_sub(r.offset) > self.capacity
+    }
 }
 
 /// Read-only view of the source ring; one per mirror connection.
@@ -543,6 +699,7 @@ struct SourceRing {
     base: *const u8,
     view: RingView,
     geometry: Geometry,
+    arena: Option<ArenaView>,
     _mmap: Mmap,
 }
 
@@ -554,16 +711,22 @@ impl SourceRing {
         let mmap = unsafe { Mmap::map(&file)? };
         let view = unsafe { validate_ring(mmap.as_ptr(), mmap.len(), None, 8)? };
         let header = unsafe { &*mmap.as_ptr().cast::<RingHeader>() };
-        if header.flags & FLAG_WITH_ARENA != 0 {
-            return Err(RingfireError::Unsupported(
-                "rings with a payload arena cannot be mirrored",
-            ));
-        }
         let geometry = Geometry::from_header(header, &view);
+        let arena = if header.flags & FLAG_WITH_ARENA != 0 {
+            if geometry.payload_len() < BLOB_REF_LEN {
+                return Err(RingfireError::Unsupported(
+                    "arena ring without a blob descriptor",
+                ));
+            }
+            Some(unsafe { ArenaView::open(mmap.as_ptr(), &geometry)? })
+        } else {
+            None
+        };
         Ok(Self {
             base: mmap.as_ptr(),
             view,
             geometry,
+            arena,
             _mmap: mmap,
         })
     }
@@ -576,7 +739,7 @@ impl SourceRing {
         self.header().write_seq.load(Ordering::Acquire)
     }
 
-    /// Copies the payload of message `want` into `out` using the v2 slot protocol.
+    /// Copies the slot payload of message `want` into `out` using the v2 slot protocol.
     fn read(&self, want: u64, out: &mut [u8]) -> RawRead {
         let slot = unsafe {
             self.base.add(
@@ -586,7 +749,7 @@ impl SourceRing {
         let seq = unsafe { &*slot.cast::<AtomicU64>() };
         let s1 = seq.load(Ordering::Acquire);
         if s1 == want {
-            unsafe { std::ptr::copy_nonoverlapping(slot.add(8), out.as_mut_ptr(), out.len()) };
+            unsafe { ptr::copy_nonoverlapping(slot.add(8), out.as_mut_ptr(), out.len()) };
             fence(Ordering::Acquire);
             let s2 = seq.load(Ordering::Relaxed);
             if s2 == want {
@@ -601,20 +764,82 @@ impl SourceRing {
         }
     }
 
-    /// Reads up to `max` consecutive records from `cursor` into `buf` after the frame
-    /// header. Returns how many were read and whether the reader was lapped.
-    fn collect(&self, cursor: u64, max: usize, buf: &mut [u8]) -> (usize, Option<u64>) {
+    /// Appends record `want` to `out`: its slot payload, then its blob bytes for arena
+    /// rings. Leaves `out` unchanged unless it returns [`RawRead::Item`].
+    fn read_record(&self, want: u64, out: &mut Vec<u8>) -> RawRead {
         let payload_len = self.geometry.payload_len();
-        let mut count = 0usize;
-        while count < max {
-            let start = FRAME_HEADER_LEN + count * payload_len;
-            match self.read(cursor + count as u64, &mut buf[start..start + payload_len]) {
-                RawRead::Item => count += 1,
-                RawRead::Pending => break,
-                RawRead::Overwritten(seen) => return (count, Some(seen)),
+        let start = out.len();
+        out.resize(start + payload_len, 0);
+        match self.read(want, &mut out[start..]) {
+            RawRead::Item => {}
+            other => {
+                out.truncate(start);
+                return other;
             }
         }
-        (count, None)
+        if let Some(arena) = &self.arena {
+            let r = blob_ref_at(&out[start..]);
+            if r.len > 0 {
+                if !arena.in_bounds(r) {
+                    out.truncate(start);
+                    return RawRead::Lost;
+                }
+                arena.copy_into(r, out);
+                if arena.is_lapped(r) {
+                    out.truncate(start);
+                    return RawRead::Lost;
+                }
+            }
+        }
+        RawRead::Item
+    }
+
+    /// Appends up to `max_records` consecutive records from `cursor` to `out`, which
+    /// already holds the frame header, stopping before `max_bytes` would be exceeded
+    /// unless the frame is still empty (a single record is never split).
+    fn collect(
+        &self,
+        cursor: u64,
+        max_records: usize,
+        max_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> Collected {
+        let mut count = 0usize;
+        while count < max_records {
+            let before = out.len();
+            match self.read_record(cursor + count as u64, out) {
+                RawRead::Item => {
+                    if count > 0 && out.len() > max_bytes {
+                        out.truncate(before);
+                        break;
+                    }
+                    count += 1;
+                    if out.len() >= max_bytes {
+                        break;
+                    }
+                }
+                RawRead::Pending => break,
+                RawRead::Overwritten(seen) => {
+                    return Collected {
+                        count,
+                        lapped: Some(seen),
+                        lost: false,
+                    };
+                }
+                RawRead::Lost => {
+                    return Collected {
+                        count,
+                        lapped: None,
+                        lost: true,
+                    };
+                }
+            }
+        }
+        Collected {
+            count,
+            lapped: None,
+            lost: false,
+        }
     }
 
     /// Where a lapped reader continues.
@@ -629,43 +854,48 @@ impl SourceRing {
     fn collect_lingering(
         &self,
         cursor: u64,
-        max: usize,
-        buf: &mut [u8],
+        max_records: usize,
+        max_bytes: usize,
+        out: &mut Vec<u8>,
         linger: Duration,
-    ) -> (usize, Option<u64>) {
-        let payload_len = self.geometry.payload_len();
-        let (mut count, mut lapped) = self.collect(cursor, max, buf);
-        if count == 0 || count >= max || lapped.is_some() || linger.is_zero() {
-            return (count, lapped);
+    ) -> Collected {
+        let mut got = self.collect(cursor, max_records, max_bytes, out);
+        let full = |got: &Collected, out: &Vec<u8>| {
+            got.count >= max_records || out.len() >= max_bytes || got.lapped.is_some() || got.lost
+        };
+        if got.count == 0 || full(&got, out) || linger.is_zero() {
+            return got;
         }
         let until = Instant::now() + linger;
-        while count < max && lapped.is_none() && Instant::now() < until {
-            let (more, seen) = self.collect(
-                cursor + count as u64,
-                max - count,
-                &mut buf[count * payload_len..],
+        while !full(&got, out) && Instant::now() < until {
+            let more = self.collect(
+                cursor + got.count as u64,
+                max_records - got.count,
+                max_bytes,
+                out,
             );
-            count += more;
-            lapped = seen;
-            if more == 0 {
+            got.count += more.count;
+            got.lapped = more.lapped;
+            got.lost = more.lost;
+            if more.count == 0 {
                 core::hint::spin_loop();
             }
         }
-        (count, lapped)
+        got
     }
 }
 
-/// Encodes a `DATA` header for `count` records into `buf` and returns the whole frame.
-fn data_frame(buf: &mut [u8], flags: u8, count: usize, payload_len: usize, seq: u64) -> &[u8] {
+/// Fills in the `DATA` header of a frame built by `collect` and returns the whole frame.
+fn data_frame(out: &mut [u8], flags: u8, count: usize, seq: u64) -> &[u8] {
     let frame = Frame {
         kind: KIND_DATA,
         flags,
         count: count as u16,
-        len: (count * payload_len) as u32,
+        len: (out.len() - FRAME_HEADER_LEN) as u32,
         seq,
     };
-    buf[..FRAME_HEADER_LEN].copy_from_slice(&frame.encode());
-    &buf[..FRAME_HEADER_LEN + count * payload_len]
+    out[..FRAME_HEADER_LEN].copy_from_slice(&frame.encode());
+    out
 }
 
 /// Single writer of a mirror ring, addressing slots by the source's sequence numbers.
@@ -675,6 +905,7 @@ struct MirrorRing {
     geometry: Geometry,
     /// Sequence the next record must carry.
     next_seq: u64,
+    arena: Option<PayloadArena>,
     _mmap: MmapMut,
     _file: std::fs::File,
 }
@@ -689,12 +920,12 @@ impl MirrorRing {
         let slot_size = geometry.element_size as usize;
         let slots_offset = geometry.slots_offset as usize;
         let capacity = geometry.capacity;
-        let total = slots_offset + capacity as usize * slot_size;
+        let total = geometry.total_len();
 
         let file = create_backing_file(path, mode, true, total as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let base = mmap.as_mut_ptr();
-        unsafe {
+        let arena = unsafe {
             RingHeader::initialize(
                 base.cast(),
                 &RingLayout {
@@ -707,8 +938,8 @@ impl MirrorRing {
                     registry_offset: if registry_count > 0 { header_size } else { 0 },
                     registry_count,
                     slots_offset,
-                    arena_offset: 0,
-                    arena_size: 0,
+                    arena_offset: geometry.arena_offset as usize,
+                    arena_size: geometry.arena_size as usize,
                 },
             );
             if registry_count > 0 {
@@ -718,8 +949,17 @@ impl MirrorRing {
                 let seq = &*base.add(slots_offset + i * slot_size).cast::<AtomicU64>();
                 seq.store(0, Ordering::Relaxed);
             }
+            let arena = if geometry.has_arena() {
+                Some(PayloadArena::init(
+                    base.add(geometry.arena_offset as usize),
+                    geometry.arena_size as usize,
+                )?)
+            } else {
+                None
+            };
             RingHeader::publish(base.cast());
-        }
+            arena
+        };
         Ok(Self {
             base,
             view: RingView {
@@ -730,6 +970,7 @@ impl MirrorRing {
             },
             geometry: *geometry,
             next_seq: 1,
+            arena,
             _mmap: mmap,
             _file: file,
         })
@@ -754,16 +995,22 @@ impl MirrorRing {
             return Ok(None);
         };
         let header = unsafe { &*base.cast::<RingHeader>() };
-        if header.flags & FLAG_WITH_ARENA != 0 {
-            return Ok(None);
-        }
         let geometry = Geometry::from_header(header, &view);
+        let arena = if geometry.has_arena() {
+            match unsafe { PayloadArena::from_ptr(base.add(geometry.arena_offset as usize)) } {
+                Ok(arena) if arena.capacity() as u64 == geometry.arena_size => Some(arena),
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
         let next_seq = header.write_seq.load(Ordering::Acquire) + 1;
         Ok(Some(Self {
             base,
             view,
             geometry,
             next_seq,
+            arena,
             _mmap: mmap,
             _file: file,
         }))
@@ -773,20 +1020,48 @@ impl MirrorRing {
         unsafe { &*self.base.cast::<RingHeader>() }
     }
 
-    /// Writes record `seq` (which must be `next_seq`) without publishing it.
+    fn slot(&self, seq: u64) -> *mut u8 {
+        unsafe {
+            self.base
+                .add(self.view.slots_offset + (seq & self.view.mask) as usize * self.view.slot_size)
+        }
+    }
+
+    /// Writes fixed-size record `seq` (which must be `next_seq`) without publishing it.
     fn write(&mut self, seq: u64, payload: &[u8]) {
         debug_assert_eq!(seq, self.next_seq);
         debug_assert_eq!(payload.len(), self.view.slot_size - 8);
-        let slot = unsafe {
-            self.base
-                .add(self.view.slots_offset + (seq & self.view.mask) as usize * self.view.slot_size)
-        };
+        let slot = self.slot(seq);
         let word = unsafe { &*slot.cast::<AtomicU64>() };
         word.store(SLOT_WRITING, Ordering::Relaxed);
         fence(Ordering::Release);
-        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), slot.add(8), payload.len()) };
+        unsafe { ptr::copy_nonoverlapping(payload.as_ptr(), slot.add(8), payload.len()) };
         word.store(seq, Ordering::Release);
         self.next_seq = seq + 1;
+    }
+
+    /// Writes arena record `seq`: the blob goes into this ring's arena and the descriptor
+    /// is stored pointing at it, keeping the source's length and flags.
+    fn write_blob(&mut self, seq: u64, descriptor: &[u8], blob: &[u8]) -> Result<()> {
+        debug_assert_eq!(seq, self.next_seq);
+        debug_assert_eq!(descriptor.len(), self.view.slot_size - 8);
+        let arena = self.arena.as_ref().expect("arena ring");
+        let source = blob_ref_at(descriptor);
+        let placed = arena.write_blob(blob, source.flags)?;
+        let slot = self.slot(seq);
+        let word = unsafe { &*slot.cast::<AtomicU64>() };
+        word.store(SLOT_WRITING, Ordering::Relaxed);
+        fence(Ordering::Release);
+        unsafe {
+            ptr::copy_nonoverlapping(descriptor.as_ptr(), slot.add(8), descriptor.len());
+            put_blob_ref(
+                std::slice::from_raw_parts_mut(slot.add(8), descriptor.len()),
+                placed,
+            );
+        }
+        word.store(seq, Ordering::Release);
+        self.next_seq = seq + 1;
+        Ok(())
     }
 
     /// Publishes everything written so far and wakes sleeping readers.
@@ -983,11 +1258,9 @@ fn multicast_loop(
     let mut linger = Linger::new(linger);
     let sock = multicast_sender(&cfg)?;
     let dest = SocketAddrV4::new(cfg.group, cfg.port);
-    let payload_len = ring.geometry.payload_len();
-    let per_datagram = (cfg.mtu.saturating_sub(FRAME_HEADER_LEN) / payload_len)
-        .clamp(1, u16::MAX as usize)
-        .min(batch);
-    let mut buf = vec![0u8; FRAME_HEADER_LEN + per_datagram * payload_len];
+    let batch = batch.clamp(1, u16::MAX as usize);
+    let mut max_bytes = cfg.mtu.max(FRAME_HEADER_LEN + 1);
+    let mut wire: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
     let mut cursor = ring.write_seq() + 1;
     let mut sent = 0u64;
     let mut idle = 0u32;
@@ -995,25 +1268,44 @@ fn multicast_loop(
     // Fault injection: a datagram held back to go out after its successor.
     let mut held: Option<Vec<u8>> = None;
     loop {
-        let (count, lapped) =
-            ring.collect_lingering(cursor, per_datagram, &mut buf, linger.current());
-        if count > 0 {
+        wire.clear();
+        wire.resize(FRAME_HEADER_LEN, 0);
+        let got = ring.collect_lingering(cursor, batch, max_bytes, &mut wire, linger.current());
+        if got.count > 0 {
+            if wire.len() > UDP_MAX_PAYLOAD {
+                // One record larger than a datagram can carry: mirrors notice the jump
+                // and fetch it over TCP.
+                cursor += got.count as u64;
+                continue;
+            }
             sent += 1;
-            let frame = data_frame(&mut buf, session, count, payload_len, cursor);
+            let frame = data_frame(&mut wire, session, got.count, cursor);
             if cfg.swap_every != 0 && sent.is_multiple_of(cfg.swap_every) && held.is_none() {
                 held = Some(frame.to_vec());
             } else if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
-                send_datagram(&sock, dest, frame)?;
-                if let Some(late) = held.take() {
-                    send_datagram(&sock, dest, &late)?;
+                match send_datagram(&sock, dest, frame) {
+                    Ok(()) => {
+                        if let Some(late) = held.take() {
+                            send_datagram(&sock, dest, &late)?;
+                        }
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {
+                        // Larger than this host lets a datagram be (macOS stops at
+                        // 9 KiB by default): remember the limit and let mirrors fetch
+                        // these records over TCP.
+                        max_bytes = max_bytes
+                            .min(wire.len().saturating_sub(1))
+                            .max(FRAME_HEADER_LEN + 1);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             linger.sent();
-            cursor += count as u64;
+            cursor += got.count as u64;
             idle = 0;
             last_beat = Instant::now();
         }
-        if let Some(seen) = lapped {
+        if let Some(seen) = got.lapped {
             // Mirrors notice the jump and NAK; the TCP side answers with GAP for what is
             // no longer retained.
             let resync = ring.resync(seen);
@@ -1022,7 +1314,12 @@ fn multicast_loop(
             }
             continue;
         }
-        if count == 0 {
+        if got.lost {
+            // Its payload is gone from the arena: mirrors NAK and get a GAP over TCP.
+            cursor += 1;
+            continue;
+        }
+        if got.count == 0 {
             if spin {
                 core::hint::spin_loop();
             } else {
@@ -1123,9 +1420,8 @@ fn serve_client(
     }
     stream.write_all(&out)?;
 
-    let payload_len = ring.geometry.payload_len();
     let batch = batch.clamp(1, u16::MAX as usize);
-    let mut buf = vec![0u8; FRAME_HEADER_LEN + batch * payload_len];
+    let mut wire: Vec<u8> = Vec::with_capacity(1 << 16);
 
     if multicast.is_some() {
         // Live data goes by multicast; answer retransmission requests until the mirror
@@ -1138,7 +1434,7 @@ fn serve_client(
                     let mut to = [0u8; NAK_LEN];
                     stream.read_exact(&mut to)?;
                     let to = u64::from_le_bytes(to);
-                    serve_range(&ring, &mut stream, frame.seq, to, batch, &mut buf)?;
+                    serve_range(&ring, &mut stream, frame.seq, to, batch, &mut wire)?;
                 }
                 _ => return Err(protocol("expected NAK")),
             }
@@ -1148,16 +1444,18 @@ fn serve_client(
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
     loop {
-        let (count, lapped) = ring.collect_lingering(cursor, batch, &mut buf, linger.current());
-        if count > 0 {
-            let frame = data_frame(&mut buf, 0, count, payload_len, cursor);
-            stream.write_all(frame)?;
+        wire.clear();
+        wire.resize(FRAME_HEADER_LEN, 0);
+        let got =
+            ring.collect_lingering(cursor, batch, TCP_FRAME_BYTES, &mut wire, linger.current());
+        if got.count > 0 {
+            stream.write_all(data_frame(&mut wire, 0, got.count, cursor))?;
             linger.sent();
-            cursor += count as u64;
+            cursor += got.count as u64;
             idle = 0;
             last_beat = Instant::now();
         }
-        if let Some(seen) = lapped {
+        if let Some(seen) = got.lapped {
             // Resynchronize at the oldest message still retained and tell the mirror.
             let resync = ring.resync(seen);
             if resync > cursor {
@@ -1166,7 +1464,12 @@ fn serve_client(
             }
             continue;
         }
-        if count == 0 {
+        if got.lost {
+            cursor += 1;
+            stream.write_all(&Frame::control(KIND_GAP, cursor).encode())?;
+            continue;
+        }
+        if got.count == 0 {
             if spin {
                 core::hint::spin_loop();
             } else {
@@ -1195,9 +1498,8 @@ fn serve_range(
     from: u64,
     to: u64,
     batch: usize,
-    buf: &mut [u8],
+    wire: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let payload_len = ring.geometry.payload_len();
     let mut cursor = from.max(1);
     let oldest = oldest_retained(ring.write_seq(), ring.view.capacity);
     if cursor < oldest {
@@ -1206,13 +1508,14 @@ fn serve_range(
     }
     while cursor <= to {
         let max = batch.min((to - cursor + 1) as usize);
-        let (count, lapped) = ring.collect(cursor, max, buf);
-        if count > 0 {
-            let frame = data_frame(buf, 0, count, payload_len, cursor);
-            stream.write_all(frame)?;
-            cursor += count as u64;
+        wire.clear();
+        wire.resize(FRAME_HEADER_LEN, 0);
+        let got = ring.collect(cursor, max, TCP_FRAME_BYTES, wire);
+        if got.count > 0 {
+            stream.write_all(data_frame(wire, 0, got.count, cursor))?;
+            cursor += got.count as u64;
         }
-        if let Some(seen) = lapped {
+        if let Some(seen) = got.lapped {
             let resync = ring.resync(seen);
             if resync > cursor {
                 stream.write_all(&Frame::control(KIND_GAP, resync).encode())?;
@@ -1220,7 +1523,12 @@ fn serve_range(
             }
             continue;
         }
-        if count == 0 {
+        if got.lost {
+            cursor += 1;
+            stream.write_all(&Frame::control(KIND_GAP, cursor).encode())?;
+            continue;
+        }
+        if got.count == 0 {
             break;
         }
     }
@@ -1446,8 +1754,9 @@ pub struct Mirror {
     retransmitted: u64,
     nak: Option<Nak>,
     last_nak: Option<(u64, u64)>,
-    /// Multicast datagrams that arrived ahead of a hole, by first sequence.
-    pending: BTreeMap<u64, Vec<u8>>,
+    /// Multicast datagrams that arrived ahead of a hole, by first sequence: record
+    /// count and frame payload.
+    pending: BTreeMap<u64, (usize, Vec<u8>)>,
     buf: Vec<u8>,
     dgram: Vec<u8>,
 }
@@ -1585,8 +1894,8 @@ impl Mirror {
         self.frames += 1;
         match frame.kind {
             KIND_DATA => {
-                let count = match self.read_data_payload(frame) {
-                    Ok(count) => count,
+                let (count, len) = match self.read_data_payload(frame) {
+                    Ok(sizes) => sizes,
                     Err(RingfireError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                         return Ok(false);
                     }
@@ -1605,16 +1914,10 @@ impl Mirror {
                     self.gaps += 1;
                     self.ring_mut().skip_to(frame.seq);
                 }
-                let payload_len = self.geometry.payload_len();
-                let ring = self.ring.as_mut().expect("mirror ring");
-                for i in 0..count {
-                    ring.write(
-                        frame.seq + i as u64,
-                        &self.buf[i * payload_len..(i + 1) * payload_len],
-                    );
-                }
-                ring.publish();
-                self.source_seq = self.source_seq.max(ring.next_seq - 1);
+                let bytes = std::mem::take(&mut self.buf);
+                let result = self.write_records(frame.seq, count, &bytes[..len]);
+                self.buf = bytes;
+                result?;
             }
             KIND_GAP => {
                 if frame.seq > self.ring().next_seq {
@@ -1630,21 +1933,73 @@ impl Mirror {
         Ok(true)
     }
 
-    /// Reads a `DATA` frame's records into `self.buf`; returns the record count.
-    fn read_data_payload(&mut self, frame: Frame) -> Result<usize> {
-        let payload_len = self.geometry.payload_len();
+    /// Reads a `DATA` frame's records into `self.buf`; returns the record count and the
+    /// byte length.
+    fn read_data_payload(&mut self, frame: Frame) -> Result<(usize, usize)> {
         let count = frame.count as usize;
-        if count == 0 || frame.len as usize != count * payload_len {
+        let len = frame.len as usize;
+        if !self.frame_sizes_ok(count, len) {
             return Err(RingfireError::Protocol(
                 "DATA length does not match its record count",
             ));
         }
-        let total = count * payload_len;
-        if self.buf.len() < total {
-            self.buf.resize(total, 0);
+        if self.buf.len() < len {
+            self.buf.resize(len, 0);
         }
-        read_full(&mut self.stream, &mut self.buf[..total], self.spin)?;
-        Ok(count)
+        read_full(&mut self.stream, &mut self.buf[..len], self.spin)?;
+        Ok((count, len))
+    }
+
+    /// Whether `count` records can be `len` bytes long for this ring.
+    fn frame_sizes_ok(&self, count: usize, len: usize) -> bool {
+        let descriptors = count * self.geometry.payload_len();
+        count > 0
+            && if self.geometry.has_arena() {
+                len >= descriptors
+            } else {
+                len == descriptors
+            }
+    }
+
+    /// Writes the records of a `DATA` frame into the ring, skipping those below the
+    /// write position, and publishes. Records are consecutive from `seq`.
+    fn write_records(&mut self, seq: u64, count: usize, bytes: &[u8]) -> Result<()> {
+        let payload_len = self.geometry.payload_len();
+        let arena = self.geometry.has_arena();
+        let ring = self.ring.as_mut().expect("mirror ring");
+        let next = ring.next_seq;
+        let mut pos = 0usize;
+        for i in 0..count {
+            let s = seq + i as u64;
+            if pos + payload_len > bytes.len() {
+                return Err(RingfireError::Protocol(
+                    "DATA frame shorter than its records",
+                ));
+            }
+            let descriptor = &bytes[pos..pos + payload_len];
+            pos += payload_len;
+            if arena {
+                let len = blob_ref_at(descriptor).len as usize;
+                if pos + len > bytes.len() {
+                    return Err(RingfireError::Protocol("DATA frame shorter than its blobs"));
+                }
+                let blob = &bytes[pos..pos + len];
+                pos += len;
+                if s >= next {
+                    ring.write_blob(s, descriptor, blob)?;
+                }
+            } else if s >= next {
+                ring.write(s, descriptor);
+            }
+        }
+        if pos != bytes.len() {
+            return Err(RingfireError::Protocol(
+                "DATA frame longer than its records",
+            ));
+        }
+        ring.publish();
+        self.source_seq = self.source_seq.max(seq + count as u64 - 1);
+        Ok(())
     }
 
     // --- multicast mode -----------------------------------------------------------------
@@ -1733,14 +2088,10 @@ impl Mirror {
     fn handle_control(&mut self, frame: Frame) -> Result<()> {
         match frame.kind {
             KIND_DATA => {
-                let count = self.read_data_payload(frame)?;
+                let (count, len) = self.read_data_payload(frame)?;
                 self.retransmitted += count as u64;
                 let payload = std::mem::take(&mut self.buf);
-                let result = self.apply(
-                    frame.seq,
-                    count,
-                    &payload[..count * self.geometry.payload_len()],
-                );
+                let result = self.apply(frame.seq, count, &payload[..len]);
                 self.buf = payload;
                 result
             }
@@ -1769,11 +2120,9 @@ impl Mirror {
         }
         match frame.kind {
             KIND_DATA => {
-                let payload_len = self.geometry.payload_len();
                 let count = frame.count as usize;
                 let len = frame.len as usize;
-                if count == 0 || len != count * payload_len || bytes.len() < FRAME_HEADER_LEN + len
-                {
+                if !self.frame_sizes_ok(count, len) || bytes.len() < FRAME_HEADER_LEN + len {
                     return Ok(());
                 }
                 self.apply(
@@ -1790,7 +2139,6 @@ impl Mirror {
     /// Writes `count` records starting at `seq` if they continue the ring; keeps them
     /// aside and asks for the missing range otherwise.
     fn apply(&mut self, seq: u64, count: usize, payload: &[u8]) -> Result<()> {
-        let payload_len = self.geometry.payload_len();
         let next = self.ring().next_seq;
         let end = seq + count as u64;
         if end <= next {
@@ -1798,20 +2146,13 @@ impl Mirror {
         }
         if seq > next {
             if self.pending.len() < PENDING_MAX {
-                self.pending.entry(seq).or_insert_with(|| payload.to_vec());
+                self.pending
+                    .entry(seq)
+                    .or_insert_with(|| (count, payload.to_vec()));
             }
             return self.request(next, seq - 1);
         }
-        let skip = (next - seq) as usize;
-        let ring = self.ring.as_mut().expect("mirror ring");
-        for i in skip..count {
-            ring.write(
-                seq + i as u64,
-                &payload[i * payload_len..(i + 1) * payload_len],
-            );
-        }
-        ring.publish();
-        self.source_seq = self.source_seq.max(end - 1);
+        self.write_records(seq, count, payload)?;
         self.after_advance()
     }
 
@@ -1828,27 +2169,16 @@ impl Mirror {
             let Some((&seq, _)) = self.pending.first_key_value() else {
                 return Ok(());
             };
-            let payload = self.pending.remove(&seq).expect("first pending entry");
-            let count = payload.len() / self.geometry.payload_len();
+            let (count, payload) = self.pending.remove(&seq).expect("first pending entry");
             let end = seq + count as u64;
             if end <= next {
                 continue;
             }
             if seq > next {
-                self.pending.insert(seq, payload);
+                self.pending.insert(seq, (count, payload));
                 return self.request(next, seq - 1);
             }
-            let payload_len = self.geometry.payload_len();
-            let skip = (next - seq) as usize;
-            let ring = self.ring.as_mut().expect("mirror ring");
-            for i in skip..count {
-                ring.write(
-                    seq + i as u64,
-                    &payload[i * payload_len..(i + 1) * payload_len],
-                );
-            }
-            ring.publish();
-            self.source_seq = self.source_seq.max(end - 1);
+            self.write_records(seq, count, &payload)?;
         }
     }
 
