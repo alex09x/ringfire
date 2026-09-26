@@ -420,6 +420,19 @@ let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code a
 * `cargo run --release --example replication_latency` measures one-way source ring →
   mirror ring latency and burst throughput over loopback.
 
+Measured with 64-byte slots, one message every 100 µs, producer, server, mirror and reader
+all busy-polling (`--spin`), Linux 6.8, kernel TCP stack:
+
+| Path | p50 | p99 | max |
+| :--- | ---: | ---: | ---: |
+| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | 6.0 µs | 6.8 µs | 19.7 µs |
+| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two TCP hops, four ring hand-offs (`examples/replication_pingpong.rs`) | 54.0 µs | 59.1 µs | 1.3 ms |
+
+Half a LAN round trip is about 27 µs one way, most of it in the two kernel TCP stacks; the
+ring hand-offs on each side add well under a microsecond. Going lower means bypassing the
+kernel (`AF_XDP`, DPDK, Onload), which is the planned next transport together with UDP
+multicast so one packet feeds every mirror.
+
 ---
 
 ## 🛡️ Memory Safety: Why Raw Pointers into Shared Memory Are Dangerous
