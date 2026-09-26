@@ -448,9 +448,24 @@ all busy-polling (`--spin`), Linux 6.8, kernel network stack:
 
 Half a LAN round trip is about 27 µs one way whichever transport is used: that is the two
 kernel network stacks, the ring hand-offs on each side add well under a microsecond.
-Multicast buys the tail (a worst case of 87 µs instead of 1.3 ms over 20,000 samples) and
-a cost that stays flat as mirrors are added. Going below that means bypassing the kernel
-(`AF_XDP`, DPDK, Onload), which is the planned next transport.
+Multicast buys the tail (a worst case of 87 µs instead of 1.3 ms over 20,000 samples).
+
+The same round trip with **16 more mirrors** of the source ring on the second host (the
+source runs on 16 cores, the extra mirrors poll without spinning), verified afterwards to
+hold all 22,000 records each:
+
+| Extra mirrors | Transport | p50 | p90 | p99 | max |
+| ---: | :--- | ---: | ---: | ---: | ---: |
+| 0 | TCP | 54.4 µs | 56.1 µs | 60.3 µs | 82 µs |
+| 16 | TCP | 53.5 µs | 102.2 µs | 235.1 µs | 11.0 ms |
+| 0 | multicast | 52.5 µs | 53.9 µs | 58.5 µs | 68 µs |
+| 16 | multicast | 63.7 µs | 66.2 µs | 72.1 µs | 84 µs |
+
+With TCP the source pays one thread and one `write` per mirror per message, and two of
+the sixteen TCP mirrors were still behind when the run ended; with multicast it pays one
+`sendto` however many mirrors listen. Run-to-run variation on these shared hosts is about
+±10 µs at p50. Going below the kernel stack means bypassing it (`AF_XDP`, DPDK, Onload),
+which is the planned next transport.
 
 ---
 
