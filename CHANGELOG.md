@@ -5,7 +5,10 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-26
+
+Network mirrors: a ring on one host, identical copies with the same sequence numbers on
+others, over TCP, UDP multicast or UDP unicast. See [docs/replication.md](docs/replication.md).
 
 ### Added
 - **Network mirrors** (`ringfire::replication`): `ReplicaServer` streams a ring to other

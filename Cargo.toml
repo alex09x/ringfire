@@ -1,10 +1,10 @@
 [package]
 name = "ringfire"
 authors = ["alex09x <alex@prod.codes>"]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Zero-copy lock-free inter-process communication (IPC) ring buffer and shared memory bus in Rust"
+description = "Zero-copy lock-free inter-process communication (IPC) ring buffer and shared memory bus in Rust, with ring mirroring across hosts"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alex09x/ringfire"
 readme = "README.md"

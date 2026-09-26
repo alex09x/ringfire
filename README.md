@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-brightgreen.svg)](https://www.rust-lang.org)
 
-**`ringfire`** is an ultra-low-latency, zero-copy, lock-free **Inter-Process Communication (IPC)** ring buffer and shared memory state bus for Linux.
+**`ringfire`** is an ultra-low-latency, zero-copy, lock-free **Inter-Process Communication (IPC)** ring buffer and shared memory state bus for Linux, and since v0.5.0 it mirrors a ring to other hosts with the same sequence numbers.
 
 It is engineered for high-frequency trading (HFT) engines, real-time market data ingestion, telemetry buses, and performance-critical distributed pipelines where microsecond socket latencies and kernel overhead are unacceptable.
 
@@ -45,6 +45,20 @@ The last `push` row is the realistic cross-process figure: it is bound by moving
 between cores, and costs the same with lossless backpressure enabled (+0.8 ns). Every read is
 validated against concurrent overwrites; the regression suite verifies zero torn records under
 continuous lapping on x86-64 and AArch64. Full numbers: [Detailed Benchmarks](#-detailed-benchmarks-amd-ryzen-9-7950x-on-linux-booster).
+
+**Network mirrors** (v0.5.0): the same ring, with the same sequence numbers, on other
+hosts. Readers there attach to it as if it were local.
+
+| Path, 64-byte records, 1,000 msg/s | push → read |
+| :--- | ---: |
+| consumer on the source host (same ring) | 0.1 µs |
+| mirror on the same host, multicast | 3.8 µs |
+| mirror on another host on a 1 GbE LAN, multicast, each of six | 30–32 µs |
+| mirror in Los Angeles from a source in Tokyo, UDP unicast | 51.7 ms p50, **51.7 ms p99** |
+
+Ordered, never duplicated, lost datagrams recovered from the ring itself; TCP, UDP
+multicast or UDP unicast (works from behind NAT). See [Network Mirrors](#11-network-mirrors-one-source-ring-identical-copies-on-other-hosts)
+and [docs/replication.md](docs/replication.md).
 
 ---
 
@@ -101,6 +115,16 @@ When communicating between processes on the same host, developers usually defaul
 │           • Inter-process lock-free ring buffer via /dev/shm                │
 │           • O(1) Shared State Blackboard (Seqlock)                          │
 │           • ~160 ns cross-core latency, C11 header, Python bindings         │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          CROSS-HOST (Network Mirrors)                       │
+│                                                                             │
+│                           ringfire serve / mirror                           │
+│           • The same ring, same sequence numbers, on other hosts            │
+│           • TCP, UDP multicast, UDP unicast (NAT, clouds, other sites)      │
+│           • ~30 µs across a LAN, no reordering, loss repaired from the ring │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -371,178 +395,188 @@ cargo run --bin ringfire -- prune /dev/shm/hft_ticker_stream
 
 ### 11. Network Mirrors: One Source Ring, Identical Copies on Other Hosts
 
-`ringfire serve` streams a ring to any number of mirror hosts; `ringfire mirror` keeps a
-ring with the **same geometry and the same sequence numbers** in the local `/dev/shm`.
-Readers on a mirror host attach to that ring exactly as they would on the source host and
-never touch the network. Records travel as raw slot payloads, so one server/mirror pair
-works for any element type without recompiling.
+One process writes a ring. Other hosts get a **mirror**: a ring with the same geometry
+and the same sequence numbers, kept up to date over the network. Readers on a mirror host
+attach to it with `RingConsumer` or `BlobConsumer` exactly as they would on the source
+host and never touch the network. Records travel as raw slot bytes, so one
+`ringfire serve` / `ringfire mirror` pair works for any element type, fixed-size or
+variable-length (`BlobProducer` rings included). The full design, the story of what the
+stress tests found and every measurement are in [docs/replication.md](docs/replication.md).
+
+```mermaid
+flowchart LR
+    subgraph src["source host"]
+        P[producer] --> R[("ring in /dev/shm")]
+        R --> S["ringfire serve"]
+        R --> L[local readers]
+    end
+    S -- "records, in order" --> M1["ringfire mirror"]
+    S --> M2["ringfire mirror"]
+    subgraph h1["mirror host 1"]
+        M1 --> R1[("identical ring")] --> C1[readers]
+    end
+    subgraph h2["mirror host 2"]
+        M2 --> R2[("identical ring")] --> C2[readers]
+    end
+```
+
+#### Choosing how records travel
+
+| Route | Flag | Why |
+| :--- | :--- | :--- |
+| Processes on one host | none needed | they share the ring: 0.1 µs, no network |
+| Your own LAN with your own switch | `--multicast GROUP:PORT` | one datagram whatever the number of mirrors; ~30 µs to every mirror, flat |
+| Between sites, into a cloud, from behind NAT | `--udp PORT` on the source, `--unicast` on the mirror, `--dup 2` on long links | clouds and hosters do not route multicast; TCP pays a full round trip per lost segment, this path pays nothing |
+| One mirror over a link that only passes TCP | default | simplest; a thread and a `write` per mirror on the source |
+
+Whatever the transport: **records are written to a mirror strictly in sequence order,
+never reordered, never duplicated**. A lost datagram is asked back with `NAK` over the
+TCP control connection and answered from the source ring; the ring is the retransmission
+buffer, so a mirror can be behind by up to `capacity` records (262,144 slots is 262 ms at
+1 M msg/s, 26 s at 10 k msg/s). Only beyond that a mirror gets a `GAP` and its readers
+see the same `lapped` count a slow reader on the source host would.
+
+#### A site hub: cross the network once per site
+
+A mirror is an ordinary ring, so a site runs one mirror over the WAN and serves it again
+locally. One copy crosses the ocean however many readers the site has, and every hop
+keeps the source's sequence numbers.
+
+```mermaid
+flowchart LR
+    subgraph tokyo["Tokyo: source"]
+        P[producer] --> R[("ring")] --> S["serve --udp 7403 --dup 2"]
+    end
+    S -- "UDP unicast, every datagram twice<br/>NAK / GAP over TCP" --> H
+    subgraph aws["AWS: one hub, N instances"]
+        H["mirror --unicast"] --> HR[("ring")] --> HS["serve --udp 7403"]
+        HS --> I1["mirror --unicast"] --> R1[("ring")] --> C1[readers]
+        HS --> I2["mirror --unicast"] --> R2[("ring")] --> C2[readers]
+    end
+```
+
+Measured through such a hub on the LAN: 52.9 µs p50 end to end against 10.3 µs for a
+direct mirror, i.e. the hub costs its two network hops and nothing of its own. (VPCs have
+no native multicast, only Transit Gateway multicast domains, so inside a cloud the hub
+sends unicast to each instance: one `sendto` per instance per frame.)
+
+#### CLI
 
 ```bash
-# Source host: publish /dev/shm/ticks to mirrors (one thread and one ring reader per mirror)
-ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --spin
+# Source host, LAN with multicast
+ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --multicast 239.255.0.1:7401 --iface 10.0.0.5 --spin
+# Mirror hosts on that LAN (join on the NIC facing the source)
+ringfire mirror 10.0.0.5:7400 /dev/shm/ticks --iface 10.0.0.7 --spin
 
-# Each mirror host: keep an identical /dev/shm/ticks; reconnects and resumes on its own
-ringfire mirror source-host:7400 /dev/shm/ticks --from latest --spin
+# Source host, mirrors anywhere (other sites, clouds, behind NAT)
+ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --udp 7403 --dup 2 --spin
+ringfire mirror source.example:7400 /dev/shm/ticks --unicast --spin
+
+# Site hub: mirror the source, then serve the mirror ring to local readers
+ringfire mirror source.example:7400 /dev/shm/ticks --unicast --spin &
+ringfire serve  /dev/shm/ticks --bind 0.0.0.0:7400 --udp 7403 --spin
+
+# Resume after a restart from the last record in the local ring
+ringfire mirror source.example:7400 /dev/shm/ticks --from resume --unicast
 ```
+
+`serve` options: `--batch N` records per frame, `--linger-us N` (frame pacing, adaptive by
+default), `--mtu N` datagram budget (8972 with jumbo frames on a LAN, ~1400 through a
+tunnel), `--ttl`, `--iface`. `mirror` options: `--from latest|oldest|resume|N`, `--iface`,
+`--once`, `--reconnect-ms`.
+
+#### Rust
 
 ```rust
-use ringfire::{Mirror, MirrorStart, ReplicaServer, RingConsumer};
+use ringfire::{Mirror, MirrorStart, MulticastConfig, ReplicaServer, RingConsumer};
+use std::net::Ipv4Addr;
 
-// Source host
-let server = ReplicaServer::bind("/dev/shm/ticks", "0.0.0.0:7400")?.spin(true);
+// Source host, LAN: one datagram for all mirrors.
+let server = ReplicaServer::bind("/dev/shm/ticks", "0.0.0.0:7400")?
+    .multicast(MulticastConfig::new(Ipv4Addr::new(239, 255, 0, 1), 7401).interface(source_nic))
+    .spin(true);
 server.spawn()?;
 
-// Mirror host
+// Source host, mirrors anywhere: UDP unicast from port 7403, every datagram twice.
+let server = ReplicaServer::bind("/dev/shm/ticks", "0.0.0.0:7400")?
+    .unicast(7403, 1400)
+    .duplicate(2)
+    .spin(true);
+server.spawn()?;
+
+// Mirror host.
 let mut mirror = Mirror::builder()
-    .start(MirrorStart::Oldest)
+    .start(MirrorStart::Oldest)   // everything the source still retains, then live
+    .unicast(true)                // ask for UDP unicast (ignored if the source has none)
     .spin(true)
-    .connect("source-host:7400", "/dev/shm/ticks")?;
+    .connect("source.example:7400", "/dev/shm/ticks")?;
 std::thread::spawn(move || mirror.run());
-let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code as on the source host
+
+// Readers on the mirror host: the same code as on the source host.
+let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?;
+while let Some(tick) = reader.try_recv() { /* ... */ }
 ```
 
-* **Ordered and gap-free while the link keeps up.** Every record carries the source's
-  sequence number; a mirror never reorders or duplicates. If the server-side reader is
-  lapped by the source ring (a stalled link, a mirror that stopped reading) it
-  resynchronizes at the oldest retained message and the mirror receives a `GAP`, which is
-  exactly what a slow reader on the source host would observe.
-* **Resume after a restart.** `--from resume` continues after the last sequence in the
-  existing mirror ring; the source ring itself is the retransmission buffer, so everything
-  it still retains is recovered. A source that restarted its numbering makes the mirror
-  start over.
-* **Mirror rings are broadcast rings** (`FLAG_MODE_SPMC | FLAG_POLICY_LATEST_WINS |
-  FLAG_SPARSE`): the mirror writer never waits for local readers. `FLAG_SPARSE` marks
-  rings whose sequence numbers may have holes; a Rust `RingConsumer` then skips to the
-  next message present instead of waiting for a sequence that will never arrive.
-* **Own binary protocol**: a 16-byte frame header, up to 65,535 records per `DATA`
-  frame, `HEARTBEAT` while idle. The frame table is in `src/replication.rs`.
-* **Fixed-size and variable-length records.** A `RingProducer` ring is copied slot for
-  slot. A `BlobProducer` ring (descriptor ring plus payload arena) is copied record for
-  record: each blob keeps its bytes, length, flags and sequence and lands in the mirror's
-  own arena, which no reader can tell apart. A blob whose bytes the source already
-  overwrote is skipped with a `GAP`, exactly as a lapped local `BlobConsumer` would skip
-  it. Blobs larger than one datagram ride IP fragmentation; blobs larger than the host's
-  datagram limit reach mirrors through the `NAK` path over TCP.
-* **UDP multicast** (`--multicast GROUP:PORT`): the source sends each `DATA` frame once,
-  as one datagram, and every mirror receives it, so the cost does not grow with the number
-  of mirrors. The TCP connection stays for the handshake and for retransmission: a mirror
-  that sees a sequence jump sends `NAK` and gets the range back from the source ring (or
-  `GAP` for what is no longer retained). Datagrams that overtake a hole are held back, so
-  the mirror ring is still written strictly in order. A lost *last* datagram is caught by
-  the 1 ms multicast heartbeat.
-* **UDP unicast for routes without multicast** (`serve --udp PORT`, `mirror --unicast`):
-  the source sends the same datagrams to each mirror that asked for them, from one fixed
-  port; mirrors punch to it first, so it works from behind NAT. `--dup N` sends every
-  datagram N times and mirrors drop the copies by sequence: on a lossy long-haul link a
-  single loss then costs no round trip. A mirror is an ordinary ring, so a site can run
-  one mirror over the WAN and serve it again locally by multicast or unicast: one copy
-  crosses the ocean, however many readers the site has.
-* `cargo run --release --example replication_latency` measures one-way source ring →
-  mirror ring latency and burst throughput over loopback;
-  `examples/replication_pingpong.rs` measures a round trip between two hosts;
-  `examples/replication_stages.rs` measures every stage on every host at once.
+`BlobProducer` rings need nothing extra: readers use `BlobConsumer` on the mirror, blobs
+keep their bytes, length, flags and sequence, and only sit at a different offset in the
+mirror's arena.
 
-```bash
-# Source host: live records by multicast, TCP only for handshakes and NAKs
-ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --multicast 239.255.0.1:7401 --iface 10.0.0.5 --spin
+#### What it costs
 
-# Each mirror host (join on the NIC facing the source)
-ringfire mirror 10.0.0.5:7400 /dev/shm/ticks --iface 10.0.0.7 --spin
-```
+64-byte records, one message every 100 µs unless noted, everything busy-polling, Linux
+6.8, kernel network stack, two Ryzen 9 7950X hosts on a 1 GbE LAN.
 
-Measured with 64-byte slots, one message every 100 µs, producer, server, mirror and reader
-all busy-polling (`--spin`), Linux 6.8, kernel network stack:
+| Stage | p50 | p99 |
+| :--- | ---: | ---: |
+| push → read by a consumer on the source (same ring) | 0.1 µs | 0.1 µs |
+| push → read on a mirror on the same host, multicast | 3.8 µs | 4.9 µs |
+| push → read on a mirror on the other host, multicast, each of six | 30–32 µs | 33–36 µs |
+| push → read on a mirror on the other host, UDP unicast, each of six | 38–48 µs | 50–63 µs |
+| push → read on a mirror on the other host, TCP | 31–34 µs | 35–38 µs |
+| push → read on a leaf behind a hub, unicast both hops | 52.9 µs | 57.3 µs |
 
-| Path | Transport | p50 | p99 | max |
+| Round trip, 20,000 samples | Transport | p50 | p99 | max |
 | :--- | :--- | ---: | ---: | ---: |
-| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | TCP | 6.0 µs | 6.8 µs | 19.7 µs |
-| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | multicast | 3.3 µs | 8.2 µs | 66.8 µs |
-| Two Ryzen 9 7950X hosts on a 1 GbE LAN, round trip: two network hops, four ring hand-offs | TCP | 54.0 µs | 59.1 µs | 1.3 ms |
-| Two Ryzen 9 7950X hosts on a 1 GbE LAN, round trip: two network hops, four ring hand-offs | multicast | 53.1 µs | 59.9 µs | 86.9 µs |
+| two hosts, one mirror each way | TCP | 54.0 µs | 59.1 µs | 1.3 ms |
+| two hosts, one mirror each way | multicast | 53.1 µs | 59.9 µs | 86.9 µs |
+| the same with 16 more mirrors on the second host | TCP | 53.5 µs | 235 µs | 11.0 ms |
+| the same with 16 more mirrors on the second host | multicast | 63.7 µs | 72.1 µs | 84 µs |
 
-Half a LAN round trip is about 27 µs one way whichever transport is used: that is the two
-kernel network stacks, the ring hand-offs on each side add well under a microsecond.
-Multicast buys the tail (a worst case of 87 µs instead of 1.3 ms over 20,000 samples).
-
-The same round trip with **16 more mirrors** of the source ring on the second host (the
-source runs on 16 cores, the extra mirrors poll without spinning), verified afterwards to
-hold all 22,000 records each:
-
-| Extra mirrors | Transport | p50 | p90 | p99 | max |
-| ---: | :--- | ---: | ---: | ---: | ---: |
-| 0 | TCP | 54.4 µs | 56.1 µs | 60.3 µs | 82 µs |
-| 16 | TCP | 53.5 µs | 102.2 µs | 235.1 µs | 11.0 ms |
-| 0 | multicast | 52.5 µs | 53.9 µs | 58.5 µs | 68 µs |
-| 16 | multicast | 63.7 µs | 66.2 µs | 72.1 µs | 84 µs |
-
-With TCP the source pays one thread and one `write` per mirror per message, and two of
-the sixteen TCP mirrors were still behind when the run ended; with multicast it pays one
-`sendto` however many mirrors listen. Run-to-run variation on these shared hosts is about
-±10 µs at p50.
-
-**Sustained rate** (`examples/replication_stress.rs`: open loop, the pinger publishes at
-a fixed rate for 5 s and never waits, the other host echoes everything, echoes are matched
-by sequence; 64-byte slots, same two hosts):
-
-| Rate | Transport, frame linger | Delivered | RTT p50 | RTT p99 |
+| Sustained, open loop, 5 s per point | Transport, frame linger | Delivered | RTT p50 | RTT p99 |
 | ---: | :--- | ---: | ---: | ---: |
-| 10,000/s | multicast, none | 100 % | 54 µs | 62 µs |
+| 1,000/s | multicast, adaptive | 100 % | 55 µs | 62 µs |
 | 20,000/s | multicast, none | 100 % | 51 µs | 65 µs |
-| 50,000/s | multicast, none | 100 % | 830 µs | 1.5 ms |
-| 50,000/s | multicast, 100 µs | 100 % | 213 µs | 268 µs |
 | 100,000/s | multicast, 100 µs | 100 % | 221 µs | 272 µs |
-| 500,000/s | multicast, 100 µs | 100 % | 122 µs | 3.5 ms |
 | 1,000,000/s | multicast, 300 µs | 100 % | 0.93 ms | 1.8 ms |
-| 100,000/s | TCP, adaptive | 100 % | 1.2 ms | 4.0 ms |
 
-**Per stage, on every host at once** (`examples/replication_stages.rs`: the master stamps
-each record when it pushes it; a consumer on the master and one on each of eight slaves,
-six on a second host and two on the master's own host, stamp the read; slave clocks are
-translated into the master's with a PTP-style offset from the minimum-round-trip probe,
-so cross-host figures carry a systematic uncertainty of a few microseconds):
-
-| Stage, 1,000 msg/s, multicast | p50 | p99 | max |
+| Tokyo → Los Angeles, 100 ms ping, 1,000/s | one-way p50 | p99 | max |
 | :--- | ---: | ---: | ---: |
-| push → read by a consumer on the master (same ring) | 0.1 µs | 0.1 µs | 0.5 µs |
-| push → read by a consumer on a mirror on the same host | 3.8–4.1 µs | 4.6–4.9 µs | 14 µs |
-| push → read by a consumer on a mirror on the other host, each of six | 29.6–32.4 µs | 32.7–35.6 µs | 45–48 µs |
+| TCP | 50.4 ms | 99.6 ms | 132 ms |
+| UDP unicast | 51.7 ms | 51.7 ms | 61 ms |
+| UDP unicast, every datagram twice | 51.5 ms | 51.6 ms | 58 ms |
 
-The same over TCP: 9 µs to a mirror on the same host, 31–34 µs to each of the six on the
-other host. At 20,000 msg/s the multicast figures become 34 µs (same host) and 58–63 µs
-(other host): the 50 µs pacing shows at exactly that rate. Over UDP unicast to the same
-eight mirrors: 38–48 µs to the six on the other host, one `sendto` per mirror per frame.
-Through a site hub (`ringfire mirror` + `ringfire serve` on the same ring on the second
-host, unicast on both hops, leaf back on the first host): 52.9 µs p50, 57.3 µs p99 end
-to end, against 10.3 µs for a direct mirror on the first host, so the hub costs its two
-network hops and nothing measurable of its own.
+No record was lost or reordered at any point of any of these runs. Above ~20,000 msg/s
+every unbatched record costs a datagram and a system call, and the kernel path here
+sustains about 40,000 datagrams/s; frame pacing (`--linger-us`, adaptive by default:
+frames leave at most once per 50 µs unless full) is what keeps 100,000/s at 221 µs
+instead of over a millisecond. Near 1 M/s the 1500-byte MTU is the limit; jumbo frames
+raise it six-fold. Going below the kernel stack means bypassing it (`AF_XDP`, DPDK,
+Onload), which is the planned next transport.
 
-**Across an ocean** (source in Tokyo, mirror in Los Angeles behind a home NAT, 100 ms
-ping, 1,000 msg/s, 5 s; one-way figures are corrected with a clock offset whose error
-over such a path is a few milliseconds, so compare the spread, not the medians):
+#### Tuning checklist
 
-| Transport | one-way p50 | p90 | p99 | p99.9 | max |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| TCP | 50.4 ms | 50.5 ms | 99.6 ms | 127 ms | 132 ms |
-| UDP unicast | 51.7 ms | 51.7 ms | 51.7 ms | 56.2 ms | 61.2 ms |
-| UDP unicast, every datagram twice | 51.5 ms | 51.5 ms | 51.6 ms | 53.6 ms | 57.6 ms |
-
-TCP spends a full round trip recovering about one record in a hundred; the UDP path's
-99th percentile sits 50 µs above its median, no `NAK` was needed, and sending twice
-trims the last of the tail.
-
-No record was lost or reordered at any point (5 million records at 1 M/s). The cliff
-between 20,000 and 50,000 messages/s without linger is the per-datagram cost of the
-kernel path (about 40,000 datagrams/s sustained on these hosts): a frame per record is a
-system call and a packet per record. Linger fills frames (26 records fit a 1472-byte
-datagram) at the price of the wait. The default is adaptive pacing: frames leave at most
-once per 50 µs unless full, and a record that arrives later than that after the previous
-frame goes out at once, so a quiet or bursty stream pays nothing (1,000/s: 55 µs p50,
-bursts of four: 62 µs p50) while a steady 20,000/s stream pays about 35 µs; pass
-`--linger-us 0` for such streams if that matters. Near 1 M/s the 1500-byte MTU is the limit and
-jumbo frames raise it six-fold. A receiver that cannot keep up loses datagrams faster than
-`NAK` retransmission brings them back, so size the mirror host for the rate. Going below
-the kernel stack means bypassing it (`AF_XDP`, DPDK, Onload), which is the planned next
-transport.
+* Give every mirror process two cores when it busy-polls (`--spin`): the mirror thread
+  and the reader are both spinning; one core for both turns microseconds into scheduler
+  slices of milliseconds.
+* `--iface` on multi-homed hosts (docker bridges, several NICs); on Linux a socket bound
+  to a port receives every multicast group joined on that port, so give each stream its
+  own port.
+* `--mtu 8972` once the NICs and the switch pass jumbo frames; `--mtu 1400` through
+  WireGuard or other tunnels, never above the path MTU on a WAN.
+* Size the source ring for the burst you want mirrors to survive: retention is
+  `capacity` records.
+* `--linger-us 0` for a steady stream near 20,000 msg/s where every microsecond counts;
+  a fixed `--linger-us 100` for a steady 100,000 msg/s.
 
 ---
 

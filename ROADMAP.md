@@ -177,7 +177,7 @@ copying, which is what lets a `LosslessBackpressure` producer reuse slots safely
 - [x] **Registry**: CAS-only ownership changes; refusing unprotected readers on lossless rings.
 - [x] **Regression suite** (`tests/regression_tests.rs`) and CI on Linux x86-64 + macOS AArch64.
 
-### Phase 9: Network Mirrors (unreleased)
+### Phase 9: Network Mirrors (v0.5.0)
 - [x] **Ring replication over TCP** (`ringfire::replication`): `ReplicaServer` on the source host, `Mirror` on each other host, byte-identical rings under the source's sequence numbers, own binary protocol, resume and restart detection, `ringfire serve` / `ringfire mirror` CLI.
 - [x] **`FLAG_SPARSE`** and hole skipping in `RingConsumer` for rings that join a stream mid-way.
 - [x] **UDP multicast transport** with NAK-based retransmission from the source ring (one datagram for every mirror), in-order hold-back of overtaking datagrams, heartbeat-detected tail loss, per-source session byte.
