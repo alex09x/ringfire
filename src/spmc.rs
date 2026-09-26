@@ -9,7 +9,8 @@ use crate::checkpoint::OffsetCheckpoint;
 use crate::error::{Result, RingfireError};
 use crate::header::{
     check_schema, validate_ring, RingHeader, RingLayout, Slot, FLAG_MODE_MPMC, FLAG_MODE_SPMC,
-    FLAG_POLICY_LATEST_WINS, FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_REGISTRY, SLOT_WRITING,
+    FLAG_POLICY_LATEST_WINS, FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_SPARSE, FLAG_WITH_REGISTRY,
+    SLOT_WRITING,
 };
 use crate::registry::{ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
 use crate::shm::create_backing_file;
@@ -600,6 +601,10 @@ pub struct RingConsumer<T: Copy + 'static> {
     lapped_total: u64,
     /// Ring written by multiple producers: a slot can stay unpublished (dead producer).
     multi_producer: bool,
+    /// Sequence numbers may have holes (`FLAG_SPARSE`: network mirrors). A stale slot
+    /// behind `write_seq` is then skipped instead of waited for.
+    sparse: bool,
+    empty_polls: u32,
     checkpoint: Option<OffsetCheckpoint>,
     registry: Option<ReaderRegistry>,
     registration: Option<ReaderRegistration>,
@@ -740,6 +745,8 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
             cursor,
             lapped_total,
             multi_producer: header.flags & FLAG_MODE_MPMC != 0,
+            sparse: header.flags & FLAG_SPARSE != 0,
+            empty_polls: 0,
             checkpoint,
             registry,
             registration,
@@ -774,6 +781,40 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
         }
     }
 
+    /// Sparse rings only (`FLAG_SPARSE`): if the writer has published past the cursor while
+    /// the cursor's slot still holds an older lap, message `cursor` was never written into
+    /// this ring (a mirror joined mid-stream or resynchronized after a gap). Moves the
+    /// cursor to the next message present in the retained window, or just past `write_seq`
+    /// when none is. Returns the number of sequences skipped.
+    #[cold]
+    #[inline(never)]
+    fn skip_hole(&mut self) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        if write_seq < self.cursor {
+            return 0;
+        }
+        // The message may have landed between the slot load and the header load.
+        let seen = unsafe { (*self.slots.add((self.cursor & self.mask) as usize)).seq.load(Ordering::Acquire) };
+        if seen == SLOT_WRITING || seen >= self.cursor {
+            return 0;
+        }
+        let mut next = oldest_retained(write_seq, self.capacity).max(self.cursor + 1);
+        while next <= write_seq {
+            let s = unsafe { (*self.slots.add((next & self.mask) as usize)).seq.load(Ordering::Acquire) };
+            if s == next {
+                break;
+            }
+            next += 1;
+        }
+        let skipped = next - self.cursor;
+        self.cursor = next;
+        self.lapped_total += skipped;
+        if let Some(ref reg) = self.registration {
+            reg.update_cursor(self.cursor);
+        }
+        skipped
+    }
+
     /// Reads the next message, skipping over lapped ones. Returns the item (if any) and
     /// the number of messages skipped on the way.
     #[inline(always)]
@@ -798,6 +839,16 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
                     // unpublished (producer died mid-publish): once the writer is a full
                     // ring ahead, the message is gone either way.
                     if !self.multi_producer {
+                        if self.sparse {
+                            self.empty_polls = self.empty_polls.wrapping_add(1);
+                            if self.empty_polls & 63 == 0 {
+                                let s = self.skip_hole();
+                                if s > 0 {
+                                    skipped += s;
+                                    continue;
+                                }
+                            }
+                        }
                         return (None, skipped);
                     }
                     let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };

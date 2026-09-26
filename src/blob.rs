@@ -17,8 +17,7 @@ use crate::arena::{BlobRef, PayloadArena};
 use crate::error::{Result, RingfireError};
 use crate::header::{
     check_schema, validate_ring, ReaderSlot, RingHeader, RingLayout, Slot, FLAG_MODE_SPMC,
-    FLAG_POLICY_LATEST_WINS, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY,
-};
+    FLAG_POLICY_LATEST_WINS, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, FLAG_SPARSE, SLOT_WRITING};
 use crate::registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
 use crate::shm::create_backing_file;
 use crate::signature::LayoutSignature;
@@ -301,6 +300,10 @@ pub struct BlobConsumer<M: Copy + 'static> {
     mask: u64,
     cursor: u64,
     lapped_total: u64,
+    /// Sequence numbers may have holes (`FLAG_SPARSE`: network mirrors). A stale slot
+    /// behind `write_seq` is then skipped instead of waited for.
+    sparse: bool,
+    empty_polls: u32,
     _marker: PhantomData<M>,
     _mmap: MmapMut,
 }
@@ -370,8 +373,43 @@ impl<M: Copy + 'static> BlobConsumer<M> {
             mask: view.mask,
             cursor,
             lapped_total: 0,
+            sparse: header.flags & FLAG_SPARSE != 0,
+            empty_polls: 0,
             _marker: PhantomData,
         })
+    }
+
+    /// Sparse rings only (`FLAG_SPARSE`): if the writer has published past the cursor while
+    /// the cursor's slot still holds an older lap, message `cursor` was never written into
+    /// this ring (a mirror joined mid-stream or resynchronized after a gap). Moves the
+    /// cursor to the next message present in the retained window, or just past `write_seq`
+    /// when none is. Returns the number of sequences skipped.
+    #[cold]
+    #[inline(never)]
+    fn skip_hole(&mut self) -> u64 {
+        let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
+        if write_seq < self.cursor {
+            return 0;
+        }
+        let seen = unsafe { (*self.slots.add((self.cursor & self.mask) as usize)).seq.load(Ordering::Acquire) };
+        if seen == SLOT_WRITING || seen >= self.cursor {
+            return 0;
+        }
+        let mut next = oldest_retained(write_seq, self.capacity).max(self.cursor + 1);
+        while next <= write_seq {
+            let s = unsafe { (*self.slots.add((next & self.mask) as usize)).seq.load(Ordering::Acquire) };
+            if s == next {
+                break;
+            }
+            next += 1;
+        }
+        let skipped = next - self.cursor;
+        self.cursor = next;
+        self.lapped_total += skipped;
+        if let Some(ref reg) = self.registration {
+            reg.update_cursor(self.cursor);
+        }
+        skipped
     }
 
     #[cold]
@@ -438,7 +476,19 @@ impl<M: Copy + 'static> BlobConsumer<M> {
                     }
                     skipped += s;
                 }
-                SlotRead::Pending => return Ok(None),
+                SlotRead::Pending => {
+                    if self.sparse {
+                        self.empty_polls = self.empty_polls.wrapping_add(1);
+                        if self.empty_polls & 63 == 0 {
+                            let s = self.skip_hole();
+                            if s > 0 {
+                                skipped += s;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
             }
         }
     }

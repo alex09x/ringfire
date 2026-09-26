@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use ringfire::header::{
-    validate_ring, BlackboardHeader, ReaderSlot, RingHeader, RingView, BLACKBOARD_MAGIC,
-    FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA,
-    FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, SLOT_WRITING,
+    BLACKBOARD_MAGIC, BlackboardHeader, FLAG_MODE_MPMC, FLAG_MODE_SPMC,
+    FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
+    ReaderSlot, RingHeader, RingView, SLOT_WRITING, validate_ring,
 };
 use ringfire::registry::is_process_alive;
+use ringfire::replication::{MirrorBuilder, MirrorStart, MulticastConfig, ReplicaServer};
 
 /// JSON string literal for `s` (quotes, backslashes and control characters escaped).
 fn json_str(s: &str) -> String {
@@ -67,12 +68,28 @@ SUBCOMMANDS:
     top  <PATH> [--interval-ms <N>] Live terminal monitor with throughput and consumer lag
     dump <PATH> [--tail <N>]        Dump recent slots and payload data
     prune <PATH>                    Reclaim inactive/dead reader slots
+    serve <PATH> --bind <ADDR>      Stream the ring to network mirrors
+    mirror <SOURCE> <PATH>          Keep a byte-identical copy of a remote ring at PATH
 
 OPTIONS:
     --json                          Output in JSON format (stat only)
     --interval-ms <N>               Refresh interval in milliseconds for top (default: 500)
     --tail <N>                      Number of recent slots to inspect in dump (default: 10)
     --hex                           Print slot payload in hex format
+    --bind <ADDR>                   Listen address for serve (e.g. 0.0.0.0:7400)
+    --multicast <GROUP:PORT>        serve: send live records by UDP multicast (e.g. 239.255.0.1:7401)
+    --iface <ADDR>                  Local interface address for multicast (serve: send on, mirror: join on)
+    --mtu <N>                       Datagram budget in bytes for multicast (default: 1472)
+    --ttl <N>                       Multicast TTL (default: 1)
+    --linger-us <N>                 serve: wait up to N us to fill a frame before sending (default: adaptive)
+    --udp <PORT>                    serve: also deliver by UDP unicast from this port (mirrors punch to it)
+    --dup <N>                       serve: send every datagram N times (default: 1)
+    --unicast                       mirror: ask for UDP unicast even if the source offers multicast
+    --batch <N>                     Max records per frame for serve (default: 256)
+    --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
+    --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
+    --once                          Exit when the source disconnects instead of reconnecting
+    --reconnect-ms <N>              Delay between reconnect attempts (default: 500)
     -h, --help                      Show help information
     -V, --version                   Show version
 "#,
@@ -159,6 +176,164 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "serve" => {
+            if args.len() < 3 {
+                eprintln!("Error: 'serve' requires a path to a shared memory file.");
+                std::process::exit(1);
+            }
+            let path = &args[2];
+            let mut bind = None;
+            let mut batch = 256usize;
+            let mut spin = false;
+            let mut multicast: Option<MulticastConfig> = None;
+            let mut iface = None;
+            let mut mtu = None;
+            let mut ttl = None;
+            let mut linger_us: Option<u64> = None;
+            let mut udp_port: Option<u16> = None;
+            let mut dup = 1u8;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--udp" && i + 1 < args.len() {
+                    udp_port = args[i + 1].parse().ok();
+                    i += 2;
+                } else if args[i] == "--dup" && i + 1 < args.len() {
+                    dup = args[i + 1].parse().unwrap_or(1);
+                    i += 2;
+                } else if args[i] == "--linger-us" && i + 1 < args.len() {
+                    linger_us = args[i + 1].parse().ok();
+                    i += 2;
+                } else if args[i] == "--bind" && i + 1 < args.len() {
+                    bind = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--batch" && i + 1 < args.len() {
+                    batch = args[i + 1].parse().unwrap_or(256);
+                    i += 2;
+                } else if args[i] == "--multicast" && i + 1 < args.len() {
+                    match args[i + 1].parse::<std::net::SocketAddrV4>() {
+                        Ok(addr) if addr.ip().is_multicast() => {
+                            multicast = Some(MulticastConfig::new(*addr.ip(), addr.port()));
+                        }
+                        _ => {
+                            eprintln!(
+                                "Error: --multicast expects <GROUP:PORT> with a multicast group (224.0.0.0/4)."
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else if args[i] == "--iface" && i + 1 < args.len() {
+                    iface = args[i + 1].parse::<std::net::Ipv4Addr>().ok();
+                    i += 2;
+                } else if args[i] == "--mtu" && i + 1 < args.len() {
+                    mtu = args[i + 1].parse::<usize>().ok();
+                    i += 2;
+                } else if args[i] == "--ttl" && i + 1 < args.len() {
+                    ttl = args[i + 1].parse::<u8>().ok();
+                    i += 2;
+                } else if args[i] == "--spin" {
+                    spin = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            let Some(bind) = bind else {
+                eprintln!("Error: 'serve' requires --bind <ADDR>.");
+                std::process::exit(1);
+            };
+            if let Some(cfg) = multicast.as_mut() {
+                if let Some(iface) = iface {
+                    *cfg = cfg.interface(iface);
+                }
+                if let Some(mtu) = mtu {
+                    *cfg = cfg.mtu(mtu);
+                }
+                if let Some(ttl) = ttl {
+                    *cfg = cfg.ttl(ttl);
+                }
+            }
+            if let Err(e) = cmd_serve(
+                path,
+                &bind,
+                batch,
+                spin,
+                linger_us,
+                multicast,
+                udp_port,
+                mtu.unwrap_or(1472),
+                dup,
+            ) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        "mirror" => {
+            if args.len() < 4 {
+                eprintln!("Error: 'mirror' requires <SOURCE_ADDR> and a path for the mirror ring.");
+                std::process::exit(1);
+            }
+            let source = &args[2];
+            let path = &args[3];
+            let mut start = MirrorStart::Latest;
+            let mut spin = false;
+            let mut once = false;
+            let mut reconnect_ms = 500u64;
+            let mut iface = std::net::Ipv4Addr::UNSPECIFIED;
+            let mut unicast = false;
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--unicast" {
+                    unicast = true;
+                    i += 1;
+                } else if args[i] == "--iface" && i + 1 < args.len() {
+                    iface = args[i + 1]
+                        .parse()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+                    i += 2;
+                } else if args[i] == "--from" && i + 1 < args.len() {
+                    start = match args[i + 1].as_str() {
+                        "latest" => MirrorStart::Latest,
+                        "oldest" => MirrorStart::Oldest,
+                        "resume" => MirrorStart::Resume,
+                        seq => match seq.parse() {
+                            Ok(seq) => MirrorStart::Sequence(seq),
+                            Err(_) => {
+                                eprintln!(
+                                    "Error: --from expects latest, oldest, resume or a sequence number."
+                                );
+                                std::process::exit(1);
+                            }
+                        },
+                    };
+                    i += 2;
+                } else if args[i] == "--reconnect-ms" && i + 1 < args.len() {
+                    reconnect_ms = args[i + 1].parse().unwrap_or(500);
+                    i += 2;
+                } else if args[i] == "--spin" {
+                    spin = true;
+                    i += 1;
+                } else if args[i] == "--once" {
+                    once = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Err(e) = cmd_mirror(
+                source,
+                path,
+                start,
+                spin,
+                once,
+                reconnect_ms,
+                iface,
+                unicast,
+            ) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         other => {
             eprintln!("Unknown subcommand: '{}'", other);
             print_usage();
@@ -201,7 +376,11 @@ fn read_readers(mmap: &Mmap, header: &RingHeader, write_seq: u64) -> Vec<ReaderS
             let cursor = slot.cursor_seq.load(Ordering::Acquire);
             let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
             let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
-            let alive = if pid != 0 { is_process_alive(pid) } else { false };
+            let alive = if pid != 0 {
+                is_process_alive(pid)
+            } else {
+                false
+            };
             // cursor = next sequence to read, so everything from it to write_seq is unread
             let lag = write_seq.saturating_sub(cursor.saturating_sub(1));
 
@@ -348,16 +527,34 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
     println!(" ringfire Shared Memory Ring Buffer Status");
     println!("================================================================================");
     println!(" File:                {}", path_str);
-    println!(" Size:                {} bytes ({:.2} MB)", file_len, file_len as f64 / (1024.0 * 1024.0));
+    println!(
+        " Size:                {} bytes ({:.2} MB)",
+        file_len,
+        file_len as f64 / (1024.0 * 1024.0)
+    );
     println!(
         " Protocol / Mode:     Version {} | {} | {}",
         header.version,
-        if is_mpmc { "MPMC Queue" } else { "SPMC Broadcast" },
-        if is_lossless { "LosslessBackpressure" } else { "LossyLatestWins" }
+        if is_mpmc {
+            "MPMC Queue"
+        } else {
+            "SPMC Broadcast"
+        },
+        if is_lossless {
+            "LosslessBackpressure"
+        } else {
+            "LossyLatestWins"
+        }
     );
-    println!(" Capacity (Slots):    {} (Mask: 0x{:X})", header.capacity, header.mask);
+    println!(
+        " Capacity (Slots):    {} (Mask: 0x{:X})",
+        header.capacity, header.mask
+    );
     println!(" Element Size:        {} bytes", header.element_size);
-    println!(" Total Slots Memory:  {:.2} MB", (header.capacity * header.element_size as u64) as f64 / (1024.0 * 1024.0));
+    println!(
+        " Total Slots Memory:  {:.2} MB",
+        (header.capacity * header.element_size as u64) as f64 / (1024.0 * 1024.0)
+    );
     println!("--------------------------------------------------------------------------------");
     println!(" Sequence State:");
     println!("   Write Sequence:    {}", write_seq);
@@ -375,12 +572,25 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
     println!("   Sleeping Readers:  {} (Futex word: {})", waiting, futex);
 
     if has_arena {
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!(" Variable-Length Payload Arena:");
-        println!("   Capacity:          {} bytes ({:.2} MB)", arena_cap, arena_cap as f64 / (1024.0 * 1024.0));
-        let util = if arena_cap > 0 { (arena_reserved % arena_cap) as f64 / arena_cap as f64 * 100.0 } else { 0.0 };
+        println!(
+            "   Capacity:          {} bytes ({:.2} MB)",
+            arena_cap,
+            arena_cap as f64 / (1024.0 * 1024.0)
+        );
+        let util = if arena_cap > 0 {
+            (arena_reserved % arena_cap) as f64 / arena_cap as f64 * 100.0
+        } else {
+            0.0
+        };
         let cycles = arena_reserved.checked_div(arena_cap).unwrap_or(0);
-        println!("   Reserved Bytes:    {} ({:.1}% wrapped cycles: {})", arena_reserved, util, cycles);
+        println!(
+            "   Reserved Bytes:    {} ({:.1}% wrapped cycles: {})",
+            arena_reserved, util, cycles
+        );
     }
 
     println!("--------------------------------------------------------------------------------");
@@ -443,7 +653,10 @@ fn print_blackboard_stat(
     println!(" Version:      {}", header.version);
     println!(" Slots Count:  {}", header.slot_count);
     println!(" Value Size:   {} bytes", header.value_size);
-    println!(" Slot Stride:  {} bytes (cache-line aligned)", header.slot_size);
+    println!(
+        " Slot Stride:  {} bytes (cache-line aligned)",
+        header.slot_size
+    );
     println!("================================================================================");
     Ok(())
 }
@@ -486,13 +699,39 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
         let readers = read_readers(&mmap, header, write_seq);
 
         print!("\x1B[H"); // Cursor to home (0,0)
-        println!("ringfire top - {} [{}] | Flow: {}", path_str, mode, if is_lossless { "Backpressure" } else { "LatestWins" });
-        println!("Write Seq: {:<12} | Throughput: {:>10.1} msg/s ({:>7.2} MB/s)", write_seq, rate_msg_sec, rate_mb_sec);
-        println!("Buffer:    {:<12} / {} slots ({:>5.1}%) | Window: [{} .. {}]", active_slots, header.capacity, utilization, oldest_seq, write_seq);
-        println!("Futex:     {} sleeping | Readers: {} active", header.waiting_consumers.load(Ordering::Relaxed), readers.len());
-        println!("--------------------------------------------------------------------------------");
-        println!("{:<4}  {:<8}  {:<20}  {:<12}  {:<10}  {:<8}", "Slot", "PID", "Name", "Cursor", "Lag", "Status");
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "ringfire top - {} [{}] | Flow: {}",
+            path_str,
+            mode,
+            if is_lossless {
+                "Backpressure"
+            } else {
+                "LatestWins"
+            }
+        );
+        println!(
+            "Write Seq: {:<12} | Throughput: {:>10.1} msg/s ({:>7.2} MB/s)",
+            write_seq, rate_msg_sec, rate_mb_sec
+        );
+        println!(
+            "Buffer:    {:<12} / {} slots ({:>5.1}%) | Window: [{} .. {}]",
+            active_slots, header.capacity, utilization, oldest_seq, write_seq
+        );
+        println!(
+            "Futex:     {} sleeping | Readers: {} active",
+            header.waiting_consumers.load(Ordering::Relaxed),
+            readers.len()
+        );
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        println!(
+            "{:<4}  {:<8}  {:<20}  {:<12}  {:<10}  {:<8}",
+            "Slot", "PID", "Name", "Cursor", "Lag", "Status"
+        );
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
 
         if readers.is_empty() {
             println!("(No active readers registered)");
@@ -509,7 +748,9 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
                 );
             }
         }
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!("Press Ctrl+C to exit.");
     }
 }
@@ -521,12 +762,18 @@ fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::e
     let element_size = view.slot_size;
 
     let Some((oldest, newest)) = retained_window(write_seq, view.capacity) else {
-        println!("Ring is empty: nothing published yet (capacity {}).", view.capacity);
+        println!(
+            "Ring is empty: nothing published yet (capacity {}).",
+            view.capacity
+        );
         return Ok(());
     };
     let start_seq = newest.saturating_sub(tail.max(1) as u64 - 1).max(oldest);
 
-    println!("Dumping slots from seq {} to seq {} (capacity {}):", start_seq, newest, view.capacity);
+    println!(
+        "Dumping slots from seq {} to seq {} (capacity {}):",
+        start_seq, newest, view.capacity
+    );
     println!("{:<8}  {:<8}  {:<10}  Payload", "Seq", "SlotIdx", "SlotSeq");
     println!("--------------------------------------------------------------------------------");
 
@@ -546,14 +793,36 @@ fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::e
         let data_slice = &mmap[slot_byte_offset + 8..slot_byte_offset + element_size];
 
         let payload_str = if hex {
-            let hex_preview = data_slice.iter().take(16).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-            format!("hex: [{}]{}", hex_preview, if data_slice.len() > 16 { "..." } else { "" })
+            let hex_preview = data_slice
+                .iter()
+                .take(16)
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "hex: [{}]{}",
+                hex_preview,
+                if data_slice.len() > 16 { "..." } else { "" }
+            )
         } else {
-            let printable = data_slice.iter().take(32).map(|&b| if (32..=126).contains(&b) { b as char } else { '.' }).collect::<String>();
+            let printable = data_slice
+                .iter()
+                .take(32)
+                .map(|&b| {
+                    if (32..=126).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect::<String>();
             format!("\"{}\" ({} bytes)", printable, data_slice.len())
         };
 
-        println!("{:<8}  {:<8}  {:<10}  {}", seq, slot_idx, slot_seq_str, payload_str);
+        println!(
+            "{:<8}  {:<8}  {:<10}  {}",
+            seq, slot_idx, slot_seq_str, payload_str
+        );
     }
 
     Ok(())
@@ -596,4 +865,127 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Successfully pruned {} dead reader slot(s).", pruned);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_serve(
+    path: &str,
+    bind: &str,
+    batch: usize,
+    spin: bool,
+    linger_us: Option<u64>,
+    multicast: Option<MulticastConfig>,
+    udp_port: Option<u16>,
+    udp_mtu: usize,
+    dup: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = ReplicaServer::bind(path, bind)?
+        .batch(batch)
+        .spin(spin)
+        .linger(linger_us.map(Duration::from_micros))
+        .duplicate(dup);
+    if let Some(port) = udp_port {
+        server = server.unicast(port, udp_mtu);
+    }
+    let linger = linger_us.map_or("adaptive".to_string(), |us| format!("{} us", us));
+    if let Some(cfg) = multicast {
+        server = server.multicast(cfg);
+    }
+    eprintln!(
+        "ringfire serve: {} on {} (batch {}, {}{})",
+        path,
+        server.local_addr()?,
+        batch,
+        if spin { "busy-poll" } else { "backoff" },
+        match multicast {
+            Some(cfg) => format!(
+                ", multicast {}:{} mtu {} ttl {}, linger {}",
+                cfg.group, cfg.port, cfg.mtu, cfg.ttl, linger
+            ),
+            None => format!(", linger {}", linger),
+        }
+    );
+    if let Some(port) = udp_port {
+        eprintln!(
+            "ringfire serve: unicast from udp port {} (mtu {}), {} copies per datagram",
+            port, udp_mtu, dup
+        );
+    }
+    server.run()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_mirror(
+    source: &str,
+    path: &str,
+    start: MirrorStart,
+    spin: bool,
+    once: bool,
+    reconnect_ms: u64,
+    iface: std::net::Ipv4Addr,
+    unicast: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut start = start;
+    loop {
+        match MirrorBuilder::new()
+            .start(start)
+            .spin(spin)
+            .interface(iface)
+            .unicast(unicast)
+            .connect(source, path)
+        {
+            Ok(mut mirror) => {
+                let g = mirror.geometry();
+                eprintln!(
+                    "ringfire mirror: {} -> {} from seq {} ({}, {} slots x {} B{})",
+                    source,
+                    path,
+                    mirror.first_sequence(),
+                    if mirror.resumed() {
+                        "resumed"
+                    } else {
+                        "created"
+                    },
+                    g.capacity,
+                    g.element_size,
+                    match (mirror.is_unicast(), mirror.is_multicast(), spin) {
+                        (true, _, true) => ", udp unicast, busy-poll",
+                        (true, _, false) => ", udp unicast",
+                        (false, true, true) => ", multicast, busy-poll",
+                        (false, true, false) => ", multicast",
+                        (false, false, true) => ", busy-poll",
+                        (false, false, false) => "",
+                    }
+                );
+                let result = mirror.run();
+                eprintln!(
+                    "ringfire mirror: connection ended ({}), last seq {}, {} frames, {} datagrams, {} naks, {} retransmitted, {} gaps",
+                    match &result {
+                        Ok(()) => "closed by source".to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                    mirror.sequence(),
+                    mirror.frames(),
+                    mirror.datagrams(),
+                    mirror.naks(),
+                    mirror.retransmitted(),
+                    mirror.gaps()
+                );
+                if once {
+                    result?;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                if once {
+                    return Err(e.into());
+                }
+                eprintln!("ringfire mirror: connect failed: {}", e);
+            }
+        }
+        // Whatever we started from, continue where the local ring stopped from now on.
+        start = MirrorStart::Resume;
+        std::thread::sleep(Duration::from_millis(reconnect_ms));
+    }
 }

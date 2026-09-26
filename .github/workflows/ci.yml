@@ -15,8 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu: x86-64 (TSO); macos-latest: AArch64, where missing fences actually bite.
-        os: [ubuntu-latest, macos-latest]
+        # x86-64 (TSO) and AArch64, where missing fences actually bite. Linux only:
+        # ringfire targets /dev/shm, futex and membarrier.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

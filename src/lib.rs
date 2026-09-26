@@ -19,6 +19,7 @@ pub mod header;
 pub mod mpmc;
 pub mod multiplexer;
 pub mod registry;
+pub mod replication;
 pub mod signature;
 mod shm;
 pub mod spmc;
@@ -40,11 +41,14 @@ pub use multiplexer::AsyncRingMultiplexer;
 pub use header::{
     BlackboardHeader, BlackboardSlot, ReaderSlot, RingHeader, Slot, BLACKBOARD_MAGIC,
     BLACKBOARD_VERSION, FLAG_MODE_MPMC, FLAG_MODE_SPMC, FLAG_POLICY_LATEST_WINS,
-    FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
+    FLAG_POLICY_LOSSLESS_BACKPRESSURE, FLAG_SPARSE, FLAG_WITH_ARENA, FLAG_WITH_REGISTRY, RINGFIRE_MAGIC,
     RINGFIRE_VERSION, SLOT_WRITING,
 };
 pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
 pub use registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
+pub use replication::{
+    Geometry, Mirror, MirrorBuilder, MirrorHandle, MirrorStart, MulticastConfig, ReplicaServer,
+};
 pub use signature::{compute_layout_signature, fnv1a64, LayoutSignature};
 pub use spmc::{
     CleanupMode, ConsumerStartMode, FlowControl, RecvStatus, RingConsumer, RingConsumerBuilder,

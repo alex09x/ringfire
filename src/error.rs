@@ -40,6 +40,10 @@ pub enum RingfireError {
     CorruptLayout(&'static str),
     /// A blackboard slot stayed mid-write for too long (writer stalled or crashed).
     WriterStalled { key: usize },
+    /// The operation is not available for this ring configuration.
+    Unsupported(&'static str),
+    /// The replication peer violated the wire protocol.
+    Protocol(&'static str),
 }
 
 impl fmt::Display for RingfireError {
@@ -101,6 +105,8 @@ impl fmt::Display for RingfireError {
             Self::WriterStalled { key } => {
                 write!(f, "Blackboard key {} stayed mid-write: writer stalled or crashed", key)
             }
+            Self::Unsupported(what) => write!(f, "Unsupported: {}", what),
+            Self::Protocol(what) => write!(f, "Replication protocol error: {}", what),
         }
     }
 }
