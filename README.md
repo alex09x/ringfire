@@ -487,6 +487,22 @@ by sequence; 64-byte slots, same two hosts):
 | 1,000,000/s | multicast, 300 µs | 100 % | 0.93 ms | 1.8 ms |
 | 100,000/s | TCP, adaptive | 100 % | 1.2 ms | 4.0 ms |
 
+**Per stage, on every host at once** (`examples/replication_stages.rs`: the master stamps
+each record when it pushes it; a consumer on the master and one on each of eight slaves,
+six on a second host and two on the master's own host, stamp the read; slave clocks are
+translated into the master's with a PTP-style offset from the minimum-round-trip probe,
+so cross-host figures carry a systematic uncertainty of a few microseconds):
+
+| Stage, 1,000 msg/s, multicast | p50 | p99 | max |
+| :--- | ---: | ---: | ---: |
+| push → read by a consumer on the master (same ring) | 0.1 µs | 0.1 µs | 0.5 µs |
+| push → read by a consumer on a mirror on the same host | 3.8–4.1 µs | 4.6–4.9 µs | 14 µs |
+| push → read by a consumer on a mirror on the other host, each of six | 29.6–32.4 µs | 32.7–35.6 µs | 45–48 µs |
+
+The same over TCP: 9 µs to a mirror on the same host, 31–34 µs to each of the six on the
+other host. At 20,000 msg/s the multicast figures become 34 µs (same host) and 58–63 µs
+(other host): the 50 µs pacing shows at exactly that rate.
+
 No record was lost or reordered at any point (5 million records at 1 M/s). The cliff
 between 20,000 and 50,000 messages/s without linger is the per-datagram cost of the
 kernel path (about 40,000 datagrams/s sustained on these hosts): a frame per record is a

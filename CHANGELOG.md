@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full; a record arriving later than that after the previous frame goes out at once).
   Without it every record above ~20,000/s costs its own datagram and system call, and
   latency jumps from ~50 µs to over a millisecond on a kernel stack.
+- `examples/replication_stages.rs`: per-stage latency on every host at once (push on the
+  master → read on the master, on same-host mirrors, on each remote mirror), with a
+  PTP-style clock offset so remote consumers report in the master's clock.
 - `examples/replication_stress.rs`: open-loop two-host stress with delivery ratio,
   round-trip percentiles and per-mirror NAK/retransmission/gap counters. It found and this
   release fixes: multicast heartbeats announcing a sequence whose datagram had not been
