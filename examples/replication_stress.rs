@@ -34,13 +34,14 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
-fn connect_with_retry(peer: &str, path: &PathBuf, iface: Ipv4Addr) -> Mirror {
+fn connect_with_retry(peer: &str, path: &PathBuf, iface: Ipv4Addr, unicast: bool) -> Mirror {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match Mirror::builder()
             .start(MirrorStart::Latest)
             .spin(true)
             .interface(iface)
+            .unicast(unicast)
             .connect(peer, path)
         {
             Ok(mirror) => return mirror,
@@ -70,11 +71,19 @@ fn main() {
     let mut linger_us: Option<u64> = None;
     let mut warmup_ms = 1500u64;
     let mut burst = 1u64;
+    let mut udp_port: Option<u16> = None;
+    let mut unicast = false;
+    let mut dup = 1u8;
     let mut i = 1;
     while i + 1 < args.len() {
         match args[i].as_str() {
             "--linger-us" => linger_us = Some(args[i + 1].parse().unwrap()),
             "--burst" => burst = args[i + 1].parse::<u64>().unwrap().max(1),
+            "--udp" => udp_port = Some(args[i + 1].parse().unwrap()),
+            "--dup" => dup = args[i + 1].parse().unwrap(),
+            "--unicast" => {
+                unicast = args[i + 1] == "1" || args[i + 1] == "true";
+            }
             "--warmup-ms" => warmup_ms = args[i + 1].parse().unwrap(),
             "--role" => role = args[i + 1].clone(),
             "--bind" => bind = args[i + 1].clone(),
@@ -106,8 +115,12 @@ fn main() {
     if let Some(group) = multicast {
         server = server.multicast(MulticastConfig::new(*group.ip(), group.port()).interface(iface));
     }
+    if let Some(port) = udp_port {
+        server = server.unicast(port, 1400);
+    }
+    server = server.duplicate(dup);
     server.spawn().unwrap();
-    let mut mirror = connect_with_retry(&peer, &in_path, iface);
+    let mut mirror = connect_with_retry(&peer, &in_path, iface, unicast);
     eprintln!(
         "{}: serving {} on {}, mirroring {} ({})",
         role,
@@ -139,7 +152,7 @@ fn main() {
                         mirror.gaps()
                     );
                     echoed = 0;
-                    mirror = connect_with_retry(&peer, &in_path, iface);
+                    mirror = connect_with_retry(&peer, &in_path, iface, unicast);
                     input = RingConsumer::<Msg>::attach(&in_path).unwrap();
                 }
                 while let Some(msg) = input.try_recv() {

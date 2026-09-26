@@ -82,6 +82,9 @@ OPTIONS:
     --mtu <N>                       Datagram budget in bytes for multicast (default: 1472)
     --ttl <N>                       Multicast TTL (default: 1)
     --linger-us <N>                 serve: wait up to N us to fill a frame before sending (default: adaptive)
+    --udp <PORT>                    serve: also deliver by UDP unicast from this port (mirrors punch to it)
+    --dup <N>                       serve: send every datagram N times (default: 1)
+    --unicast                       mirror: ask for UDP unicast even if the source offers multicast
     --batch <N>                     Max records per frame for serve (default: 256)
     --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
     --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
@@ -187,9 +190,17 @@ fn main() {
             let mut mtu = None;
             let mut ttl = None;
             let mut linger_us: Option<u64> = None;
+            let mut udp_port: Option<u16> = None;
+            let mut dup = 1u8;
             let mut i = 3;
             while i < args.len() {
-                if args[i] == "--linger-us" && i + 1 < args.len() {
+                if args[i] == "--udp" && i + 1 < args.len() {
+                    udp_port = args[i + 1].parse().ok();
+                    i += 2;
+                } else if args[i] == "--dup" && i + 1 < args.len() {
+                    dup = args[i + 1].parse().unwrap_or(1);
+                    i += 2;
+                } else if args[i] == "--linger-us" && i + 1 < args.len() {
                     linger_us = args[i + 1].parse().ok();
                     i += 2;
                 } else if args[i] == "--bind" && i + 1 < args.len() {
@@ -242,7 +253,17 @@ fn main() {
                     *cfg = cfg.ttl(ttl);
                 }
             }
-            if let Err(e) = cmd_serve(path, &bind, batch, spin, linger_us, multicast) {
+            if let Err(e) = cmd_serve(
+                path,
+                &bind,
+                batch,
+                spin,
+                linger_us,
+                multicast,
+                udp_port,
+                mtu.unwrap_or(1472),
+                dup,
+            ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -259,9 +280,13 @@ fn main() {
             let mut once = false;
             let mut reconnect_ms = 500u64;
             let mut iface = std::net::Ipv4Addr::UNSPECIFIED;
+            let mut unicast = false;
             let mut i = 4;
             while i < args.len() {
-                if args[i] == "--iface" && i + 1 < args.len() {
+                if args[i] == "--unicast" {
+                    unicast = true;
+                    i += 1;
+                } else if args[i] == "--iface" && i + 1 < args.len() {
                     iface = args[i + 1]
                         .parse()
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
@@ -295,7 +320,16 @@ fn main() {
                     i += 1;
                 }
             }
-            if let Err(e) = cmd_mirror(source, path, start, spin, once, reconnect_ms, iface) {
+            if let Err(e) = cmd_mirror(
+                source,
+                path,
+                start,
+                spin,
+                once,
+                reconnect_ms,
+                iface,
+                unicast,
+            ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -833,6 +867,7 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     path: &str,
     bind: &str,
@@ -840,11 +875,18 @@ fn cmd_serve(
     spin: bool,
     linger_us: Option<u64>,
     multicast: Option<MulticastConfig>,
+    udp_port: Option<u16>,
+    udp_mtu: usize,
+    dup: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = ReplicaServer::bind(path, bind)?
         .batch(batch)
         .spin(spin)
-        .linger(linger_us.map(Duration::from_micros));
+        .linger(linger_us.map(Duration::from_micros))
+        .duplicate(dup);
+    if let Some(port) = udp_port {
+        server = server.unicast(port, udp_mtu);
+    }
     let linger = linger_us.map_or("adaptive".to_string(), |us| format!("{} us", us));
     if let Some(cfg) = multicast {
         server = server.multicast(cfg);
@@ -863,10 +905,17 @@ fn cmd_serve(
             None => format!(", linger {}", linger),
         }
     );
+    if let Some(port) = udp_port {
+        eprintln!(
+            "ringfire serve: unicast from udp port {} (mtu {}), {} copies per datagram",
+            port, udp_mtu, dup
+        );
+    }
     server.run()?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_mirror(
     source: &str,
     path: &str,
@@ -875,6 +924,7 @@ fn cmd_mirror(
     once: bool,
     reconnect_ms: u64,
     iface: std::net::Ipv4Addr,
+    unicast: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut start = start;
     loop {
@@ -882,6 +932,7 @@ fn cmd_mirror(
             .start(start)
             .spin(spin)
             .interface(iface)
+            .unicast(unicast)
             .connect(source, path)
         {
             Ok(mut mirror) => {
@@ -898,11 +949,13 @@ fn cmd_mirror(
                     },
                     g.capacity,
                     g.element_size,
-                    match (mirror.is_multicast(), spin) {
-                        (true, true) => ", multicast, busy-poll",
-                        (true, false) => ", multicast",
-                        (false, true) => ", busy-poll",
-                        (false, false) => "",
+                    match (mirror.is_unicast(), mirror.is_multicast(), spin) {
+                        (true, _, true) => ", udp unicast, busy-poll",
+                        (true, _, false) => ", udp unicast",
+                        (false, true, true) => ", multicast, busy-poll",
+                        (false, true, false) => ", multicast",
+                        (false, false, true) => ", busy-poll",
+                        (false, false, false) => "",
                     }
                 );
                 let result = mirror.run();

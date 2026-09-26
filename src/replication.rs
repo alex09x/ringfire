@@ -40,7 +40,7 @@
 //!
 //! | kind | direction | `seq` | payload |
 //! |---|---|---|---|
-//! | `HELLO` 1 | mirror → source | first wanted sequence: `0` = only new messages, `u64::MAX` = oldest retained, otherwise resume from there | magic u64, version u32, pad u32 |
+//! | `HELLO` 1 | mirror → source | first wanted sequence: `0` = only new messages, `u64::MAX` = oldest retained, otherwise resume from there | magic u64, version u32, flags u8 (bit 0: can receive UDP unicast, bit 1: prefers it), pad [u8; 3] |
 //! | `GEOMETRY` 2 | source → mirror | first sequence that will be sent; flag bit 0 = the wanted sequence was ahead of the source (restart), bit 1 = a `MULTICAST` frame follows | capacity u64, element_size u32, flags u32, schema_sig u64, registry_count u32, slots_offset u32, arena_offset u64, arena_size u64 |
 //! | `DATA` 3 | source → mirror | sequence of the first record | `count` records: the slot payload (`element_size - 8` bytes), followed for arena rings by the blob bytes the descriptor names |
 //! | `GAP` 4 | source → mirror | next sequence that will be sent | none |
@@ -62,14 +62,28 @@
 //! | kind | direction | `seq` | payload |
 //! |---|---|---|---|
 //! | `NAK` 6 | mirror → source (TCP) | first missing sequence | last missing sequence u64 |
-//! | `MULTICAST` 7 | source → mirror (TCP, after `GEOMETRY`) | none | group ipv4 [u8; 4], port u16, mtu u16, ttl u8, session u8, pad [u8; 6] |
+//! | `MULTICAST` 7 | source → mirror (TCP, after `GEOMETRY`) | none | group ipv4 [u8; 4] (`0.0.0.0` = unicast), port u16, mtu u16, ttl u8, session u8, token u32, pad u16 |
 //!
 //! Multicast `DATA` and `HEARTBEAT` frames carry the source's one-byte `session` in
 //! `flags`, so datagrams from a previous incarnation of the source are ignored.
 //! `HEARTBEAT` datagrams are sent every millisecond while the ring is idle, which is how a
 //! lost *last* datagram is noticed.
+//!
+//! ## UDP unicast (optional, for routes without multicast)
+//!
+//! With [`ReplicaServer::unicast`] the source also sends the same datagrams to each mirror
+//! that asked for them in `HELLO`, from one fixed UDP port. The mirror learns that port
+//! and a token from the `MULTICAST` frame (group `0.0.0.0` means unicast), then sends
+//! `PUNCH` datagrams to it: the source replies to whatever address the punch came from,
+//! which is what makes this work from behind NAT. Loss recovery is the same `NAK` path.
+//! [`ReplicaServer::duplicate`] sends every datagram several times; mirrors drop the
+//! copies by sequence, so a single loss costs no round trip at all.
+//!
+//! | kind | direction | `seq` | payload |
+//! |---|---|---|---|
+//! | `PUNCH` 8 | mirror → source (UDP) | the mirror's token | none |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::{
@@ -78,7 +92,8 @@ use std::net::{
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -124,6 +139,15 @@ const KIND_GAP: u8 = 4;
 const KIND_HEARTBEAT: u8 = 5;
 const KIND_NAK: u8 = 6;
 const KIND_MULTICAST: u8 = 7;
+const KIND_PUNCH: u8 = 8;
+/// `HELLO` flag: the mirror can receive UDP unicast datagrams.
+const HELLO_UDP: u8 = 0x01;
+/// `HELLO` flag: the mirror prefers unicast over multicast.
+const HELLO_PREFER_UNICAST: u8 = 0x02;
+/// How often a unicast mirror punches until the first datagram arrives, and then as a
+/// NAT keep-alive.
+const PUNCH_INTERVAL: Duration = Duration::from_millis(200);
+const PUNCH_KEEPALIVE: Duration = Duration::from_secs(5);
 /// `GEOMETRY` flag: the mirror asked for a sequence the source has not reached.
 const GEOMETRY_RESET: u8 = 0x01;
 /// `GEOMETRY` flag: a `MULTICAST` frame follows; live data arrives by multicast.
@@ -375,27 +399,43 @@ impl MulticastConfig {
     }
 
     fn encode(&self, session: u8, out: &mut [u8; MULTICAST_LEN]) {
-        out[0..4].copy_from_slice(&self.group.octets());
-        out[4..6].copy_from_slice(&self.port.to_le_bytes());
-        out[6..8].copy_from_slice(&(self.mtu.min(u16::MAX as usize) as u16).to_le_bytes());
-        out[8] = self.ttl;
-        out[9] = session;
-        out[10..16].fill(0);
+        encode_udp_info(self.group, self.port, self.mtu, self.ttl, session, 0, out);
     }
+}
+
+/// Encodes the `MULTICAST` frame payload; `group` `0.0.0.0` announces unicast delivery.
+fn encode_udp_info(
+    group: Ipv4Addr,
+    port: u16,
+    mtu: usize,
+    ttl: u8,
+    session: u8,
+    token: u32,
+    out: &mut [u8; MULTICAST_LEN],
+) {
+    out[0..4].copy_from_slice(&group.octets());
+    out[4..6].copy_from_slice(&port.to_le_bytes());
+    out[6..8].copy_from_slice(&(mtu.min(u16::MAX as usize) as u16).to_le_bytes());
+    out[8] = ttl;
+    out[9] = session;
+    out[10..14].copy_from_slice(&token.to_le_bytes());
+    out[14..16].fill(0);
 }
 
 /// What a mirror learns from the `MULTICAST` frame.
 #[derive(Debug, Clone, Copy)]
 struct MulticastInfo {
+    /// Multicast group, or `0.0.0.0` for unicast delivery from `port` on the source.
     group: Ipv4Addr,
     port: u16,
     session: u8,
+    token: u32,
 }
 
 impl MulticastInfo {
     fn decode(b: &[u8; MULTICAST_LEN]) -> Result<Self> {
         let group = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
-        if !group.is_multicast() {
+        if !group.is_multicast() && !group.is_unspecified() {
             return Err(RingfireError::Protocol(
                 "MULTICAST group is not a multicast address",
             ));
@@ -404,6 +444,7 @@ impl MulticastInfo {
             group,
             port: u16::from_le_bytes(b[4..6].try_into().unwrap()),
             session: b[9],
+            token: u32::from_le_bytes(b[10..14].try_into().unwrap()),
         })
     }
 }
@@ -531,22 +572,27 @@ fn set_sockopt<T>(fd: i32, level: i32, name: i32, value: &T) -> io::Result<()> {
     }
 }
 
-/// Sending socket for the multicast group described by `cfg`.
-fn multicast_sender(cfg: &MulticastConfig) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-    sock.set_multicast_ttl_v4(u32::from(cfg.ttl))?;
-    sock.set_multicast_loop_v4(true)?;
-    if !cfg.interface.is_unspecified() {
-        let addr = libc::in_addr {
-            s_addr: u32::from(cfg.interface).to_be(),
-        };
-        set_sockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_MULTICAST_IF,
-            &addr,
-        )?;
+/// The source's sending socket: bound to `port` (0 = any) so unicast mirrors can punch to
+/// it, non-blocking so punches can be read between frames, and set up for `multicast`
+/// when configured.
+fn udp_sender(port: u16, multicast: Option<&MulticastConfig>) -> io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
+    if let Some(cfg) = multicast {
+        sock.set_multicast_ttl_v4(u32::from(cfg.ttl))?;
+        sock.set_multicast_loop_v4(true)?;
+        if !cfg.interface.is_unspecified() {
+            let addr = libc::in_addr {
+                s_addr: u32::from(cfg.interface).to_be(),
+            };
+            set_sockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                &addr,
+            )?;
+        }
     }
+    sock.set_nonblocking(true)?;
     Ok(sock)
 }
 
@@ -586,7 +632,9 @@ fn multicast_receiver(
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    sock.join_multicast_v4(&group, &interface)?;
+    if group.is_multicast() {
+        sock.join_multicast_v4(&group, &interface)?;
+    }
     sock.set_nonblocking(true)?;
     Ok(sock)
 }
@@ -1094,7 +1142,31 @@ pub struct ReplicaServer {
     spin: bool,
     linger: Option<Duration>,
     multicast: Option<MulticastConfig>,
+    /// UDP unicast delivery: the source port and the datagram budget.
+    unicast: Option<(u16, usize)>,
+    duplicate: u8,
     session: u8,
+    /// Unicast mirrors by token: their punched address once known.
+    peers: Arc<Mutex<HashMap<u32, Option<SocketAddrV4>>>>,
+    next_token: Arc<AtomicU32>,
+}
+
+/// Where the source's datagrams go.
+struct UdpDelivery {
+    port: u16,
+    mtu: usize,
+    multicast: Option<MulticastConfig>,
+    peers: Arc<Mutex<HashMap<u32, Option<SocketAddrV4>>>>,
+    duplicate: u8,
+    heartbeat: Duration,
+}
+
+/// What a connection may offer a mirror for live delivery.
+struct UdpOffer {
+    multicast: Option<MulticastConfig>,
+    unicast: Option<(u16, usize)>,
+    peers: Arc<Mutex<HashMap<u32, Option<SocketAddrV4>>>>,
+    next_token: Arc<AtomicU32>,
 }
 
 /// Decides how long a frame may be held to fill up: a fixed setting, or adaptive pacing
@@ -1144,8 +1216,27 @@ impl ReplicaServer {
             spin: false,
             linger: None,
             multicast: None,
+            unicast: None,
+            duplicate: 1,
             session,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            next_token: Arc::new(AtomicU32::new(1)),
         })
+    }
+
+    /// Also deliver by UDP unicast, from `port`, to every mirror that asks for it; `mtu`
+    /// is the datagram budget (use the path MTU minus 28, e.g. 1400 through a tunnel).
+    /// Works behind NAT: mirrors punch to `port` and are answered where they came from.
+    pub fn unicast(mut self, port: u16, mtu: usize) -> Self {
+        self.unicast = Some((port, mtu.clamp(FRAME_HEADER_LEN + 8, MAX_DATAGRAM)));
+        self
+    }
+
+    /// Send every datagram this many times (default 1). Mirrors drop the copies by
+    /// sequence, so on a lossy route a single loss costs no round trip.
+    pub fn duplicate(mut self, copies: u8) -> Self {
+        self.duplicate = copies.max(1);
+        self
     }
 
     /// After finding new records, keep collecting for up to this long until a frame is
@@ -1189,18 +1280,33 @@ impl ReplicaServer {
         &self.ring_path
     }
 
-    /// Starts the multicast sender thread when configured.
-    fn start_multicast(&self) -> Result<()> {
-        let Some(cfg) = self.multicast else {
+    /// Starts the UDP sender thread when multicast or unicast delivery is configured.
+    fn start_udp(&self) -> Result<()> {
+        if self.multicast.is_none() && self.unicast.is_none() {
             return Ok(());
-        };
+        }
         let ring = SourceRing::open(&self.ring_path)?;
         let (batch, spin, session, linger) = (self.batch, self.spin, self.session, self.linger);
+        let delivery = UdpDelivery {
+            port: self.unicast.map_or(0, |(port, _)| port),
+            mtu: match (self.multicast, self.unicast) {
+                (Some(cfg), Some((_, mtu))) => cfg.mtu.min(mtu),
+                (Some(cfg), None) => cfg.mtu,
+                (None, Some((_, mtu))) => mtu,
+                (None, None) => DEFAULT_MTU,
+            },
+            multicast: self.multicast,
+            peers: self.peers.clone(),
+            duplicate: self.duplicate,
+            heartbeat: self
+                .multicast
+                .map_or(Duration::from_millis(1), |cfg| cfg.heartbeat),
+        };
         thread::Builder::new()
-            .name("ringfire-multicast".into())
+            .name("ringfire-udp".into())
             .spawn(move || {
-                if let Err(e) = multicast_loop(ring, cfg, session, batch, spin, linger) {
-                    eprintln!("ringfire multicast sender stopped: {}", e);
+                if let Err(e) = udp_loop(ring, delivery, session, batch, spin, linger) {
+                    eprintln!("ringfire udp sender stopped: {}", e);
                 }
             })?;
         Ok(())
@@ -1208,16 +1314,21 @@ impl ReplicaServer {
 
     /// Accepts mirrors forever, serving each on its own thread.
     pub fn run(&self) -> Result<()> {
-        self.start_multicast()?;
+        self.start_udp()?;
         loop {
             let (stream, peer) = self.listener.accept()?;
             let ring = SourceRing::open(&self.ring_path)?;
             let (batch, spin, session, linger) = (self.batch, self.spin, self.session, self.linger);
-            let multicast = self.multicast;
+            let offer = UdpOffer {
+                multicast: self.multicast,
+                unicast: self.unicast,
+                peers: self.peers.clone(),
+                next_token: self.next_token.clone(),
+            };
             thread::Builder::new()
                 .name(format!("ringfire-serve-{}", peer))
                 .spawn(move || {
-                    let _ = serve_client(ring, stream, batch, spin, linger, multicast, session);
+                    let _ = serve_client(ring, stream, batch, spin, linger, offer, session);
                 })?;
         }
     }
@@ -1227,13 +1338,19 @@ impl ReplicaServer {
     pub fn serve_one(&self) -> Result<()> {
         let (stream, _) = self.listener.accept()?;
         let ring = SourceRing::open(&self.ring_path)?;
+        let offer = UdpOffer {
+            multicast: None,
+            unicast: None,
+            peers: self.peers.clone(),
+            next_token: self.next_token.clone(),
+        };
         serve_client(
             ring,
             stream,
             self.batch,
             self.spin,
             self.linger,
-            None,
+            offer,
             self.session,
         )?;
         Ok(())
@@ -1247,28 +1364,67 @@ impl ReplicaServer {
     }
 }
 
-/// Sends every new record once, to the multicast group, as it appears in the ring.
-fn multicast_loop(
+/// Sends every new record once as it appears in the ring: to the multicast group, and to
+/// every unicast mirror whose punch has arrived.
+fn udp_loop(
     ring: SourceRing,
-    cfg: MulticastConfig,
+    delivery: UdpDelivery,
     session: u8,
     batch: usize,
     spin: bool,
     linger: Option<Duration>,
 ) -> io::Result<()> {
     let mut linger = Linger::new(linger);
-    let sock = multicast_sender(&cfg)?;
-    let dest = SocketAddrV4::new(cfg.group, cfg.port);
+    let sock = udp_sender(delivery.port, delivery.multicast.as_ref())?;
+    let group = delivery
+        .multicast
+        .map(|cfg| SocketAddrV4::new(cfg.group, cfg.port));
     let batch = batch.clamp(1, u16::MAX as usize);
-    let mut max_bytes = cfg.mtu.max(FRAME_HEADER_LEN + 1);
+    let mut max_bytes = delivery.mtu.max(FRAME_HEADER_LEN + 1);
     let mut wire: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
+    let mut punch = [0u8; FRAME_HEADER_LEN];
     let mut cursor = ring.write_seq() + 1;
     let mut sent = 0u64;
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
     // Fault injection: a datagram held back to go out after its successor.
     let mut held: Option<Vec<u8>> = None;
+    let (drop_every, swap_every) = delivery
+        .multicast
+        .map_or((0, 0), |cfg| (cfg.drop_every, cfg.swap_every));
+    // Sends one datagram everywhere it should go, `duplicate` times.
+    let deliver = |sock: &UdpSocket, bytes: &[u8]| -> io::Result<()> {
+        for _ in 0..delivery.duplicate {
+            if let Some(group) = group {
+                send_datagram(sock, group, bytes)?;
+            }
+            let peers = delivery.peers.lock().unwrap();
+            for addr in peers.values().flatten() {
+                send_datagram(sock, *addr, bytes)?;
+            }
+        }
+        Ok(())
+    };
     loop {
+        // Punches from unicast mirrors: remember where each token lives now.
+        loop {
+            match sock.recv_from(&mut punch) {
+                Ok((n, SocketAddr::V4(from))) if n == FRAME_HEADER_LEN => {
+                    let frame = Frame::decode(&punch);
+                    if frame.kind == KIND_PUNCH && frame.flags == session {
+                        let token = frame.seq as u32;
+                        let mut peers = delivery.peers.lock().unwrap();
+                        if let Some(slot) = peers.get_mut(&token) {
+                            *slot = Some(from);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         wire.clear();
         wire.resize(FRAME_HEADER_LEN, 0);
         let got = ring.collect_lingering(cursor, batch, max_bytes, &mut wire, linger.current());
@@ -1281,13 +1437,13 @@ fn multicast_loop(
             }
             sent += 1;
             let frame = data_frame(&mut wire, session, got.count, cursor);
-            if cfg.swap_every != 0 && sent.is_multiple_of(cfg.swap_every) && held.is_none() {
+            if swap_every != 0 && sent.is_multiple_of(swap_every) && held.is_none() {
                 held = Some(frame.to_vec());
-            } else if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
-                match send_datagram(&sock, dest, frame) {
+            } else if drop_every == 0 || !sent.is_multiple_of(drop_every) {
+                match deliver(&sock, frame) {
                     Ok(()) => {
                         if let Some(late) = held.take() {
-                            send_datagram(&sock, dest, &late)?;
+                            deliver(&sock, &late)?;
                         }
                     }
                     Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {
@@ -1333,13 +1489,13 @@ fn multicast_loop(
                     thread::sleep(Duration::from_micros(50));
                 }
             }
-            if last_beat.elapsed() >= cfg.heartbeat {
+            if last_beat.elapsed() >= delivery.heartbeat {
                 // Announce what this sender has put on the wire, not the ring's write_seq:
                 // a record published between `collect` and this load would otherwise be
                 // announced before its datagram and make every mirror NAK it.
                 let mut beat = Frame::control(KIND_HEARTBEAT, cursor - 1);
                 beat.flags = session;
-                send_datagram(&sock, dest, &beat.encode())?;
+                deliver(&sock, &beat.encode())?;
                 last_beat = Instant::now();
             }
         }
@@ -1352,7 +1508,7 @@ fn serve_client(
     batch: usize,
     spin: bool,
     linger: Option<Duration>,
-    multicast: Option<MulticastConfig>,
+    offer: UdpOffer,
     session: u8,
 ) -> io::Result<()> {
     let mut linger = Linger::new(linger);
@@ -1375,6 +1531,38 @@ fn serve_client(
     if version != REPLICATION_VERSION {
         return Err(protocol("unsupported replication protocol version"));
     }
+    let hello_flags = body[12];
+
+    // Live delivery: unicast when the mirror prefers it (or multicast is not configured)
+    // and unicast is enabled; multicast when configured; the TCP stream otherwise.
+    let wants_udp = hello_flags & HELLO_UDP != 0;
+    let prefers_unicast = hello_flags & HELLO_PREFER_UNICAST != 0;
+    let unicast = match offer.unicast {
+        Some(unicast) if wants_udp && (prefers_unicast || offer.multicast.is_none()) => {
+            Some(unicast)
+        }
+        _ => None,
+    };
+    let multicast = if unicast.is_none() {
+        offer.multicast
+    } else {
+        None
+    };
+    let token = unicast.map(|_| {
+        let token = offer.next_token.fetch_add(1, Ordering::Relaxed);
+        offer.peers.lock().unwrap().insert(token, None);
+        token
+    });
+    // Whatever happens below, a unicast mirror stops being a destination when it leaves.
+    struct Unregister(Arc<Mutex<HashMap<u32, Option<SocketAddrV4>>>>, Option<u32>);
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            if let Some(token) = self.1 {
+                self.0.lock().unwrap().remove(&token);
+            }
+        }
+    }
+    let _unregister = Unregister(offer.peers.clone(), token);
 
     let capacity = ring.view.capacity;
     let write_seq = ring.write_seq();
@@ -1385,7 +1573,7 @@ fn serve_client(
         wanted if wanted > write_seq + 1 => (write_seq + 1, GEOMETRY_RESET),
         wanted => (wanted.max(oldest), 0),
     };
-    if multicast.is_some() {
+    if multicast.is_some() || unicast.is_some() {
         flags |= GEOMETRY_MULTICAST;
     }
 
@@ -1404,9 +1592,28 @@ fn serve_client(
         .encode(),
     );
     out.extend_from_slice(&geometry);
-    if let Some(cfg) = multicast {
-        let mut info = [0u8; MULTICAST_LEN];
-        cfg.encode(session, &mut info);
+    let udp_info = match (multicast, unicast) {
+        (Some(cfg), _) => {
+            let mut info = [0u8; MULTICAST_LEN];
+            cfg.encode(session, &mut info);
+            Some(info)
+        }
+        (None, Some((port, mtu))) => {
+            let mut info = [0u8; MULTICAST_LEN];
+            encode_udp_info(
+                Ipv4Addr::UNSPECIFIED,
+                port,
+                mtu,
+                0,
+                session,
+                token.unwrap_or(0),
+                &mut info,
+            );
+            Some(info)
+        }
+        (None, None) => None,
+    };
+    if let Some(info) = udp_info {
         out.extend_from_slice(
             &Frame {
                 kind: KIND_MULTICAST,
@@ -1424,9 +1631,8 @@ fn serve_client(
     let batch = batch.clamp(1, u16::MAX as usize);
     let mut wire: Vec<u8> = Vec::with_capacity(1 << 16);
 
-    if multicast.is_some() {
-        // Live data goes by multicast; answer retransmission requests until the mirror
-        // hangs up.
+    if multicast.is_some() || unicast.is_some() {
+        // Live data goes by UDP; answer retransmission requests until the mirror hangs up.
         loop {
             stream.read_exact(&mut hdr)?;
             let frame = Frame::decode(&hdr);
@@ -1564,6 +1770,7 @@ pub struct MirrorBuilder {
     interface: Ipv4Addr,
     rcvbuf: usize,
     nak_timeout: Duration,
+    prefer_unicast: bool,
 }
 
 impl Default for MirrorBuilder {
@@ -1581,7 +1788,16 @@ impl MirrorBuilder {
             interface: Ipv4Addr::UNSPECIFIED,
             rcvbuf: 8 << 20,
             nak_timeout: Duration::from_millis(20),
+            prefer_unicast: false,
         }
+    }
+
+    /// Ask for UDP unicast delivery even when the source offers multicast (a mirror on a
+    /// route without multicast, e.g. another site). Ignored by sources without
+    /// [`ReplicaServer::unicast`].
+    pub fn unicast(mut self, prefer: bool) -> Self {
+        self.prefer_unicast = prefer;
+        self
     }
 
     pub fn start(mut self, start: MirrorStart) -> Self {
@@ -1653,7 +1869,15 @@ impl MirrorBuilder {
         );
         hello.extend_from_slice(&REPLICATION_MAGIC.to_le_bytes());
         hello.extend_from_slice(&REPLICATION_VERSION.to_le_bytes());
-        hello.extend_from_slice(&[0u8; 4]);
+        hello.push(
+            HELLO_UDP
+                | if self.prefer_unicast {
+                    HELLO_PREFER_UNICAST
+                } else {
+                    0
+                },
+        );
+        hello.extend_from_slice(&[0u8; 3]);
         stream.write_all(&hello)?;
 
         let mut hdr = [0u8; FRAME_HEADER_LEN];
@@ -1669,6 +1893,7 @@ impl MirrorBuilder {
 
         let mut udp = None;
         let mut session = 0u8;
+        let mut punch = None;
         if frame.flags & GEOMETRY_MULTICAST != 0 {
             stream.read_exact(&mut hdr)?;
             let mc = Frame::decode(&hdr);
@@ -1678,13 +1903,34 @@ impl MirrorBuilder {
             let mut info = [0u8; MULTICAST_LEN];
             stream.read_exact(&mut info)?;
             let info = MulticastInfo::decode(&info)?;
-            udp = Some(multicast_receiver(
-                info.group,
-                info.port,
-                self.interface,
-                self.rcvbuf,
-            )?);
             session = info.session;
+            if info.group.is_unspecified() {
+                // Unicast: any local port; the source answers where our punches come from.
+                let SocketAddr::V4(peer) = stream.peer_addr()? else {
+                    return Err(RingfireError::Unsupported(
+                        "unicast delivery needs an IPv4 source",
+                    ));
+                };
+                udp = Some(multicast_receiver(
+                    info.group,
+                    0,
+                    self.interface,
+                    self.rcvbuf,
+                )?);
+                punch = Some(Punch {
+                    to: SocketAddrV4::new(*peer.ip(), info.port),
+                    token: info.token,
+                    last: Instant::now() - PUNCH_INTERVAL,
+                    heard: false,
+                });
+            } else {
+                udp = Some(multicast_receiver(
+                    info.group,
+                    info.port,
+                    self.interface,
+                    self.rcvbuf,
+                )?);
+            }
         }
 
         let (ring, resumed) = match adopted {
@@ -1702,6 +1948,7 @@ impl MirrorBuilder {
         Ok(Mirror {
             stream,
             udp,
+            punch,
             session,
             ring: Some(ring),
             ring_path,
@@ -1733,11 +1980,21 @@ struct Nak {
     sent: Instant,
 }
 
+/// Unicast delivery state: where to punch, and whether anything has arrived yet.
+#[derive(Debug, Clone, Copy)]
+struct Punch {
+    to: SocketAddrV4,
+    token: u32,
+    last: Instant,
+    heard: bool,
+}
+
 /// Maintains a mirror ring: receives records from a [`ReplicaServer`] and writes them
 /// into a local ring under the source's sequence numbers.
 pub struct Mirror {
     stream: TcpStream,
     udp: Option<UdpSocket>,
+    punch: Option<Punch>,
     session: u8,
     ring: Option<MirrorRing>,
     ring_path: PathBuf,
@@ -1802,9 +2059,15 @@ impl Mirror {
         self.stream.peer_addr()
     }
 
-    /// Whether live records arrive by multicast (with TCP only for retransmission).
+    /// Whether live records arrive by UDP, multicast or unicast (with TCP only for
+    /// retransmission).
     pub fn is_multicast(&self) -> bool {
         self.udp.is_some()
+    }
+
+    /// Whether live records arrive by UDP unicast (punched through to this mirror).
+    pub fn is_unicast(&self) -> bool {
+        self.punch.is_some()
     }
 
     /// Session byte the source stamps on its multicast datagrams (tests).
@@ -2052,6 +2315,25 @@ impl Mirror {
             self.send_nak(nak.from, nak.to)?;
             progressed = true;
         }
+        if let Some(punch) = self.punch.as_mut() {
+            let due = if punch.heard {
+                PUNCH_KEEPALIVE
+            } else {
+                PUNCH_INTERVAL
+            };
+            if punch.last.elapsed() >= due {
+                let mut frame = Frame::control(KIND_PUNCH, u64::from(punch.token));
+                frame.flags = self.session;
+                let udp = self.udp.as_ref().expect("unicast socket");
+                match udp.send_to(&frame.encode(), punch.to) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+                punch.last = Instant::now();
+                progressed = true;
+            }
+        }
         if !progressed {
             if self.spin {
                 core::hint::spin_loop();
@@ -2118,6 +2400,9 @@ impl Mirror {
         let frame = Frame::decode(bytes[..FRAME_HEADER_LEN].try_into().unwrap());
         if frame.flags != self.session {
             return Ok(());
+        }
+        if let Some(punch) = self.punch.as_mut() {
+            punch.heard = true;
         }
         match frame.kind {
             KIND_DATA => {

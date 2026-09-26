@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release fixes: multicast heartbeats announcing a sequence whose datagram had not been
   sent yet (spurious NAKs under load), and `Mirror::step` draining datagrams without bound
   so a caller interleaving its own work never got control back.
+- **UDP unicast delivery** (`ReplicaServer::unicast`, `ReplicaServer::duplicate`,
+  `MirrorBuilder::unicast`, CLI `serve --udp PORT --dup N`, `mirror --unicast`): for
+  routes without multicast (between sites, into clouds). Mirrors announce the capability
+  in `HELLO`, learn the source's UDP port and a token from the `MULTICAST` frame (group
+  `0.0.0.0`), and `PUNCH` to it, so delivery works from behind NAT; the source sends to
+  the punched address and, with `--dup`, several times. Mirrors can be served again, so
+  one copy per site crosses the WAN.
 - **Blob rings are mirrored too** (`BlobProducer` / `BlobConsumer`): the `GEOMETRY` frame
   carries the arena, `DATA` records carry the descriptor followed by the blob bytes, the
   mirror writes blobs into its own arena and rewrites the descriptor's location. A blob

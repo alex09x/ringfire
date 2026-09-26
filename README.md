@@ -430,9 +430,17 @@ let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code a
   `GAP` for what is no longer retained). Datagrams that overtake a hole are held back, so
   the mirror ring is still written strictly in order. A lost *last* datagram is caught by
   the 1 ms multicast heartbeat.
+* **UDP unicast for routes without multicast** (`serve --udp PORT`, `mirror --unicast`):
+  the source sends the same datagrams to each mirror that asked for them, from one fixed
+  port; mirrors punch to it first, so it works from behind NAT. `--dup N` sends every
+  datagram N times and mirrors drop the copies by sequence: on a lossy long-haul link a
+  single loss then costs no round trip. A mirror is an ordinary ring, so a site can run
+  one mirror over the WAN and serve it again locally by multicast or unicast: one copy
+  crosses the ocean, however many readers the site has.
 * `cargo run --release --example replication_latency` measures one-way source ring →
   mirror ring latency and burst throughput over loopback;
-  `examples/replication_pingpong.rs` measures a round trip between two hosts.
+  `examples/replication_pingpong.rs` measures a round trip between two hosts;
+  `examples/replication_stages.rs` measures every stage on every host at once.
 
 ```bash
 # Source host: live records by multicast, TCP only for handshakes and NAKs
@@ -501,7 +509,22 @@ so cross-host figures carry a systematic uncertainty of a few microseconds):
 
 The same over TCP: 9 µs to a mirror on the same host, 31–34 µs to each of the six on the
 other host. At 20,000 msg/s the multicast figures become 34 µs (same host) and 58–63 µs
-(other host): the 50 µs pacing shows at exactly that rate.
+(other host): the 50 µs pacing shows at exactly that rate. Over UDP unicast to the same
+eight mirrors: 38–48 µs to the six on the other host, one `sendto` per mirror per frame.
+
+**Across an ocean** (source in Tokyo, mirror in Los Angeles behind a home NAT, 100 ms
+ping, 1,000 msg/s, 5 s; one-way figures are corrected with a clock offset whose error
+over such a path is a few milliseconds, so compare the spread, not the medians):
+
+| Transport | one-way p50 | p90 | p99 | p99.9 | max |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| TCP | 50.4 ms | 50.5 ms | 99.6 ms | 127 ms | 132 ms |
+| UDP unicast | 51.7 ms | 51.7 ms | 51.7 ms | 56.2 ms | 61.2 ms |
+| UDP unicast, every datagram twice | 51.5 ms | 51.5 ms | 51.6 ms | 53.6 ms | 57.6 ms |
+
+TCP spends a full round trip recovering about one record in a hundred; the UDP path's
+99th percentile sits 50 µs above its median, no `NAK` was needed, and sending twice
+trims the last of the tail.
 
 No record was lost or reordered at any point (5 million records at 1 M/s). The cliff
 between 20,000 and 50,000 messages/s without linger is the per-datagram cost of the

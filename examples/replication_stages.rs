@@ -9,14 +9,19 @@
 //!
 //! ```text
 //! master:  replication_stages --role master --bind 0.0.0.0:7400 --clock 0.0.0.0:7402 \
-//!              [--multicast 239.255.1.1:7410 --iface A] --rate 1000 --seconds 5
+//!              [--multicast 239.255.1.1:7410 --iface A] [--udp 7403 --dup 2] --rate 1000 --seconds 5
 //! slave:   replication_stages --role slave --source A:7400 --clock A:7402 [--iface B] \
-//!              --ring /dev/shm/stage_s1.shm --name s1
+//!              [--unicast 1] --ring /dev/shm/stage_s1.shm --name s1
 //! ```
+//!
+//! Every slave also echoes each record it reads back over its clock connection; the
+//! master stamps the echo's arrival with the same clock that stamped the push, so the
+//! "round trip" line per slave is exact even across sites with unsynchronised clocks.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,38 +68,79 @@ fn report(label: &str, samples: &mut [i64], extra: &str) {
     );
 }
 
-/// Answers clock probes: reads the probe's send time, replies with receive and send times.
-fn clock_service(bind: String) {
+/// Round trips seen by the master: per slave (identified by its 8-byte name), the push →
+/// echo-arrival latencies in the master's clock.
+type Echoes = Arc<Mutex<Vec<(String, Vec<i64>)>>>;
+
+/// Answers clock probes and collects echoes. Requests are 24 bytes: `kind u64, a u64,
+/// b [u8; 8]`. kind 0 = probe (`a` = send time, replied with receive and send times),
+/// kind 1 = echo (`a` = sequence read, `b` = slave name, no reply).
+fn clock_service(bind: String, sent: Arc<Mutex<Vec<i64>>>, echoes: Echoes) {
     let listener = TcpListener::bind(bind).unwrap();
     for stream in listener.incoming().flatten() {
+        let sent = sent.clone();
+        let echoes = echoes.clone();
         thread::spawn(move || {
             let mut stream = stream;
             stream.set_nodelay(true).ok();
-            let mut probe = [0u8; 8];
-            while stream.read_exact(&mut probe).is_ok() {
-                let t2 = wall_ns();
-                let mut reply = [0u8; 24];
-                reply[0..8].copy_from_slice(&probe);
-                reply[8..16].copy_from_slice(&t2.to_le_bytes());
-                reply[16..24].copy_from_slice(&wall_ns().to_le_bytes());
-                if stream.write_all(&reply).is_err() {
-                    break;
+            let mut req = [0u8; 24];
+            let mut mine: Vec<i64> = Vec::new();
+            let mut name = String::new();
+            while stream.read_exact(&mut req).is_ok() {
+                let kind = u64::from_le_bytes(req[0..8].try_into().unwrap());
+                let a = u64::from_le_bytes(req[8..16].try_into().unwrap());
+                match kind {
+                    0 => {
+                        let t2 = wall_ns();
+                        let mut reply = [0u8; 24];
+                        reply[0..8].copy_from_slice(&a.to_le_bytes());
+                        reply[8..16].copy_from_slice(&t2.to_le_bytes());
+                        reply[16..24].copy_from_slice(&wall_ns().to_le_bytes());
+                        if stream.write_all(&reply).is_err() {
+                            break;
+                        }
+                    }
+                    1 => {
+                        let now = wall_ns();
+                        if name.is_empty() {
+                            name = String::from_utf8_lossy(&req[16..24])
+                                .trim_end_matches('\0')
+                                .to_string();
+                        }
+                        let sent = sent.lock().unwrap();
+                        if let Some(&t) = sent.get(a as usize)
+                            && t != 0
+                        {
+                            mine.push(now - t);
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            if !mine.is_empty() {
+                echoes.lock().unwrap().push((name, mine));
             }
         });
     }
 }
 
 /// Estimates `master clock - slave clock` from the minimum-round-trip probe.
-fn clock_offset(clock: &str, probes: usize) -> (i64, i64) {
+fn clock_offset(clock: &str, probes: usize) -> (i64, i64, TcpStream) {
     let mut stream = TcpStream::connect(clock).unwrap();
     stream.set_nodelay(true).unwrap();
     let mut best_rtt = i64::MAX;
     let mut best_offset = 0i64;
     let mut reply = [0u8; 24];
+    let mut req = [0u8; 24];
+    // Bounded in time as well: across an ocean each probe is a 100 ms round trip.
+    let budget = Instant::now() + Duration::from_secs(2);
     for _ in 0..probes {
+        if Instant::now() > budget {
+            break;
+        }
         let t1 = wall_ns();
-        stream.write_all(&t1.to_le_bytes()).unwrap();
+        req[8..16].copy_from_slice(&t1.to_le_bytes());
+        stream.write_all(&req).unwrap();
         stream.read_exact(&mut reply).unwrap();
         let t4 = wall_ns();
         let t2 = i64::from_le_bytes(reply[8..16].try_into().unwrap());
@@ -106,7 +152,7 @@ fn clock_offset(clock: &str, probes: usize) -> (i64, i64) {
         }
         thread::sleep(Duration::from_micros(200));
     }
-    (best_offset, best_rtt)
+    (best_offset, best_rtt, stream)
 }
 
 fn main() {
@@ -123,6 +169,9 @@ fn main() {
     let mut warmup_ms = 3000u64;
     let mut multicast: Option<SocketAddrV4> = None;
     let mut iface = Ipv4Addr::UNSPECIFIED;
+    let mut udp_port: Option<u16> = None;
+    let mut dup = 1u8;
+    let mut unicast = false;
     let mut i = 1;
     while i + 1 < args.len() {
         match args[i].as_str() {
@@ -138,6 +187,9 @@ fn main() {
             "--warmup-ms" => warmup_ms = args[i + 1].parse().unwrap(),
             "--multicast" => multicast = Some(args[i + 1].parse().unwrap()),
             "--iface" => iface = args[i + 1].parse().unwrap(),
+            "--udp" => udp_port = Some(args[i + 1].parse().unwrap()),
+            "--dup" => dup = args[i + 1].parse().unwrap(),
+            "--unicast" => unicast = args[i + 1] == "1" || args[i + 1] == "true",
             _ => {}
         }
         i += 2;
@@ -154,9 +206,17 @@ fn main() {
                 server = server
                     .multicast(MulticastConfig::new(*group.ip(), group.port()).interface(iface));
             }
+            if let Some(port) = udp_port {
+                server = server.unicast(port, 1400);
+            }
+            server = server.duplicate(dup);
             server.spawn().unwrap();
+            let sent: Arc<Mutex<Vec<i64>>> =
+                Arc::new(Mutex::new(vec![0i64; (rate * seconds + 1) as usize]));
+            let echoes: Echoes = Arc::new(Mutex::new(Vec::new()));
             let clock_bind = clock.clone();
-            thread::spawn(move || clock_service(clock_bind));
+            let (sent_c, echoes_c) = (sent.clone(), echoes.clone());
+            thread::spawn(move || clock_service(clock_bind, sent_c, echoes_c));
             eprintln!(
                 "master: ring {} served on {}, clock on {}",
                 ring.display(),
@@ -197,8 +257,10 @@ fn main() {
                     }
                     next += period;
                 }
+                let now = wall_ns();
+                sent.lock().unwrap()[seq as usize] = now;
                 producer.push(&Msg {
-                    sent_ns: wall_ns() as u64,
+                    sent_ns: now as u64,
                     seq,
                     _pad: [0; 40],
                 });
@@ -216,23 +278,43 @@ fn main() {
                 &mut samples,
                 &format!("lapped={}", lapped),
             );
-            // Keep serving until slaves have drained and reported.
-            thread::sleep(Duration::from_secs(3));
+            // Keep serving until slaves have drained, echoed and reported.
+            thread::sleep(Duration::from_secs(4));
+            let mut echoes = echoes.lock().unwrap();
+            echoes.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, rtt) in echoes.iter_mut() {
+                report(
+                    &format!(
+                        "stage round-trip via slave {} (push on master -> read on slave -> echo, master clock)",
+                        name
+                    ),
+                    rtt,
+                    "",
+                );
+            }
         }
         "slave" => {
-            let (offset, sync_rtt) = clock_offset(&clock, 400);
+            let (offset, sync_rtt, mut echo) = clock_offset(&clock, 400);
             let _ = std::fs::remove_file(&ring);
             let mut mirror = Mirror::builder()
                 .start(MirrorStart::Latest)
                 .spin(true)
                 .interface(iface)
+                .unicast(unicast)
                 .connect(source.as_str(), &ring)
                 .unwrap();
-            let transport = if mirror.is_multicast() {
+            let transport = if mirror.is_unicast() {
+                "udp unicast"
+            } else if mirror.is_multicast() {
                 "multicast"
             } else {
                 "tcp"
             };
+            let mut echo_req = [0u8; 24];
+            echo_req[0..8].copy_from_slice(&1u64.to_le_bytes());
+            for (i, b) in name.bytes().take(8).enumerate() {
+                echo_req[16 + i] = b;
+            }
             let handle = mirror.handle().unwrap();
             let mirror_thread = thread::spawn(move || {
                 let _ = mirror.run();
@@ -256,6 +338,8 @@ fn main() {
                     last_seen = Instant::now();
                     last_seq = msg.seq;
                     first.get_or_insert(Instant::now());
+                    echo_req[8..16].copy_from_slice(&msg.seq.to_le_bytes());
+                    let _ = echo.write_all(&echo_req);
                 } else {
                     if (first.is_some() && last_seen.elapsed() > Duration::from_secs(2))
                         || start.elapsed() > Duration::from_secs(seconds + 40)
