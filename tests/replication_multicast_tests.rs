@@ -381,3 +381,37 @@ fn multicast_ignores_datagrams_from_another_session() {
     );
     let _ = std::fs::remove_file(&copy);
 }
+
+#[test]
+fn multicast_reordered_datagrams_are_written_in_order() {
+    let source = temp("swap_src");
+    let copy = temp("swap_dst");
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&copy);
+
+    // Every fourth datagram goes out after the one that follows it, so the mirror keeps
+    // seeing a later sequence before an earlier one. The ring must still be written
+    // strictly in order and no record may be lost.
+    let mut producer = RingProducer::<Tick>::create(&source, 1 << 16).unwrap();
+    let addr = start_server(&source, multicast(6).swap_every(4));
+    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
+        return;
+    };
+    let handle = mirror.handle().unwrap();
+    let runner = thread::spawn(move || {
+        mirror.run().unwrap();
+        (mirror.sequence(), mirror.datagrams(), mirror.gaps())
+    });
+    let mut consumer = RingConsumer::<Tick>::attach(&copy).unwrap();
+    let n = 20_000u64;
+    push_paced(&mut producer, 1..=n);
+    // `collect` asserts every record arrives exactly in sequence order.
+    collect(&mut consumer, 1..=n, Duration::from_secs(30));
+    assert_eq!(consumer.lapped_count(), 0);
+    handle.shutdown().unwrap();
+    let (seq, datagrams, gaps) = runner.join().unwrap();
+    assert_eq!(seq, n);
+    assert!(datagrams > 0);
+    assert_eq!(gaps, 0);
+    let _ = std::fs::remove_file(&copy);
+}

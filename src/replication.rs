@@ -248,6 +248,10 @@ pub struct MulticastConfig {
     /// Fault injection for tests: skip every n-th datagram (0 = never).
     #[doc(hidden)]
     pub drop_every: u64,
+    /// Fault injection for tests: send every n-th datagram after the one that follows it
+    /// (0 = never), so mirrors see datagrams out of order.
+    #[doc(hidden)]
+    pub swap_every: u64,
 }
 
 impl MulticastConfig {
@@ -260,6 +264,7 @@ impl MulticastConfig {
             ttl: 1,
             heartbeat: Duration::from_millis(1),
             drop_every: 0,
+            swap_every: 0,
         }
     }
 
@@ -286,6 +291,12 @@ impl MulticastConfig {
     #[doc(hidden)]
     pub fn drop_every(mut self, n: u64) -> Self {
         self.drop_every = n;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn swap_every(mut self, n: u64) -> Self {
+        self.swap_every = n;
         self
     }
 
@@ -981,14 +992,21 @@ fn multicast_loop(
     let mut sent = 0u64;
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
+    // Fault injection: a datagram held back to go out after its successor.
+    let mut held: Option<Vec<u8>> = None;
     loop {
         let (count, lapped) =
             ring.collect_lingering(cursor, per_datagram, &mut buf, linger.current());
         if count > 0 {
             sent += 1;
-            if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
-                let frame = data_frame(&mut buf, session, count, payload_len, cursor);
+            let frame = data_frame(&mut buf, session, count, payload_len, cursor);
+            if cfg.swap_every != 0 && sent.is_multiple_of(cfg.swap_every) && held.is_none() {
+                held = Some(frame.to_vec());
+            } else if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
                 send_datagram(&sock, dest, frame)?;
+                if let Some(late) = held.take() {
+                    send_datagram(&sock, dest, &late)?;
+                }
             }
             linger.sent();
             cursor += count as u64;
