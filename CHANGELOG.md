@@ -5,6 +5,22 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Network mirrors** (`ringfire::replication`): `ReplicaServer` streams a ring to other
+  hosts over TCP; `Mirror` keeps a ring with the same geometry and the same sequence
+  numbers in the local `/dev/shm`, so readers attach to it as they would on the source
+  host. Raw slot payloads, own binary protocol with a 16-byte frame header
+  (`HELLO` / `GEOMETRY` / `DATA` / `GAP` / `HEARTBEAT`), batching, resume from the last
+  local sequence, restart detection, busy-poll mode. CLI: `ringfire serve <ring> --bind
+  <addr>` and `ringfire mirror <source> <ring>`.
+- `FLAG_SPARSE` (0x0400): rings whose sequence numbers may have holes. `RingConsumer`
+  skips to the next message present instead of waiting on a hole (checked every 64 empty
+  polls, only on sparse rings; other rings are unchanged).
+- `RingfireError::Unsupported` and `RingfireError::Protocol`.
+- `examples/replication_latency.rs`: one-way latency and burst throughput over loopback.
+
 ## [0.4.0] - 2026-09-22
 
 Correctness release. The v0.3.0 review found torn reads, hangs, file truncation and

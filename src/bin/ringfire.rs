@@ -21,6 +21,7 @@ use ringfire::header::{
     FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, SLOT_WRITING,
 };
 use ringfire::registry::is_process_alive;
+use ringfire::replication::{MirrorBuilder, MirrorStart, ReplicaServer};
 
 /// JSON string literal for `s` (quotes, backslashes and control characters escaped).
 fn json_str(s: &str) -> String {
@@ -67,12 +68,20 @@ SUBCOMMANDS:
     top  <PATH> [--interval-ms <N>] Live terminal monitor with throughput and consumer lag
     dump <PATH> [--tail <N>]        Dump recent slots and payload data
     prune <PATH>                    Reclaim inactive/dead reader slots
+    serve <PATH> --bind <ADDR>      Stream the ring to network mirrors
+    mirror <SOURCE> <PATH>          Keep a byte-identical copy of a remote ring at PATH
 
 OPTIONS:
     --json                          Output in JSON format (stat only)
     --interval-ms <N>               Refresh interval in milliseconds for top (default: 500)
     --tail <N>                      Number of recent slots to inspect in dump (default: 10)
     --hex                           Print slot payload in hex format
+    --bind <ADDR>                   Listen address for serve (e.g. 0.0.0.0:7400)
+    --batch <N>                     Max records per frame for serve (default: 256)
+    --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
+    --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
+    --once                          Exit when the source disconnects instead of reconnecting
+    --reconnect-ms <N>              Delay between reconnect attempts (default: 500)
     -h, --help                      Show help information
     -V, --version                   Show version
 "#,
@@ -155,6 +164,84 @@ fn main() {
             }
             let path = &args[2];
             if let Err(e) = cmd_prune(path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        "serve" => {
+            if args.len() < 3 {
+                eprintln!("Error: 'serve' requires a path to a shared memory file.");
+                std::process::exit(1);
+            }
+            let path = &args[2];
+            let mut bind = None;
+            let mut batch = 256usize;
+            let mut spin = false;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--bind" && i + 1 < args.len() {
+                    bind = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--batch" && i + 1 < args.len() {
+                    batch = args[i + 1].parse().unwrap_or(256);
+                    i += 2;
+                } else if args[i] == "--spin" {
+                    spin = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            let Some(bind) = bind else {
+                eprintln!("Error: 'serve' requires --bind <ADDR>.");
+                std::process::exit(1);
+            };
+            if let Err(e) = cmd_serve(path, &bind, batch, spin) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        "mirror" => {
+            if args.len() < 4 {
+                eprintln!("Error: 'mirror' requires <SOURCE_ADDR> and a path for the mirror ring.");
+                std::process::exit(1);
+            }
+            let source = &args[2];
+            let path = &args[3];
+            let mut start = MirrorStart::Latest;
+            let mut spin = false;
+            let mut once = false;
+            let mut reconnect_ms = 500u64;
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--from" && i + 1 < args.len() {
+                    start = match args[i + 1].as_str() {
+                        "latest" => MirrorStart::Latest,
+                        "oldest" => MirrorStart::Oldest,
+                        "resume" => MirrorStart::Resume,
+                        seq => match seq.parse() {
+                            Ok(seq) => MirrorStart::Sequence(seq),
+                            Err(_) => {
+                                eprintln!("Error: --from expects latest, oldest, resume or a sequence number.");
+                                std::process::exit(1);
+                            }
+                        },
+                    };
+                    i += 2;
+                } else if args[i] == "--reconnect-ms" && i + 1 < args.len() {
+                    reconnect_ms = args[i + 1].parse().unwrap_or(500);
+                    i += 2;
+                } else if args[i] == "--spin" {
+                    spin = true;
+                    i += 1;
+                } else if args[i] == "--once" {
+                    once = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Err(e) = cmd_mirror(source, path, start, spin, once, reconnect_ms) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -596,4 +683,69 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Successfully pruned {} dead reader slot(s).", pruned);
     Ok(())
+}
+
+fn cmd_serve(path: &str, bind: &str, batch: usize, spin: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let server = ReplicaServer::bind(path, bind)?.batch(batch).spin(spin);
+    eprintln!(
+        "ringfire serve: {} on {} (batch {}, {})",
+        path,
+        server.local_addr()?,
+        batch,
+        if spin { "busy-poll" } else { "backoff" }
+    );
+    server.run()?;
+    Ok(())
+}
+
+fn cmd_mirror(
+    source: &str,
+    path: &str,
+    start: MirrorStart,
+    spin: bool,
+    once: bool,
+    reconnect_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut start = start;
+    loop {
+        match MirrorBuilder::new().start(start).spin(spin).connect(source, path) {
+            Ok(mut mirror) => {
+                let g = mirror.geometry();
+                eprintln!(
+                    "ringfire mirror: {} -> {} from seq {} ({}, {} slots x {} B{})",
+                    source,
+                    path,
+                    mirror.first_sequence(),
+                    if mirror.resumed() { "resumed" } else { "created" },
+                    g.capacity,
+                    g.element_size,
+                    if spin { ", busy-poll" } else { "" }
+                );
+                let result = mirror.run();
+                eprintln!(
+                    "ringfire mirror: connection ended ({}), last seq {}, {} frames, {} gaps",
+                    match &result {
+                        Ok(()) => "closed by source".to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                    mirror.sequence(),
+                    mirror.frames(),
+                    mirror.gaps()
+                );
+                if once {
+                    result?;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                if once {
+                    return Err(e.into());
+                }
+                eprintln!("ringfire mirror: connect failed: {}", e);
+            }
+        }
+        // Whatever we started from, continue where the local ring stopped from now on.
+        start = MirrorStart::Resume;
+        std::thread::sleep(Duration::from_millis(reconnect_ms));
+    }
 }

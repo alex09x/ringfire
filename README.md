@@ -369,6 +369,59 @@ cargo run --bin ringfire -- prune /dev/shm/hft_ticker_stream
 
 ---
 
+### 11. Network Mirrors: One Source Ring, Identical Copies on Other Hosts
+
+`ringfire serve` streams a ring to any number of mirror hosts; `ringfire mirror` keeps a
+ring with the **same geometry and the same sequence numbers** in the local `/dev/shm`.
+Readers on a mirror host attach to that ring exactly as they would on the source host and
+never touch the network. Records travel as raw slot payloads, so one server/mirror pair
+works for any element type without recompiling.
+
+```bash
+# Source host: publish /dev/shm/ticks to mirrors (one thread and one ring reader per mirror)
+ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --spin
+
+# Each mirror host: keep an identical /dev/shm/ticks; reconnects and resumes on its own
+ringfire mirror source-host:7400 /dev/shm/ticks --from latest --spin
+```
+
+```rust
+use ringfire::{Mirror, MirrorStart, ReplicaServer, RingConsumer};
+
+// Source host
+let server = ReplicaServer::bind("/dev/shm/ticks", "0.0.0.0:7400")?.spin(true);
+server.spawn()?;
+
+// Mirror host
+let mut mirror = Mirror::builder()
+    .start(MirrorStart::Oldest)
+    .spin(true)
+    .connect("source-host:7400", "/dev/shm/ticks")?;
+std::thread::spawn(move || mirror.run());
+let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code as on the source host
+```
+
+* **Ordered and gap-free while the link keeps up.** Every record carries the source's
+  sequence number; a mirror never reorders or duplicates. If the server-side reader is
+  lapped by the source ring (a stalled link, a mirror that stopped reading) it
+  resynchronizes at the oldest retained message and the mirror receives a `GAP`, which is
+  exactly what a slow reader on the source host would observe.
+* **Resume after a restart.** `--from resume` continues after the last sequence in the
+  existing mirror ring; the source ring itself is the retransmission buffer, so everything
+  it still retains is recovered. A source that restarted its numbering makes the mirror
+  start over.
+* **Mirror rings are broadcast rings** (`FLAG_MODE_SPMC | FLAG_POLICY_LATEST_WINS |
+  FLAG_SPARSE`): the mirror writer never waits for local readers. `FLAG_SPARSE` marks
+  rings whose sequence numbers may have holes; a Rust `RingConsumer` then skips to the
+  next message present instead of waiting for a sequence that will never arrive.
+* **Own binary protocol** over TCP with `TCP_NODELAY`: a 16-byte frame header, up to
+  65,535 records per `DATA` frame, `HEARTBEAT` while idle. The frame table is in
+  `src/replication.rs`. Rings with a payload arena (`BlobProducer`) are not supported yet.
+* `cargo run --release --example replication_latency` measures one-way source ring →
+  mirror ring latency and burst throughput over loopback.
+
+---
+
 ## 🛡️ Memory Safety: Why Raw Pointers into Shared Memory Are Dangerous
 
 In cross-process shared memory with a non-blocking writer (`LatestWins`), returning a raw pointer (`*const T`) directly into the mapped `/dev/shm` buffer is **fundamentally unsafe**:

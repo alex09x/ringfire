@@ -18,6 +18,10 @@ pub const FLAG_MODE_SPMC: u32 = 0x0010;
 pub const FLAG_MODE_MPMC: u32 = 0x0020;
 pub const FLAG_WITH_ARENA: u32 = 0x0100;
 pub const FLAG_WITH_REGISTRY: u32 = 0x0200;
+/// Sequence numbers may have holes: the ring is a network mirror that joined mid-stream
+/// or resynchronized after a gap. Readers skip to the next message present instead of
+/// waiting for a sequence that will never be written.
+pub const FLAG_SPARSE: u32 = 0x0400;
 
 /// Slot sequence value stored while a writer is overwriting the slot payload.
 ///
