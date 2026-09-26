@@ -511,6 +511,10 @@ The same over TCP: 9 µs to a mirror on the same host, 31–34 µs to each of th
 other host. At 20,000 msg/s the multicast figures become 34 µs (same host) and 58–63 µs
 (other host): the 50 µs pacing shows at exactly that rate. Over UDP unicast to the same
 eight mirrors: 38–48 µs to the six on the other host, one `sendto` per mirror per frame.
+Through a site hub (`ringfire mirror` + `ringfire serve` on the same ring on the second
+host, unicast on both hops, leaf back on the first host): 52.9 µs p50, 57.3 µs p99 end
+to end, against 10.3 µs for a direct mirror on the first host, so the hub costs its two
+network hops and nothing measurable of its own.
 
 **Across an ocean** (source in Tokyo, mirror in Los Angeles behind a home NAT, 100 ms
 ping, 1,000 msg/s, 5 s; one-way figures are corrected with a clock offset whose error
