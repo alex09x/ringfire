@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source ring and a `MULTICAST` handshake frame. Mirrors hold back datagrams that overtake
   a hole, so rings are still written in order; a 1 ms multicast heartbeat exposes a lost
   last datagram; a per-source session byte drops datagrams from an earlier incarnation.
+- Frame linger (`ReplicaServer::linger`, CLI `--linger-us`): fill a frame for a bounded
+  time before sending it; adaptive by default (batch only while frames go out back to
+  back, up to 50 µs). Without it every record above ~20,000/s costs its own datagram and
+  system call, and latency jumps from ~50 µs to over a millisecond on a kernel stack.
+- `examples/replication_stress.rs`: open-loop two-host stress with delivery ratio,
+  round-trip percentiles and per-mirror NAK/retransmission/gap counters. It found and this
+  release fixes: multicast heartbeats announcing a sequence whose datagram had not been
+  sent yet (spurious NAKs under load), and `Mirror::step` draining datagrams without bound
+  so a caller interleaving its own work never got control back.
 - `FLAG_SPARSE` (0x0400): rings whose sequence numbers may have holes. `RingConsumer`
   skips to the next message present instead of waiting on a hole (checked every 64 empty
   polls, only on sparse rings; other rings are unchanged).

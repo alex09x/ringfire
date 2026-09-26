@@ -128,6 +128,12 @@ const NAK_MAX: u64 = u16::MAX as u64;
 const PENDING_MAX: usize = 8192;
 /// How long a mirror sleeps in `poll` between checks when not busy-polling.
 const POLL_SLICE: Duration = Duration::from_millis(10);
+/// Datagrams one `Mirror::step` processes before returning: small enough that a caller
+/// interleaving its own work sees new records within a few frames.
+const DATAGRAMS_PER_STEP: usize = 32;
+/// Adaptive linger: when the previous frame went out less than this long ago, the sender
+/// keeps collecting for up to the same time before sending the next one.
+const ADAPTIVE_LINGER: Duration = Duration::from_micros(50);
 
 /// Geometry of a ring as exchanged during the handshake: everything a mirror needs to
 /// create an identical ring.
@@ -604,6 +610,38 @@ impl SourceRing {
     fn resync(&self, seen: u64) -> u64 {
         oldest_retained(self.write_seq().max(seen), self.view.capacity)
     }
+
+    /// [`SourceRing::collect`] that, once it has something, keeps collecting for up to
+    /// `linger` until the frame is full. Trades a few microseconds for far fewer sends
+    /// under load: without it a sender that keeps up with the producer puts one or two
+    /// records in every frame and pays a system call for each.
+    fn collect_lingering(
+        &self,
+        cursor: u64,
+        max: usize,
+        buf: &mut [u8],
+        linger: Duration,
+    ) -> (usize, Option<u64>) {
+        let payload_len = self.geometry.payload_len();
+        let (mut count, mut lapped) = self.collect(cursor, max, buf);
+        if count == 0 || count >= max || lapped.is_some() || linger.is_zero() {
+            return (count, lapped);
+        }
+        let until = Instant::now() + linger;
+        while count < max && lapped.is_none() && Instant::now() < until {
+            let (more, seen) = self.collect(
+                cursor + count as u64,
+                max - count,
+                &mut buf[count * payload_len..],
+            );
+            count += more;
+            lapped = seen;
+            if more == 0 {
+                core::hint::spin_loop();
+            }
+        }
+        (count, lapped)
+    }
 }
 
 /// Encodes a `DATA` header for `count` records into `buf` and returns the whole frame.
@@ -768,8 +806,38 @@ pub struct ReplicaServer {
     listener: TcpListener,
     batch: usize,
     spin: bool,
+    linger: Option<Duration>,
     multicast: Option<MulticastConfig>,
     session: u8,
+}
+
+/// Decides how long the next frame may be held to fill up: a fixed setting, or the
+/// adaptive rule (batch only while frames go out back to back).
+#[derive(Clone, Copy)]
+struct Linger {
+    fixed: Option<Duration>,
+    last_send: Instant,
+}
+
+impl Linger {
+    fn new(fixed: Option<Duration>) -> Self {
+        Self {
+            fixed,
+            last_send: Instant::now() - ADAPTIVE_LINGER,
+        }
+    }
+
+    fn current(&self) -> Duration {
+        match self.fixed {
+            Some(fixed) => fixed,
+            None if self.last_send.elapsed() < ADAPTIVE_LINGER => ADAPTIVE_LINGER,
+            None => Duration::ZERO,
+        }
+    }
+
+    fn sent(&mut self) {
+        self.last_send = Instant::now();
+    }
 }
 
 impl ReplicaServer {
@@ -788,9 +856,21 @@ impl ReplicaServer {
             listener,
             batch: DEFAULT_BATCH,
             spin: false,
+            linger: None,
             multicast: None,
             session,
         })
+    }
+
+    /// After finding new records, keep collecting for up to this long until a frame is
+    /// full before sending it. Zero sends every record as soon as it is seen. The default
+    /// (`None`) is adaptive: no waiting while frames are sparse, up to 50 µs while they
+    /// go out back to back. Each frame costs a system call and a packet, so at
+    /// 100,000 messages/s unbatched frames alone push latency past a millisecond on a
+    /// kernel network stack; see the stress example.
+    pub fn linger(mut self, linger: Option<Duration>) -> Self {
+        self.linger = linger;
+        self
     }
 
     /// Maximum records per `DATA` frame (default 256, at most 65535). With multicast the
@@ -828,11 +908,11 @@ impl ReplicaServer {
             return Ok(());
         };
         let ring = SourceRing::open(&self.ring_path)?;
-        let (batch, spin, session) = (self.batch, self.spin, self.session);
+        let (batch, spin, session, linger) = (self.batch, self.spin, self.session, self.linger);
         thread::Builder::new()
             .name("ringfire-multicast".into())
             .spawn(move || {
-                if let Err(e) = multicast_loop(ring, cfg, session, batch, spin) {
+                if let Err(e) = multicast_loop(ring, cfg, session, batch, spin, linger) {
                     eprintln!("ringfire multicast sender stopped: {}", e);
                 }
             })?;
@@ -845,12 +925,12 @@ impl ReplicaServer {
         loop {
             let (stream, peer) = self.listener.accept()?;
             let ring = SourceRing::open(&self.ring_path)?;
-            let (batch, spin, session) = (self.batch, self.spin, self.session);
+            let (batch, spin, session, linger) = (self.batch, self.spin, self.session, self.linger);
             let multicast = self.multicast;
             thread::Builder::new()
                 .name(format!("ringfire-serve-{}", peer))
                 .spawn(move || {
-                    let _ = serve_client(ring, stream, batch, spin, multicast, session);
+                    let _ = serve_client(ring, stream, batch, spin, linger, multicast, session);
                 })?;
         }
     }
@@ -860,7 +940,15 @@ impl ReplicaServer {
     pub fn serve_one(&self) -> Result<()> {
         let (stream, _) = self.listener.accept()?;
         let ring = SourceRing::open(&self.ring_path)?;
-        serve_client(ring, stream, self.batch, self.spin, None, self.session)?;
+        serve_client(
+            ring,
+            stream,
+            self.batch,
+            self.spin,
+            self.linger,
+            None,
+            self.session,
+        )?;
         Ok(())
     }
 
@@ -879,7 +967,9 @@ fn multicast_loop(
     session: u8,
     batch: usize,
     spin: bool,
+    linger: Option<Duration>,
 ) -> io::Result<()> {
+    let mut linger = Linger::new(linger);
     let sock = multicast_sender(&cfg)?;
     let dest = SocketAddrV4::new(cfg.group, cfg.port);
     let payload_len = ring.geometry.payload_len();
@@ -892,13 +982,15 @@ fn multicast_loop(
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
     loop {
-        let (count, lapped) = ring.collect(cursor, per_datagram, &mut buf);
+        let (count, lapped) =
+            ring.collect_lingering(cursor, per_datagram, &mut buf, linger.current());
         if count > 0 {
             sent += 1;
             if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
                 let frame = data_frame(&mut buf, session, count, payload_len, cursor);
                 send_datagram(&sock, dest, frame)?;
             }
+            linger.sent();
             cursor += count as u64;
             idle = 0;
             last_beat = Instant::now();
@@ -926,7 +1018,10 @@ fn multicast_loop(
                 }
             }
             if last_beat.elapsed() >= cfg.heartbeat {
-                let mut beat = Frame::control(KIND_HEARTBEAT, ring.write_seq());
+                // Announce what this sender has put on the wire, not the ring's write_seq:
+                // a record published between `collect` and this load would otherwise be
+                // announced before its datagram and make every mirror NAK it.
+                let mut beat = Frame::control(KIND_HEARTBEAT, cursor - 1);
                 beat.flags = session;
                 send_datagram(&sock, dest, &beat.encode())?;
                 last_beat = Instant::now();
@@ -940,9 +1035,11 @@ fn serve_client(
     mut stream: TcpStream,
     batch: usize,
     spin: bool,
+    linger: Option<Duration>,
     multicast: Option<MulticastConfig>,
     session: u8,
 ) -> io::Result<()> {
+    let mut linger = Linger::new(linger);
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
@@ -1033,10 +1130,11 @@ fn serve_client(
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
     loop {
-        let (count, lapped) = ring.collect(cursor, batch, &mut buf);
+        let (count, lapped) = ring.collect_lingering(cursor, batch, &mut buf, linger.current());
         if count > 0 {
             let frame = data_frame(&mut buf, 0, count, payload_len, cursor);
             stream.write_all(frame)?;
+            linger.sent();
             cursor += count as u64;
             idle = 0;
             last_beat = Instant::now();
@@ -1293,6 +1391,7 @@ impl MirrorBuilder {
             naks: 0,
             retransmitted: 0,
             nak: None,
+            last_nak: None,
             pending: BTreeMap::new(),
             buf: Vec::new(),
             dgram: vec![0u8; MAX_DATAGRAM],
@@ -1328,6 +1427,7 @@ pub struct Mirror {
     naks: u64,
     retransmitted: u64,
     nak: Option<Nak>,
+    last_nak: Option<(u64, u64)>,
     /// Multicast datagrams that arrived ahead of a hole, by first sequence.
     pending: BTreeMap<u64, Vec<u8>>,
     buf: Vec<u8>,
@@ -1377,6 +1477,18 @@ impl Mirror {
     /// Whether live records arrive by multicast (with TCP only for retransmission).
     pub fn is_multicast(&self) -> bool {
         self.udp.is_some()
+    }
+
+    /// Session byte the source stamps on its multicast datagrams (tests).
+    #[doc(hidden)]
+    pub fn session(&self) -> u8 {
+        self.session
+    }
+
+    /// Range of the last `NAK` sent, if any (tests).
+    #[doc(hidden)]
+    pub fn last_nak(&self) -> Option<(u64, u64)> {
+        self.last_nak
     }
 
     /// First sequence the source agreed to send.
@@ -1455,7 +1567,13 @@ impl Mirror {
         self.frames += 1;
         match frame.kind {
             KIND_DATA => {
-                let count = self.read_data_payload(frame)?;
+                let count = match self.read_data_payload(frame) {
+                    Ok(count) => count,
+                    Err(RingfireError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let next = self.ring().next_seq;
                 if frame.seq < next {
                     // The source restarted its numbering underneath us: start over.
@@ -1515,7 +1633,11 @@ impl Mirror {
 
     fn step_multicast(&mut self) -> Result<bool> {
         let mut progressed = false;
-        loop {
+        // Bounded, so a caller that interleaves other work with `step` gets control back
+        // even when datagrams arrive faster than it drains them.
+        let mut drained = 0;
+        while drained < DATAGRAMS_PER_STEP {
+            drained += 1;
             let received = {
                 let udp = self.udp.as_ref().expect("multicast socket");
                 udp.recv(&mut self.dgram)
@@ -1538,7 +1660,13 @@ impl Mirror {
             Ok(Some(frame)) => {
                 progressed = true;
                 self.frames += 1;
-                self.handle_control(frame)?;
+                match self.handle_control(frame) {
+                    Ok(()) => {}
+                    Err(RingfireError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Ok(None) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
@@ -1747,6 +1875,7 @@ impl Mirror {
             to,
             sent: Instant::now(),
         });
+        self.last_nak = Some((from, to));
         self.naks += 1;
         Ok(())
     }

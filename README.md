@@ -443,8 +443,8 @@ all busy-polling (`--spin`), Linux 6.8, kernel network stack:
 | :--- | :--- | ---: | ---: | ---: |
 | Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | TCP | 6.0 µs | 6.8 µs | 19.7 µs |
 | Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | multicast | 3.3 µs | 8.2 µs | 66.8 µs |
-| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two network hops, four ring hand-offs | TCP | 54.0 µs | 59.1 µs | 1.3 ms |
-| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two network hops, four ring hand-offs | multicast | 53.1 µs | 59.9 µs | 86.9 µs |
+| Two Ryzen 9 7950X hosts on a 1 GbE LAN, round trip: two network hops, four ring hand-offs | TCP | 54.0 µs | 59.1 µs | 1.3 ms |
+| Two Ryzen 9 7950X hosts on a 1 GbE LAN, round trip: two network hops, four ring hand-offs | multicast | 53.1 µs | 59.9 µs | 86.9 µs |
 
 Half a LAN round trip is about 27 µs one way whichever transport is used: that is the two
 kernel network stacks, the ring hand-offs on each side add well under a microsecond.
@@ -464,8 +464,33 @@ hold all 22,000 records each:
 With TCP the source pays one thread and one `write` per mirror per message, and two of
 the sixteen TCP mirrors were still behind when the run ended; with multicast it pays one
 `sendto` however many mirrors listen. Run-to-run variation on these shared hosts is about
-±10 µs at p50. Going below the kernel stack means bypassing it (`AF_XDP`, DPDK, Onload),
-which is the planned next transport.
+±10 µs at p50.
+
+**Sustained rate** (`examples/replication_stress.rs`: open loop, the pinger publishes at
+a fixed rate for 5 s and never waits, the other host echoes everything, echoes are matched
+by sequence; 64-byte slots, same two hosts):
+
+| Rate | Transport, frame linger | Delivered | RTT p50 | RTT p99 |
+| ---: | :--- | ---: | ---: | ---: |
+| 10,000/s | multicast, none | 100 % | 54 µs | 62 µs |
+| 20,000/s | multicast, none | 100 % | 51 µs | 65 µs |
+| 50,000/s | multicast, none | 100 % | 830 µs | 1.5 ms |
+| 50,000/s | multicast, 100 µs | 100 % | 213 µs | 268 µs |
+| 100,000/s | multicast, 100 µs | 100 % | 221 µs | 272 µs |
+| 500,000/s | multicast, 100 µs | 100 % | 122 µs | 3.5 ms |
+| 1,000,000/s | multicast, 300 µs | 100 % | 0.93 ms | 1.8 ms |
+| 100,000/s | TCP, adaptive | 100 % | 1.2 ms | 4.0 ms |
+
+No record was lost or reordered at any point (5 million records at 1 M/s). The cliff
+between 20,000 and 50,000 messages/s without linger is the per-datagram cost of the
+kernel path (about 40,000 datagrams/s sustained on these hosts): a frame per record is a
+system call and a packet per record. Linger fills frames (26 records fit a 1472-byte
+datagram) at the price of the wait; the default is adaptive, which batches only while
+frames go out back to back, up to 50 µs. Near 1 M/s the 1500-byte MTU is the limit and
+jumbo frames raise it six-fold. A receiver that cannot keep up loses datagrams faster than
+`NAK` retransmission brings them back, so size the mirror host for the rate. Going below
+the kernel stack means bypassing it (`AF_XDP`, DPDK, Onload), which is the planned next
+transport.
 
 ---
 

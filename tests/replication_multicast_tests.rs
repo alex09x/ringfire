@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -242,5 +242,142 @@ fn multicast_last_datagram_loss_is_recovered_by_heartbeat() {
     let (seq, naks) = runner.join().unwrap();
     assert_eq!(seq, 200);
     assert!(naks > 0);
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn multicast_lapped_source_yields_gaps_but_never_disorder() {
+    let source = temp("mclap_src");
+    let copy = temp("mclap_dst");
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&copy);
+
+    // A tiny ring flooded without pauses: the multicast sender is lapped constantly, so
+    // mirrors see jumps, NAK old ranges and get GAP for what is gone. Every delivered
+    // record must still be intact and strictly increasing.
+    let mut producer = RingProducer::<Tick>::create(&source, 16).unwrap();
+    let addr = start_server(&source, multicast(4));
+    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Oldest) else {
+        return;
+    };
+    let handle = mirror.handle().unwrap();
+    let runner = thread::spawn(move || {
+        mirror.run().unwrap();
+        (mirror.sequence(), mirror.gaps(), mirror.naks())
+    });
+    let mut consumer = RingConsumer::<Tick>::attach(&copy).unwrap();
+    let n = 100_000u64;
+    let pusher = thread::spawn(move || {
+        for seq in 1..=n {
+            producer.push(&Tick::nth(seq));
+        }
+        // Keep the ring alive (and quiet) so the last records can still be fetched.
+        thread::sleep(Duration::from_secs(2));
+        producer
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = 0u64;
+    let mut received = 0u64;
+    while last < n {
+        if let Some(tick) = consumer.try_recv() {
+            assert!(
+                tick.seq > last,
+                "sequence went backwards: {} after {}",
+                tick.seq,
+                last
+            );
+            assert_eq!(tick, Tick::nth(tick.seq), "torn record");
+            last = tick.seq;
+            received += 1;
+        } else {
+            assert!(Instant::now() < deadline, "stalled at {} of {}", last, n);
+            std::hint::spin_loop();
+        }
+    }
+    let _producer = pusher.join().unwrap();
+    assert!(received <= n);
+    handle.shutdown().unwrap();
+    let (seq, gaps, naks) = runner.join().unwrap();
+    assert_eq!(seq, n);
+    assert!(gaps > 0, "a 16-slot ring at full speed must lose history");
+    assert!(naks > 0);
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn multicast_ignores_datagrams_from_another_session() {
+    let source = temp("session_src");
+    let copy = temp("session_dst");
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&copy);
+
+    let mut producer = RingProducer::<Tick>::create(&source, 1024).unwrap();
+    let cfg = multicast(5);
+    let addr = start_server(&source, cfg);
+    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
+        return;
+    };
+    let session = mirror.session();
+    let mut consumer = RingConsumer::<Tick>::attach(&copy).unwrap();
+
+    // Stray DATA datagrams on the same group and port, stamped with another session
+    // (a restarted source, or another stream): a far-ahead sequence that must neither
+    // be written nor be asked for. The mirror is driven from this thread so its
+    // counters can be checked directly.
+    let stray = UdpSocket::bind("0.0.0.0:0").unwrap();
+    stray.set_multicast_loop_v4(true).unwrap();
+    let payload_len = std::mem::size_of::<Tick>();
+    let mut frame = vec![0u8; 16 + payload_len];
+    frame[0] = 3; // DATA
+    frame[1] = session.wrapping_add(1);
+    frame[2..4].copy_from_slice(&1u16.to_le_bytes());
+    frame[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    frame[8..16].copy_from_slice(&999_999u64.to_le_bytes());
+    let until = Instant::now() + Duration::from_millis(300);
+    let mut sent = 0;
+    while Instant::now() < until {
+        if sent < 20 {
+            stray.send_to(&frame, (cfg.group, cfg.port)).unwrap();
+            sent += 1;
+        }
+        assert!(mirror.step().unwrap());
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        mirror.datagrams() > 0,
+        "the mirror should have seen the stray datagrams"
+    );
+    assert_eq!(mirror.naks(), 0, "a foreign session must not cause NAKs");
+    assert_eq!(mirror.sequence(), 0);
+    assert_eq!(
+        consumer.try_recv(),
+        None,
+        "stray record must not be written"
+    );
+
+    // The real source still works and the stray sequence left no trace.
+    for seq in 1..=100 {
+        producer.push(&Tick::nth(seq));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mirror.sequence() < 100 {
+        assert!(
+            Instant::now() < deadline,
+            "records did not arrive: {:?}",
+            mirror
+        );
+        assert!(mirror.step().unwrap());
+    }
+    collect(&mut consumer, 1..=100, Duration::from_secs(10));
+    assert_eq!(mirror.gaps(), 0);
+    assert_eq!(
+        mirror.naks(),
+        0,
+        "no NAK expected on an intact live stream: {:?}, last nak {:?}, datagrams {}, retransmitted {}",
+        mirror,
+        mirror.last_nak(),
+        mirror.datagrams(),
+        mirror.retransmitted()
+    );
     let _ = std::fs::remove_file(&copy);
 }
