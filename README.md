@@ -414,24 +414,43 @@ let mut reader = RingConsumer::<Tick>::attach("/dev/shm/ticks")?; // same code a
   FLAG_SPARSE`): the mirror writer never waits for local readers. `FLAG_SPARSE` marks
   rings whose sequence numbers may have holes; a Rust `RingConsumer` then skips to the
   next message present instead of waiting for a sequence that will never arrive.
-* **Own binary protocol** over TCP with `TCP_NODELAY`: a 16-byte frame header, up to
-  65,535 records per `DATA` frame, `HEARTBEAT` while idle. The frame table is in
-  `src/replication.rs`. Rings with a payload arena (`BlobProducer`) are not supported yet.
+* **Own binary protocol**: a 16-byte frame header, up to 65,535 records per `DATA`
+  frame, `HEARTBEAT` while idle. The frame table is in `src/replication.rs`. Rings with a
+  payload arena (`BlobProducer`) are not supported yet.
+* **UDP multicast** (`--multicast GROUP:PORT`): the source sends each `DATA` frame once,
+  as one datagram, and every mirror receives it, so the cost does not grow with the number
+  of mirrors. The TCP connection stays for the handshake and for retransmission: a mirror
+  that sees a sequence jump sends `NAK` and gets the range back from the source ring (or
+  `GAP` for what is no longer retained). Datagrams that overtake a hole are held back, so
+  the mirror ring is still written strictly in order. A lost *last* datagram is caught by
+  the 1 ms multicast heartbeat.
 * `cargo run --release --example replication_latency` measures one-way source ring →
-  mirror ring latency and burst throughput over loopback.
+  mirror ring latency and burst throughput over loopback;
+  `examples/replication_pingpong.rs` measures a round trip between two hosts.
+
+```bash
+# Source host: live records by multicast, TCP only for handshakes and NAKs
+ringfire serve /dev/shm/ticks --bind 0.0.0.0:7400 --multicast 239.255.0.1:7401 --iface 10.0.0.5 --spin
+
+# Each mirror host (join on the NIC facing the source)
+ringfire mirror 10.0.0.5:7400 /dev/shm/ticks --iface 10.0.0.7 --spin
+```
 
 Measured with 64-byte slots, one message every 100 µs, producer, server, mirror and reader
-all busy-polling (`--spin`), Linux 6.8, kernel TCP stack:
+all busy-polling (`--spin`), Linux 6.8, kernel network stack:
 
-| Path | p50 | p99 | max |
-| :--- | ---: | ---: | ---: |
-| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | 6.0 µs | 6.8 µs | 19.7 µs |
-| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two TCP hops, four ring hand-offs (`examples/replication_pingpong.rs`) | 54.0 µs | 59.1 µs | 1.3 ms |
+| Path | Transport | p50 | p99 | max |
+| :--- | :--- | ---: | ---: | ---: |
+| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | TCP | 6.0 µs | 6.8 µs | 19.7 µs |
+| Loopback, source ring → mirror ring, one way (Ryzen 9 7950X) | multicast | 3.3 µs | 8.2 µs | 66.8 µs |
+| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two network hops, four ring hand-offs | TCP | 54.0 µs | 59.1 µs | 1.3 ms |
+| Two Ryzen 9 7950X hosts on a 25 GbE LAN, round trip: two network hops, four ring hand-offs | multicast | 53.1 µs | 59.9 µs | 86.9 µs |
 
-Half a LAN round trip is about 27 µs one way, most of it in the two kernel TCP stacks; the
-ring hand-offs on each side add well under a microsecond. Going lower means bypassing the
-kernel (`AF_XDP`, DPDK, Onload), which is the planned next transport together with UDP
-multicast so one packet feeds every mirror.
+Half a LAN round trip is about 27 µs one way whichever transport is used: that is the two
+kernel network stacks, the ring hand-offs on each side add well under a microsecond.
+Multicast buys the tail (a worst case of 87 µs instead of 1.3 ms over 20,000 samples) and
+a cost that stays flat as mirrors are added. Going below that means bypassing the kernel
+(`AF_XDP`, DPDK, Onload), which is the planned next transport.
 
 ---
 

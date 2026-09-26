@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`HELLO` / `GEOMETRY` / `DATA` / `GAP` / `HEARTBEAT`), batching, resume from the last
   local sequence, restart detection, busy-poll mode. CLI: `ringfire serve <ring> --bind
   <addr>` and `ringfire mirror <source> <ring>`.
+- **UDP multicast delivery** (`ReplicaServer::multicast`, `MulticastConfig`, CLI
+  `--multicast GROUP:PORT --iface ADDR --mtu N --ttl N`): each `DATA` frame goes out once
+  as a datagram to every mirror; the TCP connection carries `NAK` retransmission from the
+  source ring and a `MULTICAST` handshake frame. Mirrors hold back datagrams that overtake
+  a hole, so rings are still written in order; a 1 ms multicast heartbeat exposes a lost
+  last datagram; a per-source session byte drops datagrams from an earlier incarnation.
 - `FLAG_SPARSE` (0x0400): rings whose sequence numbers may have holes. `RingConsumer`
   skips to the next message present instead of waiting on a hole (checked every 64 empty
   polls, only on sparse rings; other rings are unchanged).

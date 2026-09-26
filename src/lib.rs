@@ -46,7 +46,9 @@ pub use header::{
 };
 pub use mpmc::{MpmcProducer, MpmcQueueConsumer};
 pub use registry::{ReaderInfo, ReaderRegistration, ReaderRegistry, DEFAULT_MAX_READERS};
-pub use replication::{Geometry, Mirror, MirrorBuilder, MirrorHandle, MirrorStart, ReplicaServer};
+pub use replication::{
+    Geometry, Mirror, MirrorBuilder, MirrorHandle, MirrorStart, MulticastConfig, ReplicaServer,
+};
 pub use signature::{compute_layout_signature, fnv1a64, LayoutSignature};
 pub use spmc::{
     CleanupMode, ConsumerStartMode, FlowControl, RecvStatus, RingConsumer, RingConsumerBuilder,

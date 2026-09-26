@@ -10,13 +10,17 @@
 //!              [--samples 20000] [--paced-us 100] [--dir /dev/shm]
 //! ```
 //!
+//! Add `--multicast GROUP:PORT --iface LOCAL_ADDR` on each side (a different group or
+//! port per side) to send live records by UDP multicast instead of TCP.
+//!
 //! Start the ponger first; both sides retry the connection to their peer for a while.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ringfire::replication::{Mirror, MirrorStart, ReplicaServer};
+use ringfire::replication::{Mirror, MirrorStart, MulticastConfig, ReplicaServer};
 use ringfire::{RingConsumer, RingProducer};
 
 #[derive(Debug, Clone, Copy)]
@@ -32,12 +36,13 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
-fn connect_with_retry(peer: &str, path: &PathBuf) -> Mirror {
+fn connect_with_retry(peer: &str, path: &PathBuf, iface: Ipv4Addr) -> Mirror {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match Mirror::builder()
             .start(MirrorStart::Latest)
             .spin(true)
+            .interface(iface)
             .connect(peer, path)
         {
             Ok(mirror) => return mirror,
@@ -62,6 +67,8 @@ fn main() {
     let mut samples = 20_000usize;
     let mut paced_us = 100u64;
     let mut dir = PathBuf::from("/dev/shm");
+    let mut multicast: Option<SocketAddrV4> = None;
+    let mut iface = Ipv4Addr::UNSPECIFIED;
     let mut i = 1;
     while i + 1 < args.len() {
         match args[i].as_str() {
@@ -71,6 +78,8 @@ fn main() {
             "--samples" => samples = args[i + 1].parse().unwrap(),
             "--paced-us" => paced_us = args[i + 1].parse().unwrap(),
             "--dir" => dir = PathBuf::from(&args[i + 1]),
+            "--multicast" => multicast = Some(args[i + 1].parse().unwrap()),
+            "--iface" => iface = args[i + 1].parse().unwrap(),
             _ => {}
         }
         i += 2;
@@ -86,23 +95,37 @@ fn main() {
     let _ = std::fs::remove_file(&in_path);
 
     let mut out = RingProducer::<Msg>::create(&out_path, 1 << 16).unwrap();
-    let server = ReplicaServer::bind(&out_path, bind.as_str())
+    let mut server = ReplicaServer::bind(&out_path, bind.as_str())
         .unwrap()
         .spin(true);
+    if let Some(group) = multicast {
+        server = server.multicast(MulticastConfig::new(*group.ip(), group.port()).interface(iface));
+    }
     eprintln!(
-        "{}: serving {} on {}",
+        "{}: serving {} on {}{}",
         role,
         out_path.display(),
-        server.local_addr().unwrap()
+        server.local_addr().unwrap(),
+        multicast.map_or(String::new(), |g| format!(", multicast {}", g))
     );
     server.spawn().unwrap();
 
-    let mut mirror = connect_with_retry(&peer, &in_path);
-    eprintln!("{}: mirroring {} -> {}", role, peer, in_path.display());
+    let mut mirror = connect_with_retry(&peer, &in_path, iface);
+    eprintln!(
+        "{}: mirroring {} -> {} ({})",
+        role,
+        peer,
+        in_path.display(),
+        if mirror.is_multicast() {
+            "multicast"
+        } else {
+            "tcp"
+        }
+    );
     let handle = mirror.handle().unwrap();
     let mirror_thread = thread::spawn(move || {
         let _ = mirror.run();
-        mirror.gaps()
+        (mirror.gaps(), mirror.naks(), mirror.retransmitted())
     });
     let mut input = RingConsumer::<Msg>::attach(&in_path).unwrap();
 
@@ -182,8 +205,11 @@ fn main() {
                 percentile(&rtt, 0.99) as f64 / 2000.0
             );
             handle.shutdown().unwrap();
-            let gaps = mirror_thread.join().unwrap();
-            println!("  mirror gaps {}", gaps);
+            let (gaps, naks, retransmitted) = mirror_thread.join().unwrap();
+            println!(
+                "  mirror gaps {}, naks {}, retransmitted {}",
+                gaps, naks, retransmitted
+            );
         }
         other => panic!("unknown role {}", other),
     }

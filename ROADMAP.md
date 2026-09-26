@@ -180,7 +180,8 @@ copying, which is what lets a `LosslessBackpressure` producer reuse slots safely
 ### Phase 9: Network Mirrors (unreleased)
 - [x] **Ring replication over TCP** (`ringfire::replication`): `ReplicaServer` on the source host, `Mirror` on each other host, byte-identical rings under the source's sequence numbers, own binary protocol, resume and restart detection, `ringfire serve` / `ringfire mirror` CLI.
 - [x] **`FLAG_SPARSE`** and hole skipping in `RingConsumer` for rings that join a stream mid-way.
-- [ ] UDP multicast transport with NAK-based retransmission from the source ring (one packet for every mirror).
+- [x] **UDP multicast transport** with NAK-based retransmission from the source ring (one datagram for every mirror), in-order hold-back of overtaking datagrams, heartbeat-detected tail loss, per-source session byte.
+- [ ] Kernel bypass for the multicast path (`AF_XDP` / DPDK / Onload): the two kernel network stacks are about 27 µs of the LAN one-way latency.
 - [ ] Mirror rings with a payload arena (`BlobProducer` streams).
 - [ ] `FLAG_SPARSE` awareness in the C header and Python readers.
 

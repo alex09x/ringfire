@@ -21,7 +21,7 @@ use ringfire::header::{
     FLAG_WITH_REGISTRY, RINGFIRE_MAGIC, SLOT_WRITING,
 };
 use ringfire::registry::is_process_alive;
-use ringfire::replication::{MirrorBuilder, MirrorStart, ReplicaServer};
+use ringfire::replication::{MirrorBuilder, MirrorStart, MulticastConfig, ReplicaServer};
 
 /// JSON string literal for `s` (quotes, backslashes and control characters escaped).
 fn json_str(s: &str) -> String {
@@ -77,6 +77,10 @@ OPTIONS:
     --tail <N>                      Number of recent slots to inspect in dump (default: 10)
     --hex                           Print slot payload in hex format
     --bind <ADDR>                   Listen address for serve (e.g. 0.0.0.0:7400)
+    --multicast <GROUP:PORT>        serve: send live records by UDP multicast (e.g. 239.255.0.1:7401)
+    --iface <ADDR>                  Local interface address for multicast (serve: send on, mirror: join on)
+    --mtu <N>                       Datagram budget in bytes for multicast (default: 1472)
+    --ttl <N>                       Multicast TTL (default: 1)
     --batch <N>                     Max records per frame for serve (default: 256)
     --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
     --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
@@ -177,6 +181,10 @@ fn main() {
             let mut bind = None;
             let mut batch = 256usize;
             let mut spin = false;
+            let mut multicast: Option<MulticastConfig> = None;
+            let mut iface = None;
+            let mut mtu = None;
+            let mut ttl = None;
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "--bind" && i + 1 < args.len() {
@@ -184,6 +192,26 @@ fn main() {
                     i += 2;
                 } else if args[i] == "--batch" && i + 1 < args.len() {
                     batch = args[i + 1].parse().unwrap_or(256);
+                    i += 2;
+                } else if args[i] == "--multicast" && i + 1 < args.len() {
+                    match args[i + 1].parse::<std::net::SocketAddrV4>() {
+                        Ok(addr) if addr.ip().is_multicast() => {
+                            multicast = Some(MulticastConfig::new(*addr.ip(), addr.port()));
+                        }
+                        _ => {
+                            eprintln!("Error: --multicast expects <GROUP:PORT> with a multicast group (224.0.0.0/4).");
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else if args[i] == "--iface" && i + 1 < args.len() {
+                    iface = args[i + 1].parse::<std::net::Ipv4Addr>().ok();
+                    i += 2;
+                } else if args[i] == "--mtu" && i + 1 < args.len() {
+                    mtu = args[i + 1].parse::<usize>().ok();
+                    i += 2;
+                } else if args[i] == "--ttl" && i + 1 < args.len() {
+                    ttl = args[i + 1].parse::<u8>().ok();
                     i += 2;
                 } else if args[i] == "--spin" {
                     spin = true;
@@ -196,7 +224,18 @@ fn main() {
                 eprintln!("Error: 'serve' requires --bind <ADDR>.");
                 std::process::exit(1);
             };
-            if let Err(e) = cmd_serve(path, &bind, batch, spin) {
+            if let Some(cfg) = multicast.as_mut() {
+                if let Some(iface) = iface {
+                    *cfg = cfg.interface(iface);
+                }
+                if let Some(mtu) = mtu {
+                    *cfg = cfg.mtu(mtu);
+                }
+                if let Some(ttl) = ttl {
+                    *cfg = cfg.ttl(ttl);
+                }
+            }
+            if let Err(e) = cmd_serve(path, &bind, batch, spin, multicast) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -212,9 +251,13 @@ fn main() {
             let mut spin = false;
             let mut once = false;
             let mut reconnect_ms = 500u64;
+            let mut iface = std::net::Ipv4Addr::UNSPECIFIED;
             let mut i = 4;
             while i < args.len() {
-                if args[i] == "--from" && i + 1 < args.len() {
+                if args[i] == "--iface" && i + 1 < args.len() {
+                    iface = args[i + 1].parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+                    i += 2;
+                } else if args[i] == "--from" && i + 1 < args.len() {
                     start = match args[i + 1].as_str() {
                         "latest" => MirrorStart::Latest,
                         "oldest" => MirrorStart::Oldest,
@@ -241,7 +284,7 @@ fn main() {
                     i += 1;
                 }
             }
-            if let Err(e) = cmd_mirror(source, path, start, spin, once, reconnect_ms) {
+            if let Err(e) = cmd_mirror(source, path, start, spin, once, reconnect_ms, iface) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -685,14 +728,27 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_serve(path: &str, bind: &str, batch: usize, spin: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let server = ReplicaServer::bind(path, bind)?.batch(batch).spin(spin);
+fn cmd_serve(
+    path: &str,
+    bind: &str,
+    batch: usize,
+    spin: bool,
+    multicast: Option<MulticastConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = ReplicaServer::bind(path, bind)?.batch(batch).spin(spin);
+    if let Some(cfg) = multicast {
+        server = server.multicast(cfg);
+    }
     eprintln!(
-        "ringfire serve: {} on {} (batch {}, {})",
+        "ringfire serve: {} on {} (batch {}, {}{})",
         path,
         server.local_addr()?,
         batch,
-        if spin { "busy-poll" } else { "backoff" }
+        if spin { "busy-poll" } else { "backoff" },
+        match multicast {
+            Some(cfg) => format!(", multicast {}:{} mtu {} ttl {}", cfg.group, cfg.port, cfg.mtu, cfg.ttl),
+            None => String::new(),
+        }
     );
     server.run()?;
     Ok(())
@@ -705,10 +761,16 @@ fn cmd_mirror(
     spin: bool,
     once: bool,
     reconnect_ms: u64,
+    iface: std::net::Ipv4Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut start = start;
     loop {
-        match MirrorBuilder::new().start(start).spin(spin).connect(source, path) {
+        match MirrorBuilder::new()
+            .start(start)
+            .spin(spin)
+            .interface(iface)
+            .connect(source, path)
+        {
             Ok(mut mirror) => {
                 let g = mirror.geometry();
                 eprintln!(
@@ -719,17 +781,25 @@ fn cmd_mirror(
                     if mirror.resumed() { "resumed" } else { "created" },
                     g.capacity,
                     g.element_size,
-                    if spin { ", busy-poll" } else { "" }
+                    match (mirror.is_multicast(), spin) {
+                        (true, true) => ", multicast, busy-poll",
+                        (true, false) => ", multicast",
+                        (false, true) => ", busy-poll",
+                        (false, false) => "",
+                    }
                 );
                 let result = mirror.run();
                 eprintln!(
-                    "ringfire mirror: connection ended ({}), last seq {}, {} frames, {} gaps",
+                    "ringfire mirror: connection ended ({}), last seq {}, {} frames, {} datagrams, {} naks, {} retransmitted, {} gaps",
                     match &result {
                         Ok(()) => "closed by source".to_string(),
                         Err(e) => e.to_string(),
                     },
                     mirror.sequence(),
                     mirror.frames(),
+                    mirror.datagrams(),
+                    mirror.naks(),
+                    mirror.retransmitted(),
                     mirror.gaps()
                 );
                 if once {

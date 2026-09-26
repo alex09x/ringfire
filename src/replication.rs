@@ -38,18 +38,41 @@
 //! | kind | direction | `seq` | payload |
 //! |---|---|---|---|
 //! | `HELLO` 1 | mirror → source | first wanted sequence: `0` = only new messages, `u64::MAX` = oldest retained, otherwise resume from there | magic u64, version u32, pad u32 |
-//! | `GEOMETRY` 2 | source → mirror | first sequence that will be sent; flag bit 0 = the wanted sequence was ahead of the source (restart) | capacity u64, element_size u32, flags u32, schema_sig u64, registry_count u32, slots_offset u32 |
+//! | `GEOMETRY` 2 | source → mirror | first sequence that will be sent; flag bit 0 = the wanted sequence was ahead of the source (restart), bit 1 = a `MULTICAST` frame follows | capacity u64, element_size u32, flags u32, schema_sig u64, registry_count u32, slots_offset u32 |
 //! | `DATA` 3 | source → mirror | sequence of the first record | `count` records of `element_size - 8` bytes |
 //! | `GAP` 4 | source → mirror | next sequence that will be sent | none |
 //! | `HEARTBEAT` 5 | source → mirror | last sequence published by the source | none |
 //!
 //! `HEARTBEAT` is sent while the ring is idle so a mirror can tell a quiet source from a
 //! dead link.
+//!
+//! ## UDP multicast (optional)
+//!
+//! With [`ReplicaServer::multicast`] the source sends every `DATA` frame once, as one UDP
+//! datagram to a multicast group, and every mirror receives it: the network cost no longer
+//! grows with the number of mirrors and no per-mirror TCP send sits between the ring and
+//! the wire. The TCP session stays for the handshake and for **retransmission**: a mirror
+//! that sees a sequence jump (a lost datagram, or history it asked for) sends `NAK` and
+//! the source answers with `DATA` from its ring, or `GAP` for what it no longer retains.
+//! Nothing is written to a mirror ring out of order.
+//!
+//! | kind | direction | `seq` | payload |
+//! |---|---|---|---|
+//! | `NAK` 6 | mirror → source (TCP) | first missing sequence | last missing sequence u64 |
+//! | `MULTICAST` 7 | source → mirror (TCP, after `GEOMETRY`) | none | group ipv4 [u8; 4], port u16, mtu u16, ttl u8, session u8, pad [u8; 6] |
+//!
+//! Multicast `DATA` and `HEARTBEAT` frames carry the source's one-byte `session` in
+//! `flags`, so datagrams from a previous incarnation of the source are ignored.
+//! `HEARTBEAT` datagrams are sent every millisecond while the ring is idle, which is how a
+//! lost *last* datagram is noticed.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::unix::io::AsRawFd;
+use std::net::{
+    Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle};
@@ -75,20 +98,36 @@ pub const REPLICATION_VERSION: u32 = 1;
 pub const HELLO_LATEST: u64 = 0;
 /// `HELLO` sequence asking for everything the source still retains.
 pub const HELLO_OLDEST: u64 = u64::MAX;
+/// Datagram budget for a 1500-byte MTU (IPv4 + UDP headers subtracted).
+pub const DEFAULT_MTU: usize = 1472;
 
 const FRAME_HEADER_LEN: usize = 16;
 const HELLO_LEN: usize = 16;
 const GEOMETRY_LEN: usize = 32;
+const NAK_LEN: usize = 8;
+const MULTICAST_LEN: usize = 16;
 const KIND_HELLO: u8 = 1;
 const KIND_GEOMETRY: u8 = 2;
 const KIND_DATA: u8 = 3;
 const KIND_GAP: u8 = 4;
 const KIND_HEARTBEAT: u8 = 5;
+const KIND_NAK: u8 = 6;
+const KIND_MULTICAST: u8 = 7;
 /// `GEOMETRY` flag: the mirror asked for a sequence the source has not reached.
 const GEOMETRY_RESET: u8 = 0x01;
+/// `GEOMETRY` flag: a `MULTICAST` frame follows; live data arrives by multicast.
+const GEOMETRY_MULTICAST: u8 = 0x02;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_BATCH: usize = 256;
+/// Largest datagram a mirror accepts (jumbo frames).
+const MAX_DATAGRAM: usize = 65_536;
+/// Most records one `NAK` asks for.
+const NAK_MAX: u64 = u16::MAX as u64;
+/// Out-of-order datagrams a mirror keeps while a hole is being filled.
+const PENDING_MAX: usize = 8192;
+/// How long a mirror sleeps in `poll` between checks when not busy-polling.
+const POLL_SLICE: Duration = Duration::from_millis(10);
 
 /// Geometry of a ring as exchanged during the handshake: everything a mirror needs to
 /// create an identical ring.
@@ -185,6 +224,99 @@ impl Geometry {
     }
 }
 
+/// Multicast delivery settings for a [`ReplicaServer`].
+#[derive(Debug, Clone, Copy)]
+pub struct MulticastConfig {
+    /// Multicast group, e.g. `239.255.0.1`.
+    pub group: Ipv4Addr,
+    pub port: u16,
+    /// Address of the local interface to send on; unspecified = the default route.
+    pub interface: Ipv4Addr,
+    /// Datagram budget including the 16-byte frame header: [`DEFAULT_MTU`] for a
+    /// 1500-byte link MTU, `8972` with jumbo frames.
+    pub mtu: usize,
+    pub ttl: u8,
+    /// `HEARTBEAT` interval while the ring is idle: how quickly a lost last datagram is
+    /// noticed.
+    pub heartbeat: Duration,
+    /// Fault injection for tests: skip every n-th datagram (0 = never).
+    #[doc(hidden)]
+    pub drop_every: u64,
+}
+
+impl MulticastConfig {
+    pub fn new(group: Ipv4Addr, port: u16) -> Self {
+        Self {
+            group,
+            port,
+            interface: Ipv4Addr::UNSPECIFIED,
+            mtu: DEFAULT_MTU,
+            ttl: 1,
+            heartbeat: Duration::from_millis(1),
+            drop_every: 0,
+        }
+    }
+
+    pub fn interface(mut self, interface: Ipv4Addr) -> Self {
+        self.interface = interface;
+        self
+    }
+
+    pub fn mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu.clamp(FRAME_HEADER_LEN + 8, MAX_DATAGRAM);
+        self
+    }
+
+    pub fn ttl(mut self, ttl: u8) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    pub fn heartbeat(mut self, heartbeat: Duration) -> Self {
+        self.heartbeat = heartbeat;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn drop_every(mut self, n: u64) -> Self {
+        self.drop_every = n;
+        self
+    }
+
+    fn encode(&self, session: u8, out: &mut [u8; MULTICAST_LEN]) {
+        out[0..4].copy_from_slice(&self.group.octets());
+        out[4..6].copy_from_slice(&self.port.to_le_bytes());
+        out[6..8].copy_from_slice(&(self.mtu.min(u16::MAX as usize) as u16).to_le_bytes());
+        out[8] = self.ttl;
+        out[9] = session;
+        out[10..16].fill(0);
+    }
+}
+
+/// What a mirror learns from the `MULTICAST` frame.
+#[derive(Debug, Clone, Copy)]
+struct MulticastInfo {
+    group: Ipv4Addr,
+    port: u16,
+    session: u8,
+}
+
+impl MulticastInfo {
+    fn decode(b: &[u8; MULTICAST_LEN]) -> Result<Self> {
+        let group = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+        if !group.is_multicast() {
+            return Err(RingfireError::Protocol(
+                "MULTICAST group is not a multicast address",
+            ));
+        }
+        Ok(Self {
+            group,
+            port: u16::from_le_bytes(b[4..6].try_into().unwrap()),
+            session: b[9],
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Frame {
     kind: u8,
@@ -230,22 +362,153 @@ fn protocol(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-/// `read_exact` that busy-polls a non-blocking socket when `spin` is set.
+// ---------------------------------------------------------------------------------------
+// Sockets
+// ---------------------------------------------------------------------------------------
+
+/// Blocks until one of `fds` is readable or `timeout` passes.
+fn wait_readable(fds: &[i32], timeout: Duration) {
+    let mut polls: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, ms) };
+}
+
+/// `read_exact` that also works on a non-blocking socket: between chunks it busy-polls
+/// when `spin` is set and sleeps in `poll` otherwise.
 fn read_full(stream: &mut TcpStream, buf: &mut [u8], spin: bool) -> io::Result<()> {
-    if !spin {
-        return stream.read_exact(buf);
-    }
     let mut filled = 0;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => core::hint::spin_loop(),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if spin {
+                    core::hint::spin_loop();
+                } else {
+                    wait_readable(&[stream.as_raw_fd()], POLL_SLICE);
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// `write_all` that also works on a non-blocking socket.
+fn write_full(stream: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let mut poll = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut poll, 1, POLL_SLICE.as_millis() as i32) };
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn set_sockopt<T>(fd: i32, level: i32, name: i32, value: &T) -> io::Result<()> {
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            (value as *const T).cast(),
+            std::mem::size_of::<T>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Sending socket for the multicast group described by `cfg`.
+fn multicast_sender(cfg: &MulticastConfig) -> io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+    sock.set_multicast_ttl_v4(u32::from(cfg.ttl))?;
+    sock.set_multicast_loop_v4(true)?;
+    if !cfg.interface.is_unspecified() {
+        let addr = libc::in_addr {
+            s_addr: u32::from(cfg.interface).to_be(),
+        };
+        set_sockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            &addr,
+        )?;
+    }
+    Ok(sock)
+}
+
+/// Non-blocking receiving socket joined to `group` on `interface`, sharing the port with
+/// other mirrors on the same host.
+fn multicast_receiver(
+    group: Ipv4Addr,
+    port: u16,
+    interface: Ipv4Addr,
+    rcvbuf: usize,
+) -> io::Result<UdpSocket> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor we own.
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)?;
+    #[cfg(not(target_os = "linux"))]
+    set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)?;
+    if rcvbuf > 0 {
+        let bytes = rcvbuf.min(i32::MAX as usize) as i32;
+        set_sockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &bytes)?;
+    }
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = u32::from(Ipv4Addr::UNSPECIFIED).to_be();
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            (&addr as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sock.join_multicast_v4(&group, &interface)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
+}
+
+fn send_datagram(sock: &UdpSocket, dest: SocketAddrV4, bytes: &[u8]) -> io::Result<()> {
+    loop {
+        match sock.send_to(bytes, dest) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => core::hint::spin_loop(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -320,6 +583,40 @@ impl SourceRing {
             RawRead::Overwritten(s1)
         }
     }
+
+    /// Reads up to `max` consecutive records from `cursor` into `buf` after the frame
+    /// header. Returns how many were read and whether the reader was lapped.
+    fn collect(&self, cursor: u64, max: usize, buf: &mut [u8]) -> (usize, Option<u64>) {
+        let payload_len = self.geometry.payload_len();
+        let mut count = 0usize;
+        while count < max {
+            let start = FRAME_HEADER_LEN + count * payload_len;
+            match self.read(cursor + count as u64, &mut buf[start..start + payload_len]) {
+                RawRead::Item => count += 1,
+                RawRead::Pending => break,
+                RawRead::Overwritten(seen) => return (count, Some(seen)),
+            }
+        }
+        (count, None)
+    }
+
+    /// Where a lapped reader continues.
+    fn resync(&self, seen: u64) -> u64 {
+        oldest_retained(self.write_seq().max(seen), self.view.capacity)
+    }
+}
+
+/// Encodes a `DATA` header for `count` records into `buf` and returns the whole frame.
+fn data_frame(buf: &mut [u8], flags: u8, count: usize, payload_len: usize, seq: u64) -> &[u8] {
+    let frame = Frame {
+        kind: KIND_DATA,
+        flags,
+        count: count as u16,
+        len: (count * payload_len) as u32,
+        seq,
+    };
+    buf[..FRAME_HEADER_LEN].copy_from_slice(&frame.encode());
+    &buf[..FRAME_HEADER_LEN + count * payload_len]
 }
 
 /// Single writer of a mirror ring, addressing slots by the source's sequence numbers.
@@ -463,12 +760,16 @@ impl MirrorRing {
 // ---------------------------------------------------------------------------------------
 
 /// Serves a ring to network mirrors. Each accepted connection gets its own thread and its
-/// own reader over the ring, so mirrors never wait for each other.
+/// own reader over the ring, so mirrors never wait for each other. With
+/// [`ReplicaServer::multicast`], live records go out once by UDP multicast and the
+/// connections only serve handshakes and retransmissions.
 pub struct ReplicaServer {
     ring_path: PathBuf,
     listener: TcpListener,
     batch: usize,
     spin: bool,
+    multicast: Option<MulticastConfig>,
+    session: u8,
 }
 
 impl ReplicaServer {
@@ -478,24 +779,38 @@ impl ReplicaServer {
         // Fail early on a missing or unsupported ring rather than at the first connection.
         SourceRing::open(&ring_path)?;
         let listener = TcpListener::bind(addr)?;
+        let session = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.subsec_nanos() ^ d.as_secs() as u32) as u8)
+            .unwrap_or(1);
         Ok(Self {
             ring_path,
             listener,
             batch: DEFAULT_BATCH,
             spin: false,
+            multicast: None,
+            session,
         })
     }
 
-    /// Maximum records per `DATA` frame (default 256, at most 65535).
+    /// Maximum records per `DATA` frame (default 256, at most 65535). With multicast the
+    /// datagram budget (`mtu`) caps it further.
     pub fn batch(mut self, batch: usize) -> Self {
         self.batch = batch.clamp(1, u16::MAX as usize);
         self
     }
 
     /// Busy-poll the ring when idle instead of backing off to sleeps: lowest latency, one
-    /// core per connected mirror.
+    /// core per connected mirror (one core in total with multicast).
     pub fn spin(mut self, spin: bool) -> Self {
         self.spin = spin;
+        self
+    }
+
+    /// Send live records by UDP multicast; TCP connections then only handle handshakes
+    /// and `NAK` retransmissions.
+    pub fn multicast(mut self, config: MulticastConfig) -> Self {
+        self.multicast = Some(config);
         self
     }
 
@@ -507,25 +822,45 @@ impl ReplicaServer {
         &self.ring_path
     }
 
+    /// Starts the multicast sender thread when configured.
+    fn start_multicast(&self) -> Result<()> {
+        let Some(cfg) = self.multicast else {
+            return Ok(());
+        };
+        let ring = SourceRing::open(&self.ring_path)?;
+        let (batch, spin, session) = (self.batch, self.spin, self.session);
+        thread::Builder::new()
+            .name("ringfire-multicast".into())
+            .spawn(move || {
+                if let Err(e) = multicast_loop(ring, cfg, session, batch, spin) {
+                    eprintln!("ringfire multicast sender stopped: {}", e);
+                }
+            })?;
+        Ok(())
+    }
+
     /// Accepts mirrors forever, serving each on its own thread.
     pub fn run(&self) -> Result<()> {
+        self.start_multicast()?;
         loop {
             let (stream, peer) = self.listener.accept()?;
             let ring = SourceRing::open(&self.ring_path)?;
-            let (batch, spin) = (self.batch, self.spin);
+            let (batch, spin, session) = (self.batch, self.spin, self.session);
+            let multicast = self.multicast;
             thread::Builder::new()
                 .name(format!("ringfire-serve-{}", peer))
                 .spawn(move || {
-                    let _ = serve_client(ring, stream, batch, spin);
+                    let _ = serve_client(ring, stream, batch, spin, multicast, session);
                 })?;
         }
     }
 
-    /// Accepts exactly one mirror and serves it on the calling thread until it disconnects.
+    /// Accepts exactly one mirror and serves it on the calling thread until it disconnects
+    /// (TCP delivery only; the multicast sender is not started).
     pub fn serve_one(&self) -> Result<()> {
         let (stream, _) = self.listener.accept()?;
         let ring = SourceRing::open(&self.ring_path)?;
-        serve_client(ring, stream, self.batch, self.spin)?;
+        serve_client(ring, stream, self.batch, self.spin, None, self.session)?;
         Ok(())
     }
 
@@ -537,11 +872,76 @@ impl ReplicaServer {
     }
 }
 
+/// Sends every new record once, to the multicast group, as it appears in the ring.
+fn multicast_loop(
+    ring: SourceRing,
+    cfg: MulticastConfig,
+    session: u8,
+    batch: usize,
+    spin: bool,
+) -> io::Result<()> {
+    let sock = multicast_sender(&cfg)?;
+    let dest = SocketAddrV4::new(cfg.group, cfg.port);
+    let payload_len = ring.geometry.payload_len();
+    let per_datagram = (cfg.mtu.saturating_sub(FRAME_HEADER_LEN) / payload_len)
+        .clamp(1, u16::MAX as usize)
+        .min(batch);
+    let mut buf = vec![0u8; FRAME_HEADER_LEN + per_datagram * payload_len];
+    let mut cursor = ring.write_seq() + 1;
+    let mut sent = 0u64;
+    let mut idle = 0u32;
+    let mut last_beat = Instant::now();
+    loop {
+        let (count, lapped) = ring.collect(cursor, per_datagram, &mut buf);
+        if count > 0 {
+            sent += 1;
+            if cfg.drop_every == 0 || !sent.is_multiple_of(cfg.drop_every) {
+                let frame = data_frame(&mut buf, session, count, payload_len, cursor);
+                send_datagram(&sock, dest, frame)?;
+            }
+            cursor += count as u64;
+            idle = 0;
+            last_beat = Instant::now();
+        }
+        if let Some(seen) = lapped {
+            // Mirrors notice the jump and NAK; the TCP side answers with GAP for what is
+            // no longer retained.
+            let resync = ring.resync(seen);
+            if resync > cursor {
+                cursor = resync;
+            }
+            continue;
+        }
+        if count == 0 {
+            if spin {
+                core::hint::spin_loop();
+            } else {
+                idle = idle.saturating_add(1);
+                if idle < 2000 {
+                    core::hint::spin_loop();
+                } else if idle < 4000 {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_micros(50));
+                }
+            }
+            if last_beat.elapsed() >= cfg.heartbeat {
+                let mut beat = Frame::control(KIND_HEARTBEAT, ring.write_seq());
+                beat.flags = session;
+                send_datagram(&sock, dest, &beat.encode())?;
+                last_beat = Instant::now();
+            }
+        }
+    }
+}
+
 fn serve_client(
     ring: SourceRing,
     mut stream: TcpStream,
     batch: usize,
     spin: bool,
+    multicast: Option<MulticastConfig>,
+    session: u8,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -566,16 +966,20 @@ fn serve_client(
     let capacity = ring.view.capacity;
     let write_seq = ring.write_seq();
     let oldest = oldest_retained(write_seq, capacity);
-    let (mut cursor, flags) = match hello.seq {
+    let (mut cursor, mut flags) = match hello.seq {
         HELLO_LATEST => (write_seq + 1, 0),
         HELLO_OLDEST => (oldest, 0),
         wanted if wanted > write_seq + 1 => (write_seq + 1, GEOMETRY_RESET),
         wanted => (wanted.max(oldest), 0),
     };
+    if multicast.is_some() {
+        flags |= GEOMETRY_MULTICAST;
+    }
 
     let mut geometry = [0u8; GEOMETRY_LEN];
     ring.geometry.encode(&mut geometry);
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + GEOMETRY_LEN);
+    let mut out =
+        Vec::with_capacity(FRAME_HEADER_LEN + GEOMETRY_LEN + FRAME_HEADER_LEN + MULTICAST_LEN);
     out.extend_from_slice(
         &Frame {
             kind: KIND_GEOMETRY,
@@ -587,44 +991,59 @@ fn serve_client(
         .encode(),
     );
     out.extend_from_slice(&geometry);
+    if let Some(cfg) = multicast {
+        let mut info = [0u8; MULTICAST_LEN];
+        cfg.encode(session, &mut info);
+        out.extend_from_slice(
+            &Frame {
+                kind: KIND_MULTICAST,
+                flags: 0,
+                count: 0,
+                len: MULTICAST_LEN as u32,
+                seq: 0,
+            }
+            .encode(),
+        );
+        out.extend_from_slice(&info);
+    }
     stream.write_all(&out)?;
 
     let payload_len = ring.geometry.payload_len();
     let batch = batch.clamp(1, u16::MAX as usize);
     let mut buf = vec![0u8; FRAME_HEADER_LEN + batch * payload_len];
+
+    if multicast.is_some() {
+        // Live data goes by multicast; answer retransmission requests until the mirror
+        // hangs up.
+        loop {
+            stream.read_exact(&mut hdr)?;
+            let frame = Frame::decode(&hdr);
+            match frame.kind {
+                KIND_NAK if frame.len as usize == NAK_LEN => {
+                    let mut to = [0u8; NAK_LEN];
+                    stream.read_exact(&mut to)?;
+                    let to = u64::from_le_bytes(to);
+                    serve_range(&ring, &mut stream, frame.seq, to, batch, &mut buf)?;
+                }
+                _ => return Err(protocol("expected NAK")),
+            }
+        }
+    }
+
     let mut idle = 0u32;
     let mut last_beat = Instant::now();
     loop {
-        let mut count = 0usize;
-        let mut lapped = None;
-        while count < batch {
-            let start = FRAME_HEADER_LEN + count * payload_len;
-            match ring.read(cursor + count as u64, &mut buf[start..start + payload_len]) {
-                RawRead::Item => count += 1,
-                RawRead::Pending => break,
-                RawRead::Overwritten(seen) => {
-                    lapped = Some(seen);
-                    break;
-                }
-            }
-        }
+        let (count, lapped) = ring.collect(cursor, batch, &mut buf);
         if count > 0 {
-            let frame = Frame {
-                kind: KIND_DATA,
-                flags: 0,
-                count: count as u16,
-                len: (count * payload_len) as u32,
-                seq: cursor,
-            };
-            buf[..FRAME_HEADER_LEN].copy_from_slice(&frame.encode());
-            stream.write_all(&buf[..FRAME_HEADER_LEN + count * payload_len])?;
+            let frame = data_frame(&mut buf, 0, count, payload_len, cursor);
+            stream.write_all(frame)?;
             cursor += count as u64;
             idle = 0;
             last_beat = Instant::now();
         }
         if let Some(seen) = lapped {
             // Resynchronize at the oldest message still retained and tell the mirror.
-            let resync = oldest_retained(ring.write_seq().max(seen), capacity);
+            let resync = ring.resync(seen);
             if resync > cursor {
                 stream.write_all(&Frame::control(KIND_GAP, resync).encode())?;
                 cursor = resync;
@@ -652,6 +1071,46 @@ fn serve_client(
     }
 }
 
+/// Answers a `NAK` for `[from, to]` from the ring: `GAP` for what is gone, `DATA` for the
+/// rest, stopping at anything not published yet (that part arrives by multicast).
+fn serve_range(
+    ring: &SourceRing,
+    stream: &mut TcpStream,
+    from: u64,
+    to: u64,
+    batch: usize,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let payload_len = ring.geometry.payload_len();
+    let mut cursor = from.max(1);
+    let oldest = oldest_retained(ring.write_seq(), ring.view.capacity);
+    if cursor < oldest {
+        stream.write_all(&Frame::control(KIND_GAP, oldest).encode())?;
+        cursor = oldest;
+    }
+    while cursor <= to {
+        let max = batch.min((to - cursor + 1) as usize);
+        let (count, lapped) = ring.collect(cursor, max, buf);
+        if count > 0 {
+            let frame = data_frame(buf, 0, count, payload_len, cursor);
+            stream.write_all(frame)?;
+            cursor += count as u64;
+        }
+        if let Some(seen) = lapped {
+            let resync = ring.resync(seen);
+            if resync > cursor {
+                stream.write_all(&Frame::control(KIND_GAP, resync).encode())?;
+                cursor = resync;
+            }
+            continue;
+        }
+        if count == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------
 // Mirror side
 // ---------------------------------------------------------------------------------------
@@ -677,6 +1136,9 @@ pub struct MirrorBuilder {
     start: MirrorStart,
     spin: bool,
     file_mode: u32,
+    interface: Ipv4Addr,
+    rcvbuf: usize,
+    nak_timeout: Duration,
 }
 
 impl Default for MirrorBuilder {
@@ -691,6 +1153,9 @@ impl MirrorBuilder {
             start: MirrorStart::Latest,
             spin: false,
             file_mode: 0o660,
+            interface: Ipv4Addr::UNSPECIFIED,
+            rcvbuf: 8 << 20,
+            nak_timeout: Duration::from_millis(20),
         }
     }
 
@@ -699,7 +1164,7 @@ impl MirrorBuilder {
         self
     }
 
-    /// Busy-poll the socket instead of blocking in the kernel: lowest latency, one core.
+    /// Busy-poll the sockets instead of blocking in the kernel: lowest latency, one core.
     pub fn spin(mut self, spin: bool) -> Self {
         self.spin = spin;
         self
@@ -708,6 +1173,24 @@ impl MirrorBuilder {
     /// Permission bits of the mirror ring file (default `0o660`).
     pub fn file_mode(mut self, mode: u32) -> Self {
         self.file_mode = mode;
+        self
+    }
+
+    /// Local interface address to receive multicast on (default: any).
+    pub fn interface(mut self, interface: Ipv4Addr) -> Self {
+        self.interface = interface;
+        self
+    }
+
+    /// Kernel receive buffer for the multicast socket (default 8 MiB).
+    pub fn rcvbuf(mut self, bytes: usize) -> Self {
+        self.rcvbuf = bytes;
+        self
+    }
+
+    /// How long to wait for a retransmission before repeating the `NAK` (default 20 ms).
+    pub fn nak_timeout(mut self, timeout: Duration) -> Self {
+        self.nak_timeout = timeout;
         self
     }
 
@@ -759,6 +1242,26 @@ impl MirrorBuilder {
         let geometry = Geometry::decode(&body)?;
         let reset = frame.flags & GEOMETRY_RESET != 0;
 
+        let mut udp = None;
+        let mut session = 0u8;
+        if frame.flags & GEOMETRY_MULTICAST != 0 {
+            stream.read_exact(&mut hdr)?;
+            let mc = Frame::decode(&hdr);
+            if mc.kind != KIND_MULTICAST || mc.len as usize != MULTICAST_LEN {
+                return Err(RingfireError::Protocol("expected MULTICAST"));
+            }
+            let mut info = [0u8; MULTICAST_LEN];
+            stream.read_exact(&mut info)?;
+            let info = MulticastInfo::decode(&info)?;
+            udp = Some(multicast_receiver(
+                info.group,
+                info.port,
+                self.interface,
+                self.rcvbuf,
+            )?);
+            session = info.session;
+        }
+
         let (ring, resumed) = match adopted {
             Some(ring) if !reset && ring.geometry.same_layout(&geometry) => (ring, true),
             other => {
@@ -768,41 +1271,67 @@ impl MirrorBuilder {
                 (ring, false)
             }
         };
-        if self.spin {
+        if self.spin || udp.is_some() {
             stream.set_nonblocking(true)?;
         }
         Ok(Mirror {
             stream,
+            udp,
+            session,
             ring: Some(ring),
             ring_path,
             geometry,
             spin: self.spin,
             file_mode: self.file_mode,
+            nak_timeout: self.nak_timeout,
             first_seq: frame.seq,
             resumed,
             source_seq: frame.seq.saturating_sub(1),
             frames: 0,
             gaps: 0,
+            datagrams: 0,
+            naks: 0,
+            retransmitted: 0,
+            nak: None,
+            pending: BTreeMap::new(),
             buf: Vec::new(),
+            dgram: vec![0u8; MAX_DATAGRAM],
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nak {
+    from: u64,
+    to: u64,
+    sent: Instant,
 }
 
 /// Maintains a mirror ring: receives records from a [`ReplicaServer`] and writes them
 /// into a local ring under the source's sequence numbers.
 pub struct Mirror {
     stream: TcpStream,
+    udp: Option<UdpSocket>,
+    session: u8,
     ring: Option<MirrorRing>,
     ring_path: PathBuf,
     geometry: Geometry,
     spin: bool,
     file_mode: u32,
+    nak_timeout: Duration,
     first_seq: u64,
     resumed: bool,
     source_seq: u64,
     frames: u64,
     gaps: u64,
+    datagrams: u64,
+    naks: u64,
+    retransmitted: u64,
+    nak: Option<Nak>,
+    /// Multicast datagrams that arrived ahead of a hole, by first sequence.
+    pending: BTreeMap<u64, Vec<u8>>,
     buf: Vec<u8>,
+    dgram: Vec<u8>,
 }
 
 /// Lets another thread stop a running [`Mirror`] by shutting its connection down.
@@ -845,6 +1374,11 @@ impl Mirror {
         self.stream.peer_addr()
     }
 
+    /// Whether live records arrive by multicast (with TCP only for retransmission).
+    pub fn is_multicast(&self) -> bool {
+        self.udp.is_some()
+    }
+
     /// First sequence the source agreed to send.
     pub fn first_sequence(&self) -> u64 {
         self.first_seq
@@ -871,9 +1405,24 @@ impl Mirror {
         self.gaps
     }
 
-    /// Frames received.
+    /// Frames received over TCP.
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// Multicast datagrams received.
+    pub fn datagrams(&self) -> u64 {
+        self.datagrams
+    }
+
+    /// Retransmission requests sent.
+    pub fn naks(&self) -> u64 {
+        self.naks
+    }
+
+    /// Records received by retransmission over TCP.
+    pub fn retransmitted(&self) -> u64 {
+        self.retransmitted
     }
 
     fn ring(&self) -> &MirrorRing {
@@ -890,8 +1439,12 @@ impl Mirror {
         Ok(())
     }
 
-    /// Processes one frame. `Ok(false)` once the source has closed the connection.
+    /// Processes what is available (one TCP frame, or every queued datagram).
+    /// `Ok(false)` once the source has closed the connection.
     pub fn step(&mut self) -> Result<bool> {
+        if self.udp.is_some() {
+            return self.step_multicast();
+        }
         let mut hdr = [0u8; FRAME_HEADER_LEN];
         match read_full(&mut self.stream, &mut hdr, self.spin) {
             Ok(()) => {}
@@ -902,18 +1455,7 @@ impl Mirror {
         self.frames += 1;
         match frame.kind {
             KIND_DATA => {
-                let payload_len = self.geometry.payload_len();
-                let count = frame.count as usize;
-                if count == 0 || frame.len as usize != count * payload_len {
-                    return Err(RingfireError::Protocol(
-                        "DATA length does not match its record count",
-                    ));
-                }
-                let total = count * payload_len;
-                if self.buf.len() < total {
-                    self.buf.resize(total, 0);
-                }
-                read_full(&mut self.stream, &mut self.buf[..total], self.spin)?;
+                let count = self.read_data_payload(frame)?;
                 let next = self.ring().next_seq;
                 if frame.seq < next {
                     // The source restarted its numbering underneath us: start over.
@@ -927,6 +1469,7 @@ impl Mirror {
                     self.gaps += 1;
                     self.ring_mut().skip_to(frame.seq);
                 }
+                let payload_len = self.geometry.payload_len();
                 let ring = self.ring.as_mut().expect("mirror ring");
                 for i in 0..count {
                     ring.write(
@@ -950,15 +1493,274 @@ impl Mirror {
         }
         Ok(true)
     }
+
+    /// Reads a `DATA` frame's records into `self.buf`; returns the record count.
+    fn read_data_payload(&mut self, frame: Frame) -> Result<usize> {
+        let payload_len = self.geometry.payload_len();
+        let count = frame.count as usize;
+        if count == 0 || frame.len as usize != count * payload_len {
+            return Err(RingfireError::Protocol(
+                "DATA length does not match its record count",
+            ));
+        }
+        let total = count * payload_len;
+        if self.buf.len() < total {
+            self.buf.resize(total, 0);
+        }
+        read_full(&mut self.stream, &mut self.buf[..total], self.spin)?;
+        Ok(count)
+    }
+
+    // --- multicast mode -----------------------------------------------------------------
+
+    fn step_multicast(&mut self) -> Result<bool> {
+        let mut progressed = false;
+        loop {
+            let received = {
+                let udp = self.udp.as_ref().expect("multicast socket");
+                udp.recv(&mut self.dgram)
+            };
+            match received {
+                Ok(n) => {
+                    progressed = true;
+                    self.datagrams += 1;
+                    let dgram = std::mem::take(&mut self.dgram);
+                    let result = self.handle_datagram(&dgram[..n]);
+                    self.dgram = dgram;
+                    result?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match self.try_read_frame() {
+            Ok(Some(frame)) => {
+                progressed = true;
+                self.frames += 1;
+                self.handle_control(frame)?;
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(nak) = self.nak
+            && nak.sent.elapsed() >= self.nak_timeout
+        {
+            self.send_nak(nak.from, nak.to)?;
+            progressed = true;
+        }
+        if !progressed {
+            if self.spin {
+                core::hint::spin_loop();
+            } else {
+                let udp_fd = self.udp.as_ref().expect("multicast socket").as_raw_fd();
+                wait_readable(
+                    &[udp_fd, self.stream.as_raw_fd()],
+                    self.nak_timeout.min(POLL_SLICE),
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// A frame header from the control connection if one is available now.
+    fn try_read_frame(&mut self) -> io::Result<Option<Frame>> {
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        let n = match self.stream.read(&mut hdr) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        if n < FRAME_HEADER_LEN {
+            read_full(&mut self.stream, &mut hdr[n..], self.spin)?;
+        }
+        Ok(Some(Frame::decode(&hdr)))
+    }
+
+    fn handle_control(&mut self, frame: Frame) -> Result<()> {
+        match frame.kind {
+            KIND_DATA => {
+                let count = self.read_data_payload(frame)?;
+                self.retransmitted += count as u64;
+                let payload = std::mem::take(&mut self.buf);
+                let result = self.apply(
+                    frame.seq,
+                    count,
+                    &payload[..count * self.geometry.payload_len()],
+                );
+                self.buf = payload;
+                result
+            }
+            KIND_GAP => {
+                if frame.seq > self.ring().next_seq {
+                    self.gaps += 1;
+                    self.ring_mut().skip_to(frame.seq);
+                    self.after_advance()
+                } else {
+                    Ok(())
+                }
+            }
+            KIND_HEARTBEAT => self.on_source_seq(frame.seq),
+            KIND_MULTICAST => Ok(()),
+            _ => Err(RingfireError::Protocol("unexpected frame kind")),
+        }
+    }
+
+    fn handle_datagram(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() < FRAME_HEADER_LEN {
+            return Ok(());
+        }
+        let frame = Frame::decode(bytes[..FRAME_HEADER_LEN].try_into().unwrap());
+        if frame.flags != self.session {
+            return Ok(());
+        }
+        match frame.kind {
+            KIND_DATA => {
+                let payload_len = self.geometry.payload_len();
+                let count = frame.count as usize;
+                let len = frame.len as usize;
+                if count == 0 || len != count * payload_len || bytes.len() < FRAME_HEADER_LEN + len
+                {
+                    return Ok(());
+                }
+                self.apply(
+                    frame.seq,
+                    count,
+                    &bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len],
+                )
+            }
+            KIND_HEARTBEAT => self.on_source_seq(frame.seq),
+            _ => Ok(()),
+        }
+    }
+
+    /// Writes `count` records starting at `seq` if they continue the ring; keeps them
+    /// aside and asks for the missing range otherwise.
+    fn apply(&mut self, seq: u64, count: usize, payload: &[u8]) -> Result<()> {
+        let payload_len = self.geometry.payload_len();
+        let next = self.ring().next_seq;
+        let end = seq + count as u64;
+        if end <= next {
+            return Ok(());
+        }
+        if seq > next {
+            if self.pending.len() < PENDING_MAX {
+                self.pending.entry(seq).or_insert_with(|| payload.to_vec());
+            }
+            return self.request(next, seq - 1);
+        }
+        let skip = (next - seq) as usize;
+        let ring = self.ring.as_mut().expect("mirror ring");
+        for i in skip..count {
+            ring.write(
+                seq + i as u64,
+                &payload[i * payload_len..(i + 1) * payload_len],
+            );
+        }
+        ring.publish();
+        self.source_seq = self.source_seq.max(end - 1);
+        self.after_advance()
+    }
+
+    /// After the write position moved: drop a satisfied `NAK` and apply queued datagrams
+    /// that now continue the ring.
+    fn after_advance(&mut self) -> Result<()> {
+        loop {
+            let next = self.ring().next_seq;
+            if let Some(nak) = self.nak
+                && next > nak.to
+            {
+                self.nak = None;
+            }
+            let Some((&seq, _)) = self.pending.first_key_value() else {
+                return Ok(());
+            };
+            let payload = self.pending.remove(&seq).expect("first pending entry");
+            let count = payload.len() / self.geometry.payload_len();
+            let end = seq + count as u64;
+            if end <= next {
+                continue;
+            }
+            if seq > next {
+                self.pending.insert(seq, payload);
+                return self.request(next, seq - 1);
+            }
+            let payload_len = self.geometry.payload_len();
+            let skip = (next - seq) as usize;
+            let ring = self.ring.as_mut().expect("mirror ring");
+            for i in skip..count {
+                ring.write(
+                    seq + i as u64,
+                    &payload[i * payload_len..(i + 1) * payload_len],
+                );
+            }
+            ring.publish();
+            self.source_seq = self.source_seq.max(end - 1);
+        }
+    }
+
+    fn on_source_seq(&mut self, seq: u64) -> Result<()> {
+        self.source_seq = self.source_seq.max(seq);
+        let next = self.ring().next_seq;
+        if seq >= next {
+            self.request(next, seq)?;
+        }
+        Ok(())
+    }
+
+    /// Makes sure a `NAK` for `[from, to]` is outstanding (one at a time, bounded).
+    fn request(&mut self, from: u64, to: u64) -> Result<()> {
+        let to = to.min(from + NAK_MAX - 1);
+        if let Some(nak) = self.nak
+            && nak.from == from
+            && nak.to >= to
+            && nak.sent.elapsed() < self.nak_timeout
+        {
+            return Ok(());
+        }
+        self.send_nak(from, to)
+    }
+
+    fn send_nak(&mut self, from: u64, to: u64) -> Result<()> {
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + NAK_LEN);
+        frame.extend_from_slice(
+            &Frame {
+                kind: KIND_NAK,
+                flags: 0,
+                count: 0,
+                len: NAK_LEN as u32,
+                seq: from,
+            }
+            .encode(),
+        );
+        frame.extend_from_slice(&to.to_le_bytes());
+        write_full(&mut self.stream, &frame)?;
+        self.nak = Some(Nak {
+            from,
+            to,
+            sent: Instant::now(),
+        });
+        self.naks += 1;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mirror")
             .field("path", &self.ring_path)
+            .field("multicast", &self.udp.is_some())
             .field("sequence", &self.sequence())
             .field("source_sequence", &self.source_seq)
             .field("gaps", &self.gaps)
+            .field("naks", &self.naks)
             .finish()
     }
 }

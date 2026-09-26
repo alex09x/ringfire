@@ -6,12 +6,14 @@
 //!
 //! ```text
 //! cargo run --release --example replication_latency [-- --paced-us 100 --samples 20000]
+//!     [--multicast 239.255.0.1:7401 --iface LOCAL_ADDR]
 //! ```
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ringfire::replication::{Mirror, MirrorStart, ReplicaServer};
+use ringfire::replication::{Mirror, MirrorStart, MulticastConfig, ReplicaServer};
 use ringfire::{RingConsumer, RingProducer};
 
 #[derive(Debug, Clone, Copy)]
@@ -32,9 +34,19 @@ fn main() {
     let mut paced_us = 100u64;
     let mut samples = 20_000usize;
     let mut burst = 2_000_000u64;
+    let mut multicast: Option<SocketAddrV4> = None;
+    let mut iface = Ipv4Addr::UNSPECIFIED;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--multicast" if i + 1 < args.len() => {
+                multicast = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
+            "--iface" if i + 1 < args.len() => {
+                iface = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             "--paced-us" if i + 1 < args.len() => {
                 paced_us = args[i + 1].parse().unwrap();
                 i += 2;
@@ -59,16 +71,25 @@ fn main() {
     let _ = std::fs::remove_file(&copy);
 
     let mut producer = RingProducer::<Msg>::create(&source, 1 << 16).unwrap();
-    let server = ReplicaServer::bind(&source, "127.0.0.1:0")
+    let mut server = ReplicaServer::bind(&source, "127.0.0.1:0")
         .unwrap()
         .spin(true);
+    if let Some(group) = multicast {
+        server = server.multicast(MulticastConfig::new(*group.ip(), group.port()).interface(iface));
+    }
     let addr = server.local_addr().unwrap();
     server.spawn().unwrap();
     let mut mirror = Mirror::builder()
         .start(MirrorStart::Latest)
         .spin(true)
+        .interface(iface)
         .connect(addr, &copy)
         .unwrap();
+    let transport = if mirror.is_multicast() {
+        "multicast"
+    } else {
+        "tcp"
+    };
     let handle = mirror.handle().unwrap();
     let mirror_thread = thread::spawn(move || {
         let _ = mirror.run();
@@ -108,8 +129,9 @@ fn main() {
     let mut producer = pacer.join().unwrap();
     lat.sort_unstable();
     println!(
-        "paced ({} us): one-way source ring -> mirror ring, {} samples, {} B slots",
+        "paced ({} us, {}): one-way source ring -> mirror ring, {} samples, {} B slots",
         paced_us,
+        transport,
         samples,
         std::mem::size_of::<Msg>() + 8
     );
