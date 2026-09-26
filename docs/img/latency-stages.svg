@@ -1,0 +1,30 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 940 318' width='940' height='318' font-family='JetBrains Mono, SFMono-Regular, Menlo, monospace' font-size='12'>
+<defs><marker id='a' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1f2328'/></marker><marker id='n' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1d4ed8'/></marker><marker id='r' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#c0392b'/></marker></defs>
+<rect width='940' height='318' fill='white'/>
+<text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>push on the source → read by a consumer, p50, 1,000 msg/s</text>
+<text x='16' y='42' fill='#6a737d'>microseconds; two Ryzen 9 7950X hosts on a 1 GbE LAN, kernel network stack, busy-polling</text>
+<text x='390' y='71' text-anchor='end' fill='#1f2328'>consumer on the source host, same ring</text>
+<rect x='400' y='58' width='2.0' height='20' fill='#c0392b' rx='2'/>
+<text x='406.9' y='71' fill='#1f2328'>0.1</text>
+<text x='390' y='101' text-anchor='end' fill='#1f2328'>mirror on the same host, multicast</text>
+<rect x='400' y='88' width='33.0' height='20' fill='#1d4ed8' rx='2'/>
+<text x='439.0' y='101' fill='#1f2328'>3.8</text>
+<text x='390' y='131' text-anchor='end' fill='#1f2328'>mirror on the same host, TCP</text>
+<rect x='400' y='118' width='78.3' height='20' fill='#8fa3b8' rx='2'/>
+<text x='484.3' y='131' fill='#1f2328'>9</text>
+<text x='390' y='161' text-anchor='end' fill='#1f2328'>mirror on the same host, UDP unicast</text>
+<rect x='400' y='148' width='89.6' height='20' fill='#1d4ed8' rx='2'/>
+<text x='495.6' y='161' fill='#1f2328'>10.3</text>
+<text x='390' y='191' text-anchor='end' fill='#1f2328'>mirror on another LAN host, multicast (each of 6)</text>
+<rect x='400' y='178' width='260.9' height='20' fill='#1d4ed8' rx='2'/>
+<text x='666.9' y='191' fill='#1f2328'>30</text>
+<text x='390' y='221' text-anchor='end' fill='#1f2328'>mirror on another LAN host, TCP</text>
+<rect x='400' y='208' width='278.3' height='20' fill='#8fa3b8' rx='2'/>
+<text x='684.3' y='221' fill='#1f2328'>32</text>
+<text x='390' y='251' text-anchor='end' fill='#1f2328'>mirror on another LAN host, UDP unicast (each of 6)</text>
+<rect x='400' y='238' width='373.9' height='20' fill='#1d4ed8' rx='2'/>
+<text x='779.9' y='251' fill='#1f2328'>43</text>
+<text x='390' y='281' text-anchor='end' fill='#1f2328'>leaf behind a hub on another host, unicast twice</text>
+<rect x='400' y='268' width='460.0' height='20' fill='#1d4ed8' rx='2'/>
+<text x='866.0' y='281' fill='#1f2328'>52.9</text>
+</svg>

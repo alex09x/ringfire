@@ -1,0 +1,42 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 920 420' width='920' height='420' font-family='JetBrains Mono, SFMono-Regular, Menlo, monospace' font-size='12'>
+<defs><marker id='a' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1f2328'/></marker><marker id='n' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1d4ed8'/></marker><marker id='r' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#c0392b'/></marker></defs>
+<rect width='920' height='420' fill='white'/>
+<text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>Between sites and into a cloud: cross the network once per site</text>
+<text x='16' y='42' fill='#6a737d'>UDP unicast with NAT punching and duplicated datagrams over the WAN; a hub mirror serves the site</text>
+<rect x='16' y='60' width='230' height='150' rx='10' fill='#f6f8fa' stroke='#d0d7de'/><text x='28' y='80' fill='#1f2328' font-weight='bold' font-size='13'>Tokyo: source</text>
+<rect x='30' y='100' width='74' height='40' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='67.0' y='125.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>producer</text>
+<line x1='104' y1='120' x2='128' y2='120' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='128' y='92' width='100' height='56' rx='6' fill='#fdecea' stroke='#c0392b' stroke-width='1.5'/><text x='178.0' y='118.0' text-anchor='middle' fill='#1f2328' font-size='12' font-weight='bold'>ring</text><text x='178.0' y='134.0' text-anchor='middle' fill='#6a737d' font-size='11'>/dev/shm</text>
+<text x='128' y='168' fill='#6a737d' font-size='11'>serve --udp 7403</text>
+<text x='128' y='184' fill='#6a737d' font-size='11'>      --dup 2</text>
+<rect x='256' y='70' width='170' height='150' rx='10' fill='#e8efff' stroke='#1d4ed8' stroke-dasharray='4 3'/>
+<text x='341' y='92' text-anchor='middle' fill='#1d4ed8' font-weight='bold'>internet, 100 ms</text>
+<line x1='228' y1='112' x2='436' y2='112' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/><text x='332.0' y='105' text-anchor='middle' fill='#1d4ed8' font-size='11'>every datagram twice</text>
+<line x1='436' y1='150' x2='228' y2='150' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)' stroke-dasharray='4 3'/>
+<text x='341' y='168' text-anchor='middle' fill='#1d4ed8' font-size='11'>PUNCH opens the NAT; NAK</text>
+<text x='341' y='206' text-anchor='middle' fill='#6a737d' font-size='11'>one copy per site</text>
+<rect x='436' y='60' width='468' height='270' rx='10' fill='#f6f8fa' stroke='#d0d7de'/><text x='448' y='80' fill='#1f2328' font-weight='bold' font-size='13'>AWS: hub + instances (no multicast in a VPC)</text>
+<rect x='452' y='92' width='70' height='36' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='487.0' y='108.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>mirror</text><text x='487.0' y='124.0' text-anchor='middle' fill='#6a737d' font-size='11'>--unicast</text>
+<line x1='522' y1='110' x2='548' y2='110' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='548' y='92' width='84' height='36' rx='6' fill='#fdecea' stroke='#c0392b' stroke-width='1.5'/><text x='590.0' y='115.0' text-anchor='middle' fill='#1f2328' font-size='12' font-weight='bold'>ring</text>
+<text x='590' y='146' text-anchor='middle' fill='#6a737d' font-size='11'>serve --udp 7403</text>
+<line x1='632' y1='110' x2='690' y2='188' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/>
+<rect x='690' y='170' width='60' height='36' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='720.0' y='193.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>mirror</text>
+<line x1='750' y1='188' x2='774' y2='188' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='774' y='173' width='56' height='30' rx='6' fill='#fdecea' stroke='#c0392b' stroke-width='1.5'/><text x='802.0' y='193.0' text-anchor='middle' fill='#1f2328' font-size='12' font-weight='bold'>ring</text>
+<line x1='830' y1='188' x2='848' y2='188' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='848' y='173' width='48' height='30' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='872.0' y='193.0' text-anchor='middle' fill='#1f2328' font-size='10' font-weight='bold'>readers</text>
+<line x1='632' y1='110' x2='690' y2='238' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/>
+<rect x='690' y='220' width='60' height='36' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='720.0' y='243.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>mirror</text>
+<line x1='750' y1='238' x2='774' y2='238' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='774' y='223' width='56' height='30' rx='6' fill='#fdecea' stroke='#c0392b' stroke-width='1.5'/><text x='802.0' y='243.0' text-anchor='middle' fill='#1f2328' font-size='12' font-weight='bold'>ring</text>
+<line x1='830' y1='238' x2='848' y2='238' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='848' y='223' width='48' height='30' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='872.0' y='243.0' text-anchor='middle' fill='#1f2328' font-size='10' font-weight='bold'>readers</text>
+<line x1='632' y1='110' x2='690' y2='288' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/>
+<rect x='690' y='270' width='60' height='36' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='720.0' y='293.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>mirror</text>
+<line x1='750' y1='288' x2='774' y2='288' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='774' y='273' width='56' height='30' rx='6' fill='#fdecea' stroke='#c0392b' stroke-width='1.5'/><text x='802.0' y='293.0' text-anchor='middle' fill='#1f2328' font-size='12' font-weight='bold'>ring</text>
+<line x1='830' y1='288' x2='848' y2='288' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<rect x='848' y='273' width='48' height='30' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='872.0' y='293.0' text-anchor='middle' fill='#1f2328' font-size='10' font-weight='bold'>readers</text>
+<text x='20' y='356' fill='#6a737d' font-size='12'>Measured Tokyo → Los Angeles, 1,000 msg/s: TCP one-way p50 50.4 ms but p99 99.6 ms (a full extra round trip for one</text><text x='20' y='373' fill='#6a737d' font-size='12'>record in a hundred); UDP unicast p50 51.7 ms, p99 51.7 ms, max 61 ms; sent twice, max 58 ms. Through a hub on the</text><text x='20' y='390' fill='#6a737d' font-size='12'>LAN: 52.9 µs end to end against 10.3 µs direct, i.e. the hub costs its two hops and nothing of its own.</text>
+</svg>

@@ -403,22 +403,9 @@ host and never touch the network. Records travel as raw slot bytes, so one
 variable-length (`BlobProducer` rings included). The full design, the story of what the
 stress tests found and every measurement are in [docs/replication.md](docs/replication.md).
 
-```mermaid
-flowchart LR
-    subgraph src["source host"]
-        P[producer] --> R[("ring in /dev/shm")]
-        R --> S["ringfire serve"]
-        R --> L[local readers]
-    end
-    S -- "records, in order" --> M1["ringfire mirror"]
-    S --> M2["ringfire mirror"]
-    subgraph h1["mirror host 1"]
-        M1 --> R1[("identical ring")] --> C1[readers]
-    end
-    subgraph h2["mirror host 2"]
-        M2 --> R2[("identical ring")] --> C2[readers]
-    end
-```
+![One record's path from the source ring to a mirror ring, with the measured latency at each distance](docs/img/mirror-pipeline.svg)
+
+![On a LAN, one multicast datagram reaches every mirror host through the switch](docs/img/topology-lan.svg)
 
 #### Choosing how records travel
 
@@ -442,18 +429,7 @@ A mirror is an ordinary ring, so a site runs one mirror over the WAN and serves 
 locally. One copy crosses the ocean however many readers the site has, and every hop
 keeps the source's sequence numbers.
 
-```mermaid
-flowchart LR
-    subgraph tokyo["Tokyo: source"]
-        P[producer] --> R[("ring")] --> S["serve --udp 7403 --dup 2"]
-    end
-    S -- "UDP unicast, every datagram twice<br/>NAK / GAP over TCP" --> H
-    subgraph aws["AWS: one hub, N instances"]
-        H["mirror --unicast"] --> HR[("ring")] --> HS["serve --udp 7403"]
-        HS --> I1["mirror --unicast"] --> R1[("ring")] --> C1[readers]
-        HS --> I2["mirror --unicast"] --> R2[("ring")] --> C2[readers]
-    end
-```
+![Between sites: UDP unicast with NAT punching across the ocean, then a hub mirror serves the instances inside the cloud](docs/img/topology-wan-hub.svg)
 
 Measured through such a hub on the LAN: 52.9 µs p50 end to end against 10.3 µs for a
 direct mirror, i.e. the hub costs its two network hops and nothing of its own. (VPCs have
