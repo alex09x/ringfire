@@ -37,6 +37,32 @@ fn multicast(index: u16) -> MulticastConfig {
     MulticastConfig::new(Ipv4Addr::new(239, 255, 42, 1 + index as u8), base + index)
 }
 
+/// Whether a datagram sent to `cfg`'s group comes back to a joined socket on this host
+/// within a moment. GitHub's macOS runners, for one, have no multicast route at all.
+fn multicast_works(cfg: &MulticastConfig) -> bool {
+    use std::net::UdpSocket;
+    let Ok(rx) = UdpSocket::bind(("0.0.0.0", cfg.port)) else {
+        return false;
+    };
+    if rx
+        .join_multicast_v4(&cfg.group, &Ipv4Addr::UNSPECIFIED)
+        .is_err()
+    {
+        return false;
+    }
+    rx.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let Ok(tx) = UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let _ = tx.set_multicast_loop_v4(true);
+    if tx.send_to(b"probe", (cfg.group, cfg.port)).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    matches!(rx.recv(&mut buf), Ok(5))
+}
+
 fn start_server(path: &PathBuf, cfg: MulticastConfig) -> SocketAddr {
     let server = ReplicaServer::bind(path, "127.0.0.1:0")
         .unwrap()
@@ -85,6 +111,17 @@ fn push_paced(producer: &mut RingProducer<Tick>, range: std::ops::RangeInclusive
 }
 
 /// Multicast needs a multicast-capable route; skip (not fail) where there is none.
+/// Skips a test on hosts without multicast delivery (prints why, returns `None`).
+fn multicast_or_skip(index: u16) -> Option<MulticastConfig> {
+    let cfg = multicast(index);
+    if multicast_works(&cfg) {
+        Some(cfg)
+    } else {
+        eprintln!("skipping multicast test: no multicast delivery on this host");
+        None
+    }
+}
+
 fn connect_or_skip(addr: SocketAddr, copy: &PathBuf, start: MirrorStart) -> Option<Mirror> {
     match Mirror::builder().start(start).connect(addr, copy) {
         Ok(mirror) => {
@@ -106,7 +143,10 @@ fn multicast_delivers_live_records_in_order() {
     let _ = std::fs::remove_file(&copy);
 
     let mut producer = RingProducer::<Tick>::create(&source, 1 << 16).unwrap();
-    let addr = start_server(&source, multicast(0));
+    let Some(cfg) = multicast_or_skip(0) else {
+        return;
+    };
+    let addr = start_server(&source, cfg);
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
         return;
     };
@@ -142,7 +182,10 @@ fn multicast_history_is_fetched_over_tcp_then_live_continues() {
 
     let mut producer = RingProducer::<Tick>::create(&source, 1 << 16).unwrap();
     push_paced(&mut producer, 1..=5_000);
-    let addr = start_server(&source, multicast(1));
+    let Some(cfg) = multicast_or_skip(1) else {
+        return;
+    };
+    let addr = start_server(&source, cfg);
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Oldest) else {
         return;
     };
@@ -185,7 +228,10 @@ fn multicast_recovers_dropped_datagrams_in_order() {
     let mut producer = RingProducer::<Tick>::create(&source, 1 << 16).unwrap();
     // Every third datagram is dropped on purpose; the mirror must NAK and still deliver
     // everything in order.
-    let addr = start_server(&source, multicast(2).drop_every(3));
+    let Some(cfg) = multicast_or_skip(2) else {
+        return;
+    };
+    let addr = start_server(&source, cfg.drop_every(3));
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
         return;
     };
@@ -223,7 +269,10 @@ fn multicast_last_datagram_loss_is_recovered_by_heartbeat() {
     let mut producer = RingProducer::<Tick>::create(&source, 1 << 12).unwrap();
     // Drop every second datagram: with one record per push and pauses in between, the
     // lost datagram is regularly the last one, so only the heartbeat can reveal it.
-    let addr = start_server(&source, multicast(3).drop_every(2));
+    let Some(cfg) = multicast_or_skip(3) else {
+        return;
+    };
+    let addr = start_server(&source, cfg.drop_every(2));
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
         return;
     };
@@ -256,7 +305,10 @@ fn multicast_lapped_source_yields_gaps_but_never_disorder() {
     // mirrors see jumps, NAK old ranges and get GAP for what is gone. Every delivered
     // record must still be intact and strictly increasing.
     let mut producer = RingProducer::<Tick>::create(&source, 16).unwrap();
-    let addr = start_server(&source, multicast(4));
+    let Some(cfg) = multicast_or_skip(4) else {
+        return;
+    };
+    let addr = start_server(&source, cfg);
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Oldest) else {
         return;
     };
@@ -312,7 +364,9 @@ fn multicast_ignores_datagrams_from_another_session() {
     let _ = std::fs::remove_file(&copy);
 
     let mut producer = RingProducer::<Tick>::create(&source, 1024).unwrap();
-    let cfg = multicast(5);
+    let Some(cfg) = multicast_or_skip(5) else {
+        return;
+    };
     let addr = start_server(&source, cfg);
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
         return;
@@ -393,7 +447,10 @@ fn multicast_reordered_datagrams_are_written_in_order() {
     // seeing a later sequence before an earlier one. The ring must still be written
     // strictly in order and no record may be lost.
     let mut producer = RingProducer::<Tick>::create(&source, 1 << 16).unwrap();
-    let addr = start_server(&source, multicast(6).swap_every(4));
+    let Some(cfg) = multicast_or_skip(6) else {
+        return;
+    };
+    let addr = start_server(&source, cfg.swap_every(4));
     let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
         return;
     };

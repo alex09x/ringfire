@@ -494,6 +494,19 @@ fn protocol(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
+/// Whether an I/O error means the peer is gone (a clean end for a mirror, not a failure).
+/// A source that closes while a `NAK` sits unread in its socket answers with a reset,
+/// so resets count as well as end-of-file.
+fn peer_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 // ---------------------------------------------------------------------------------------
 // Sockets
 // ---------------------------------------------------------------------------------------
@@ -1328,7 +1341,11 @@ impl ReplicaServer {
             thread::Builder::new()
                 .name(format!("ringfire-serve-{}", peer))
                 .spawn(move || {
-                    let _ = serve_client(ring, stream, batch, spin, linger, offer, session);
+                    if let Err(e) = serve_client(ring, stream, batch, spin, linger, offer, session)
+                        && e.kind() != io::ErrorKind::UnexpectedEof
+                    {
+                        eprintln!("ringfire serve: mirror {} dropped: {}", peer, e);
+                    }
                 })?;
         }
     }
@@ -2151,7 +2168,7 @@ impl Mirror {
         let mut hdr = [0u8; FRAME_HEADER_LEN];
         match read_full(&mut self.stream, &mut hdr, self.spin) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) if peer_gone(&e) => return Ok(false),
             Err(e) => return Err(e.into()),
         }
         let frame = Frame::decode(&hdr);
@@ -2160,9 +2177,7 @@ impl Mirror {
             KIND_DATA => {
                 let (count, len) = match self.read_data_payload(frame) {
                     Ok(sizes) => sizes,
-                    Err(RingfireError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        return Ok(false);
-                    }
+                    Err(RingfireError::Io(e)) if peer_gone(&e) => return Ok(false),
                     Err(e) => return Err(e),
                 };
                 let next = self.ring().next_seq;
@@ -2286,7 +2301,11 @@ impl Mirror {
                     let dgram = std::mem::take(&mut self.dgram);
                     let result = self.handle_datagram(&dgram[..n]);
                     self.dgram = dgram;
-                    result?;
+                    match result {
+                        Ok(()) => {}
+                        Err(RingfireError::Io(e)) if peer_gone(&e) => return Ok(false),
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -2299,20 +2318,22 @@ impl Mirror {
                 self.frames += 1;
                 match self.handle_control(frame) {
                     Ok(()) => {}
-                    Err(RingfireError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        return Ok(false);
-                    }
+                    Err(RingfireError::Io(e)) if peer_gone(&e) => return Ok(false),
                     Err(e) => return Err(e),
                 }
             }
             Ok(None) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) if peer_gone(&e) => return Ok(false),
             Err(e) => return Err(e.into()),
         }
         if let Some(nak) = self.nak
             && nak.sent.elapsed() >= self.nak_timeout
         {
-            self.send_nak(nak.from, nak.to)?;
+            match self.send_nak(nak.from, nak.to) {
+                Ok(()) => {}
+                Err(RingfireError::Io(e)) if peer_gone(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            }
             progressed = true;
         }
         if let Some(punch) = self.punch.as_mut() {

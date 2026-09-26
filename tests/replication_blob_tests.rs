@@ -33,6 +33,32 @@ fn multicast(index: u16) -> MulticastConfig {
     MulticastConfig::new(Ipv4Addr::new(239, 255, 44, 1 + index as u8), base + index)
 }
 
+/// Whether a datagram sent to `cfg`'s group comes back to a joined socket on this host
+/// within a moment. GitHub's macOS runners, for one, have no multicast route at all.
+fn multicast_works(cfg: &MulticastConfig) -> bool {
+    use std::net::UdpSocket;
+    let Ok(rx) = UdpSocket::bind(("0.0.0.0", cfg.port)) else {
+        return false;
+    };
+    if rx
+        .join_multicast_v4(&cfg.group, &Ipv4Addr::UNSPECIFIED)
+        .is_err()
+    {
+        return false;
+    }
+    rx.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let Ok(tx) = UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let _ = tx.set_multicast_loop_v4(true);
+    if tx.send_to(b"probe", (cfg.group, cfg.port)).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    matches!(rx.recv(&mut buf), Ok(5))
+}
+
 fn start_server(path: &PathBuf, cfg: Option<MulticastConfig>) -> SocketAddr {
     let mut server = ReplicaServer::bind(path, "127.0.0.1:0").unwrap();
     if let Some(cfg) = cfg {
@@ -143,7 +169,12 @@ fn blob_ring_is_mirrored_by_multicast_with_payloads_beyond_a_datagram() {
     // what one datagram can carry at all and must come back over TCP.
     let max = 70_000;
     let mut producer = BlobProducer::<Meta>::create(&source, 1024, 1 << 26).unwrap();
-    let addr = start_server(&source, Some(multicast(0)));
+    let cfg = multicast(0);
+    if !multicast_works(&cfg) {
+        eprintln!("skipping multicast test: no multicast delivery on this host");
+        return;
+    }
+    let addr = start_server(&source, Some(cfg));
     let mut mirror = match Mirror::builder()
         .start(MirrorStart::Latest)
         .connect(addr, &copy)
