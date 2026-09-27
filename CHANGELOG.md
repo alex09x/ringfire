@@ -18,6 +18,12 @@ Documentation release; library behavior and wire protocols are unchanged from v0
 - README and network mirror guide use the figures alongside measured results and recipes.
 - The published crate now includes the illustrated documentation added after v0.5.0.
 
+### Fixed
+- Correct the GAP direction and multicast fan-out labels in the diagrams.
+- Match charts to the documented measurements: per-mirror median ranges, the tested
+  pacing settings, and WAN precision. Remove an unsupported unpaced 100,000/s point.
+- Write generated SVGs explicitly as UTF-8.
+
 ## [0.5.0] - 2026-09-26
 
 Network mirrors: a ring on one host, identical copies with the same sequence numbers on

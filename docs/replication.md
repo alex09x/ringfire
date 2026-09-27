@@ -142,11 +142,13 @@ master's own host) stamp the read. Slave clocks are translated into the master's
 a PTP-style offset from the minimum-round-trip probe, so cross-host figures carry a
 few microseconds of systematic uncertainty; same-host figures are exact.
 
-| Stage, 1,000 msg/s | multicast | UDP unicast | TCP |
+| Stage, 1,000 msg/s (p50 per mirror) | multicast | UDP unicast | TCP |
 | :--- | ---: | ---: | ---: |
 | push → read by a consumer on the master | 0.1 µs | 0.1 µs | 0.1 µs |
 | push → read on a mirror on the same host | 3.8–4.1 µs | 8.8–21 µs | 9 µs |
 | push → read on each of six mirrors on the other host | 29.6–32.4 µs | 38–48 µs | 31–34 µs |
+
+The ranges span the medians of the mirrors in that group.
 
 Multicast is one `sendto` per frame regardless of mirrors; unicast is one per mirror,
 about 1.5 µs each, so later mirrors in the list wait longer.
@@ -219,6 +221,7 @@ sending twice trims the last of the tail. The NAT was punched on the first try.
 Master on the first host, hub on the second (`ringfire mirror --unicast` and
 `ringfire serve --udp` on the same ring), leaf back on the first host, unicast on both
 hops; a direct mirror on the first host measured the same records for reference.
+The run published 1,000 records/s for 5 seconds.
 
 | Path | p50 | p99 | max |
 | :--- | ---: | ---: | ---: |
