@@ -66,12 +66,15 @@ it even when a child fails.
   panics.
 - **`ipc_rtt_64B/<transport>`**: one round trip of a 64-byte message, bench thread to
   echo thread, over ringfire (busy spin or `FutexWait`), a Unix domain socket, a pipe
-  pair and TCP loopback with `TCP_NODELAY`. Replies are checked by sequence. A failing
-  stream echo closes its end, so the bench's read fails instead of blocking; the ringfire
-  echo thread aborts the process if it panics.
+  pair and TCP loopback with `TCP_NODELAY`. Replies are checked for sequence and all 64 bytes on every transport. A failing
+  stream echo closes its end; a whole-case watchdog also covers live but stalled peers
+  and helper-thread teardown, without per-operation counters or clock reads.
 
 `black_box` wraps every message or payload a bench receives, and every input a bench
-pushes.
+pushes. Sequence validation and loop overhead are included in reported receive costs;
+batch validation checks its length and endpoint sequences. A watchdog bounds each
+Criterion group/case, including warm-up, sampling and teardown, to 900 seconds by default
+(`RINGFIRE_BENCH_WATCHDOG_SECS` overrides it). Cancellation wakes the watchdog immediately.
 
 ### Running
 
@@ -133,15 +136,16 @@ Samples are taken from the first arrival of each sequence only.
 - **`replication_stress`**: the pinger's monotonic clock stamps pushes and echo arrivals.
 - **`replication_stages`**: records carry the master's wall clock (`SystemTime`) because
   slaves on other hosts must read the same stamp.
-  - The master-local stage reads the same host's wall clock at both ends.
+  - The master-local stage and echo round trips use the master's monotonic `Instant` epoch.
   - A slave converts its clock with an offset estimated before the run (minimum round-trip
     probe). The residual error is the path asymmetry plus drift during the run. The slave
     estimates the offset again after the run and prints `offset_change_us`: a change that
     is not small next to the latencies invalidates that slave's figures. Endpoint probes
     cannot bound transient drift or wall-clock steps during the run; retain RTT results
     and treat negative/unstable corrected samples as invalid.
-  - The round trip via a slave is stamped by the master's wall clock at both ends, so it
-    needs no offset.
+  - The round trip via a slave uses the master's monotonic clock, so it needs no offset
+    and is unaffected by wall-clock adjustments. Failed clock probes terminate the slave
+    measurement; no fabricated zero offset is published.
   - Push stamps are published through a lock-free table. Before this revision the master
     took a mutex between stamping and pushing, and that mutex was shared with the echo
     handlers, so contention could delay a push after its stamp.
@@ -187,13 +191,18 @@ excludes setup, bounded spin waits, and unique, self-removing ring paths.
 | :--- | :--- | :--- |
 | `try_recv` 6.4 ns, `recv_batch(32)` 2.3 ns/msg (74.2 ns) | README | **Withdrawn**: defect 2. Pending re-measurement. |
 | SPMC recv 83.74 M msg/s (11.94 ns) | ROADMAP (v0.1 history) | **Withdrawn**: same harness. |
-| `push` 1.88 ns, push with a reader 41 / 42 ns, blackboard 2.1 / 1.1 ns, ping-pong 249.6 ns, `ipc_compare` round trips | README | Harness definition unchanged by the fixes (checks added only). Not re-measured in this revision. |
+| `push` 1.88 ns, push with a reader 41 / 42 ns, blackboard 2.1 / 1.1 ns, ping-pong 249.6 ns, `ipc_compare` round trips | README | Historical x86-64 results; validation cost in IPC now includes the full payload. Do not compare directly with corrected ARM results. |
 | Replication round trips, stress and WAN tables | `docs/replication.md`, README | Definitions unchanged; not re-measured in this revision. The stress runs are published as having no loss or reordering, and the old reordering counter also counted duplicates, so none were hidden. |
 | Per-stage push → read (0.1 µs, 3.8 µs, 30–32 µs, …) | README, `docs/replication.md` | Taken with the stamp-then-mutex harness (defect 7). That lock could only add delay to a sample, and only when an echo handler held it. Not re-measured yet. |
 
-No figure in this repository comes from the smoke runs described below.
+Smoke runs validate behavior; their latencies are not treated as performance measurements.
 
 ## Reproducing a measurement
+
+The automated local reproduction is `bash scripts/bench-measure.sh A,B`. It records
+three runs (1 s warm-up, 3 s measurement, 50 samples by default), raw Criterion JSON and
+CPU/kernel/compiler metadata under `${CARGO_TARGET_DIR:-target}/measurements/`.
+`BENCH_RUNS`, `BENCH_WARMUP`, `BENCH_MEASUREMENT` and `BENCH_SAMPLES` override those settings.
 
 On the measurement host:
 

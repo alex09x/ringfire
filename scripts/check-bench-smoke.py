@@ -33,7 +33,8 @@ def verify(root):
         name = 'ping-' + transport
         text = read(name)
         require(re.search(
-            r'500 pings after 100 warm-up.*: 0 lost .*?, 0 late, 0 unexpected, reader lapped 0',
+            r'500 pings after 100 warm-up.*: measured 0 lost .*?, 0 late, 0 unexpected '
+            r'\(warm-up: \d+ lost, \d+ late, \d+ unexpected\), reader lapped 0',
             text), name + ': measured reply counters')
         require(re.search(r'\brtt n=500\b', text), name + ': sample count')
     for transport in ('tcp', 'multicast', 'unicast'):

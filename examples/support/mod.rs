@@ -92,7 +92,11 @@ impl SeqTracker {
             self.out_of_order += 1;
         }
         self.highest = self.highest.max(seq);
-        self.lowest = if self.lowest == 0 { seq } else { self.lowest.min(seq) };
+        self.lowest = if self.lowest == 0 {
+            seq
+        } else {
+            self.lowest.min(seq)
+        };
         true
     }
 

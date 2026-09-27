@@ -4,12 +4,12 @@
 
 mod support;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ringfire::{RingConsumer, RingProducer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use support::{AbortOnPanic, SpinBound, TempShm, REPLY_TIMEOUT};
+use support::{AbortOnPanic, REPLY_TIMEOUT, SpinBound, TempShm};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -18,6 +18,10 @@ struct LatencyPing {
 }
 
 fn bench_roundtrip_latency(c: &mut Criterion) {
+    let _watchdog = support::Watchdog::start(
+        "bench_roundtrip_latency",
+        support::Watchdog::default_limit(),
+    );
     let fwd = TempShm::new("latency_fwd");
     let rev = TempShm::new("latency_rev");
 

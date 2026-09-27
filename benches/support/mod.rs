@@ -4,8 +4,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -148,74 +148,48 @@ pub fn timed_chunks_with_clock<C>(
     total
 }
 
-/// Per-process watchdog for a blocking wait that has no built-in timeout (a blocking recv
-/// on another thread, or a plain socket/pipe read) so a peer that stays alive but stops
-/// making progress cannot hang the bench forever. The hot path calls only
-/// [`Watchdog::heartbeat`], a relaxed atomic increment with no clock read, so it stays
-/// cheap enough for operations measured in nanoseconds; a background thread reads the
-/// clock on its own schedule and aborts the process if the heartbeat count has not moved
-/// for `limit`. This is a real liveness check, not just a panic guard: unlike
-/// [`AbortOnPanic`], it also catches a peer that is merely stuck, not just one that
-/// panicked.
+/// Whole-case deadline, including Criterion warm-up, sampling and helper-thread teardown.
+/// The only clock lives in a sleeping watchdog; no per-operation counter or clock is
+/// added to the measured loop. Configure longer experiments via the environment.
 pub struct Watchdog {
-    ticks: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
+    cancel: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
-
 impl Watchdog {
-    /// Starts watching. `what` names the wait in the abort message; `limit` is how long
-    /// the heartbeat count may stay unchanged before the process aborts.
     pub fn start(what: impl Into<String>, limit: Duration) -> Self {
         let what = what.into();
-        let ticks = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let poll_every = (limit / 8).max(Duration::from_millis(1));
-        let (watch_ticks, watch_stop) = (ticks.clone(), stop.clone());
-        let thread = thread::spawn(move || {
-            let mut last = watch_ticks.load(Ordering::Relaxed);
-            let mut since = Instant::now();
-            while !watch_stop.load(Ordering::Relaxed) {
-                thread::sleep(poll_every);
-                let now_ticks = watch_ticks.load(Ordering::Relaxed);
-                if now_ticks != last {
-                    last = now_ticks;
-                    since = Instant::now();
-                } else if since.elapsed() > limit {
-                    eprintln!("{} made no progress within {:?}; aborting", what, limit);
-                    std::process::abort();
-                }
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            if matches!(rx.recv_timeout(limit), Err(mpsc::RecvTimeoutError::Timeout)) {
+                eprintln!(
+                    "{} exceeded the whole-case deadline {:?}; aborting",
+                    what, limit
+                );
+                std::process::abort();
             }
         });
         Self {
-            ticks,
-            stop,
-            thread: Some(thread),
+            cancel: Some(tx),
+            worker: Some(worker),
         }
     }
-
-    /// Default deadline for a wait that should normally complete in well under a second:
-    /// `RINGFIRE_BENCH_WATCHDOG_SECS` if set, else 30 s.
+    /// Total time for a case: RINGFIRE_BENCH_WATCHDOG_SECS, default 900 seconds.
     pub fn default_limit() -> Duration {
-        std::env::var("RINGFIRE_BENCH_WATCHDOG_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30))
-    }
-
-    /// Records that the watched wait made progress. Cheap enough to call every iteration.
-    #[inline(always)]
-    pub fn heartbeat(&self) {
-        self.ticks.fetch_add(1, Ordering::Relaxed);
+        let seconds = std::env::var("RINGFIRE_BENCH_WATCHDOG_SECS")
+            .map(|s| {
+                s.parse::<u64>()
+                    .expect("RINGFIRE_BENCH_WATCHDOG_SECS must be a positive integer")
+            })
+            .unwrap_or(900);
+        assert!(seconds > 0, "watchdog deadline must be positive");
+        Duration::from_secs(seconds)
     }
 }
-
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        drop(self.cancel.take());
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
         }
     }
 }

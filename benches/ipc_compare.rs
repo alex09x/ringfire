@@ -5,22 +5,21 @@
 //! full for every mechanism, not just the sequence, so a corruption in the other 56 bytes
 //! cannot pass unnoticed on one transport but not another.
 //!
-//! Every wait here is bounded: a per-mechanism [`Watchdog`] aborts the process if a round
-//! trip stalls, so a peer that stays alive but stops making progress cannot hang the
+//! Every wait here is bounded: a per-mechanism [`Watchdog`] aborts the process when the whole case exceeds its deadline, so a peer that stays alive but stops making progress cannot hang the
 //! bench (unlike [`AbortOnPanic`], which only covers a peer that panics).
 //!
 //! `cargo bench --bench ipc_compare`
 
 mod support;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ringfire::{FutexWait, RingConsumer, RingProducer};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
-use support::{AbortOnPanic, SpinBound, TempShm, Watchdog, REPLY_TIMEOUT};
+use support::{AbortOnPanic, REPLY_TIMEOUT, SpinBound, TempShm, Watchdog};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -32,7 +31,10 @@ struct Msg64 {
 const STOP: u64 = u64::MAX;
 
 fn msg(seq: u64) -> Msg64 {
-    Msg64 { seq, payload: [0xAB; 56] }
+    Msg64 {
+        seq,
+        payload: [0xAB; 56],
+    }
 }
 
 /// Ping-pong over two rings. `blocking` selects `FutexWait` (sleeps in the kernel when
@@ -73,7 +75,7 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
     // (which only bounds the busy-poll loop) cannot cover it. The watchdog is an
     // independent guard against the echo thread staying alive but stuck; `AbortOnPanic`
     // on that thread only covers it panicking outright.
-    let watchdog = Watchdog::start(name, Watchdog::default_limit());
+    let _watchdog = Watchdog::start(name, Watchdog::default_limit());
     c.bench_function(&format!("ipc_rtt_64B/{}", name), |b| {
         b.iter(|| {
             let ping = msg(seq);
@@ -89,18 +91,25 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
                     bound.spin();
                 }
             };
-            watchdog.heartbeat();
             assert_eq!(resp.seq, seq, "{}: reply out of sequence", name);
-            assert_eq!(resp.payload, ping.payload, "{}: reply payload corrupted", name);
+            assert_eq!(
+                resp.payload, ping.payload,
+                "{}: reply payload corrupted",
+                name
+            );
             black_box(resp);
             seq += 1;
         });
     });
-    drop(watchdog);
 
     prod_fwd.push(&msg(STOP));
     echo.join().unwrap();
-    assert_eq!(cons_rev.lapped_count(), 0, "{}: reply reader was lapped", name);
+    assert_eq!(
+        cons_rev.lapped_count(),
+        0,
+        "{}: reply reader was lapped",
+        name
+    );
 }
 
 fn as_bytes(m: &Msg64) -> &[u8] {
@@ -111,29 +120,37 @@ fn as_bytes(m: &Msg64) -> &[u8] {
 /// failed echo closes its end, so the bench's `read_exact` fails instead of blocking. A
 /// peer that stays open but stalls (no EOF, no bytes) has no such signal, so it is bounded
 /// by the watchdog instead.
-fn bench_stream<R, W>(c: &mut Criterion, name: &str, mut tx: W, mut rx: R, echo: impl FnOnce() + Send + 'static)
-where
+fn bench_stream<R, W>(
+    c: &mut Criterion,
+    name: &str,
+    mut tx: W,
+    mut rx: R,
+    echo: impl FnOnce() + Send + 'static,
+) where
     R: Read,
     W: Write,
 {
     let handle = thread::spawn(echo);
     let mut seq = 1u64;
     let mut buf = [0u8; 64];
-    let watchdog = Watchdog::start(name, Watchdog::default_limit());
+    let _watchdog = Watchdog::start(name, Watchdog::default_limit());
     c.bench_function(&format!("ipc_rtt_64B/{}", name), |b| {
         b.iter(|| {
             let ping = msg(seq);
             tx.write_all(as_bytes(&ping)).unwrap();
             rx.read_exact(&mut buf).unwrap();
-            watchdog.heartbeat();
             let got_seq = u64::from_ne_bytes(buf[..8].try_into().unwrap());
             assert_eq!(got_seq, seq, "{}: reply out of sequence", name);
-            assert_eq!(&buf[..], as_bytes(&ping), "{}: reply payload corrupted", name);
+            assert_eq!(
+                &buf[..],
+                as_bytes(&ping),
+                "{}: reply payload corrupted",
+                name
+            );
             black_box(&buf);
             seq += 1;
         });
     });
-    drop(watchdog);
     drop(tx);
     drop(rx);
     handle.join().unwrap();
@@ -151,7 +168,12 @@ fn echo_loop(mut rx: impl Read, mut tx: impl Write) {
 fn pipe_pair() -> (std::fs::File, std::fs::File) {
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    }
 }
 
 fn bench_ipc_compare(c: &mut Criterion) {
@@ -172,7 +194,9 @@ fn bench_ipc_compare(c: &mut Criterion) {
     client.set_nodelay(true).unwrap();
     server.set_nodelay(true).unwrap();
     let (client_rx, server_rx) = (client.try_clone().unwrap(), server.try_clone().unwrap());
-    bench_stream(c, "tcp_loopback", client, client_rx, move || echo_loop(server_rx, server));
+    bench_stream(c, "tcp_loopback", client, client_rx, move || {
+        echo_loop(server_rx, server)
+    });
 }
 
 criterion_group!(benches, bench_ipc_compare);

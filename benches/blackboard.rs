@@ -3,7 +3,7 @@
 
 mod support;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ringfire::{BlackboardConsumer, BlackboardProducer};
 use support::TempShm;
 
@@ -18,6 +18,8 @@ struct SymbolBbo {
 }
 
 fn bench_blackboard(c: &mut Criterion) {
+    let _watchdog =
+        support::Watchdog::start("bench_blackboard", support::Watchdog::default_limit());
     let shm = TempShm::new("blackboard");
 
     let slot_count = 1024;

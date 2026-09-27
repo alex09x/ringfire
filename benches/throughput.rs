@@ -6,11 +6,11 @@
 
 mod support;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ringfire::{FlowControl, RingConsumer, RingConsumerBuilder, RingProducer, RingProducerBuilder};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use support::{timed_chunks, AbortOnPanic, TempShm};
+use std::sync::atomic::{AtomicBool, Ordering};
+use support::{AbortOnPanic, TempShm, timed_chunks};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -34,6 +34,8 @@ const CHUNK: u64 = 4096;
 const BATCH: usize = 32;
 
 fn bench_spmc_throughput(c: &mut Criterion) {
+    let _watchdog =
+        support::Watchdog::start("bench_spmc_throughput", support::Watchdog::default_limit());
     let mut group = c.benchmark_group("ringfire_throughput");
 
     {
@@ -107,7 +109,10 @@ fn bench_spmc_throughput(c: &mut Criterion) {
                         for _ in 0..n {
                             let got = consumer.recv_batch(&mut buf);
                             if got != BATCH {
-                                panic!("recv_batch returned {} of {} at sequence {}", got, BATCH, expected);
+                                panic!(
+                                    "recv_batch returned {} of {} at sequence {}",
+                                    got, BATCH, expected
+                                );
                             }
                             mismatch |= (buf[0].timestamp ^ expected)
                                 | (buf[BATCH - 1].timestamp ^ (expected + BATCH as u64 - 1));
@@ -130,11 +135,16 @@ fn bench_spmc_throughput(c: &mut Criterion) {
 /// the bench the reader drains what is left and every pushed message must be accounted
 /// for as received or lapped (never lapped in lossless mode).
 fn bench_push_with_reader(c: &mut Criterion) {
+    let _watchdog =
+        support::Watchdog::start("bench_push_with_reader", support::Watchdog::default_limit());
     let mut group = c.benchmark_group("ringfire_throughput");
     group.throughput(Throughput::Elements(1));
     for (name, flow) in [
         ("spmc_push_with_reader_lossy", FlowControl::LossyLatestWins),
-        ("spmc_push_with_reader_lossless", FlowControl::LosslessBackpressure),
+        (
+            "spmc_push_with_reader_lossless",
+            FlowControl::LosslessBackpressure,
+        ),
     ] {
         let shm = TempShm::new(name);
 

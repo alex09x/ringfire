@@ -8,9 +8,11 @@
 mod support;
 
 use criterion::measurement::WallTime;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
 use ringfire::{BlobConsumer, BlobProducer, RingConsumer, RingProducer};
-use support::{timed_chunks, TempShm};
+use support::{TempShm, timed_chunks};
 
 fn size_label(sz: usize) -> String {
     if sz < 1024 {
@@ -51,6 +53,7 @@ fn bench_arena_push(group: &mut BenchmarkGroup<'_, WallTime>, sz: usize) {
 }
 
 fn bench_push(c: &mut Criterion) {
+    let _watchdog = support::Watchdog::start("bench_push", support::Watchdog::default_limit());
     let mut group = c.benchmark_group("push_throughput");
     bench_fixed_push::<32>(&mut group, 65536);
     bench_fixed_push::<64>(&mut group, 65536);
@@ -67,7 +70,9 @@ const RING_CAPACITY: u64 = 65536;
 const ARENA_CAPACITY: usize = 64 * 1024 * 1024;
 
 fn chunk_for(payload: usize) -> u64 {
-    (RING_CAPACITY / 2).min((ARENA_CAPACITY / 2 / payload) as u64).min(8192)
+    (RING_CAPACITY / 2)
+        .min((ARENA_CAPACITY / 2 / payload) as u64)
+        .min(8192)
 }
 
 fn bench_fixed_recv(group: &mut BenchmarkGroup<'_, WallTime>) {
@@ -102,7 +107,10 @@ fn bench_fixed_recv(group: &mut BenchmarkGroup<'_, WallTime>) {
                             None => panic!("fixed try_recv: no message at sequence {}", expected),
                         }
                     }
-                    assert_eq!(mismatch, 0, "fixed try_recv returned a message out of sequence");
+                    assert_eq!(
+                        mismatch, 0,
+                        "fixed try_recv returned a message out of sequence"
+                    );
                 },
             )
         });
@@ -158,10 +166,16 @@ fn bench_arena_recv(group: &mut BenchmarkGroup<'_, WallTime>, sz: usize, view: b
                                 mismatch |= (seq ^ expected) | (len ^ sz) as u64;
                                 expected += 1;
                             }
-                            other => panic!("{}: expected message {}, got {:?}", name, expected, other),
+                            other => {
+                                panic!("{}: expected message {}, got {:?}", name, expected, other)
+                            }
                         }
                     }
-                    assert_eq!(mismatch, 0, "{}: message out of sequence or wrong length", name);
+                    assert_eq!(
+                        mismatch, 0,
+                        "{}: message out of sequence or wrong length",
+                        name
+                    );
                 },
             )
         });
@@ -170,6 +184,7 @@ fn bench_arena_recv(group: &mut BenchmarkGroup<'_, WallTime>, sz: usize, view: b
 }
 
 fn bench_recv(c: &mut Criterion) {
+    let _watchdog = support::Watchdog::start("bench_recv", support::Watchdog::default_limit());
     let mut group = c.benchmark_group("recv_throughput");
     bench_fixed_recv(&mut group);
     bench_arena_recv(&mut group, 64, false);

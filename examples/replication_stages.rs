@@ -7,7 +7,7 @@
 //! on the slave, translating its own clock into the master's with an offset estimated
 //! PTP-style (hundreds of probes, the minimum-round-trip sample wins; the residual error
 //! is the path asymmetry, a few microseconds on a LAN). The slave estimates the offset
-//! again after the run and reports the change, which bounds the clock drift during it.
+//! again after the run and reports the change, which can reveal clock drift between its endpoints.
 //!
 //! ```text
 //! master:  replication_stages --role master --bind 0.0.0.0:7400 --clock 0.0.0.0:7402 \
@@ -18,8 +18,8 @@
 //! ```
 //!
 //! Every slave also echoes each record it reads back over its clock connection; the
-//! master stamps the echo's arrival with the same clock that stamped the push, so the
-//! "round trip" line per slave is exact even across sites with unsynchronised clocks.
+//! master measures echo arrivals and local reads with its monotonic clock, so these
+//! figures avoid cross-host offsets and local wall-clock adjustments.
 //! After pushing, the master waits until every slave has disconnected (slaves leave 2 s
 //! after their last record) or `--drain-secs` pass, then reports.
 
@@ -35,14 +35,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ringfire::replication::{Mirror, MirrorStart, MulticastConfig, ReplicaServer};
 use ringfire::{RingConsumer, RingProducer};
-use support::{latency_line, parse_arg, parse_flag, Pacer, SeqTracker};
+use support::{Pacer, SeqTracker, latency_line, parse_arg, parse_flag};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct Msg {
     sent_ns: u64,
     seq: u64,
-    _pad: [u8; 40],
+    sent_mono_ns: u64,
+    _pad: [u8; 32],
 }
 
 fn wall_ns() -> i64 {
@@ -68,7 +69,13 @@ type SentTimes = Arc<Vec<AtomicI64>>;
 /// b [u8; 8]`. kind 0 = probe (`a` = send time, replied with receive and send times),
 /// kind 1 = echo (`a` = sequence read, `b` = slave name, no reply). `active` counts open
 /// connections.
-fn clock_service(listener: TcpListener, sent: SentTimes, echoes: Echoes, active: Arc<AtomicUsize>) {
+fn clock_service(
+    listener: TcpListener,
+    sent: SentTimes,
+    echoes: Echoes,
+    active: Arc<AtomicUsize>,
+    epoch: Instant,
+) {
     for stream in listener.incoming().flatten() {
         let sent = sent.clone();
         let echoes = echoes.clone();
@@ -96,7 +103,7 @@ fn clock_service(listener: TcpListener, sent: SentTimes, echoes: Echoes, active:
                         }
                     }
                     1 => {
-                        let now = wall_ns();
+                        let now = epoch.elapsed().as_nanos() as i64;
                         if name.is_empty() {
                             name = String::from_utf8_lossy(&req[16..24])
                                 .trim_end_matches('\0')
@@ -125,7 +132,10 @@ fn clock_service(listener: TcpListener, sent: SentTimes, echoes: Echoes, active:
 /// later `read_exact`/`write_all` on it forever.
 fn connect_bounded(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
     let target = addr.to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {}", addr))
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no address for {}", addr),
+        )
     })?;
     let stream = TcpStream::connect_timeout(&target, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
@@ -136,10 +146,10 @@ fn connect_bounded(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> 
 /// Estimates `master clock - slave clock` from the minimum-round-trip probe on `stream`.
 /// Returns the offset and that probe's round trip. `stream` is expected to already carry
 /// a read/write timeout (see [`connect_bounded`]), so a probe whose peer stops responding
-/// ends the loop early (returning the best estimate so far) instead of hanging: the
+/// returns an error instead of publishing a bogus offset: the
 /// per-probe budget below only bounds how many *successful* probes are attempted, not a
 /// stalled `read_exact`/`write_all`.
-fn clock_offset(stream: &mut TcpStream, probes: usize) -> (i64, i64) {
+fn clock_offset(stream: &mut TcpStream, probes: usize) -> std::io::Result<(i64, i64)> {
     let mut best_rtt = i64::MAX;
     let mut best_offset = 0i64;
     let mut reply = [0u8; 24];
@@ -152,9 +162,8 @@ fn clock_offset(stream: &mut TcpStream, probes: usize) -> (i64, i64) {
         }
         let t1 = wall_ns();
         req[8..16].copy_from_slice(&t1.to_le_bytes());
-        if stream.write_all(&req).is_err() || stream.read_exact(&mut reply).is_err() {
-            break;
-        }
+        stream.write_all(&req)?;
+        stream.read_exact(&mut reply)?;
         let t4 = wall_ns();
         let t2 = i64::from_le_bytes(reply[8..16].try_into().unwrap());
         let t3 = i64::from_le_bytes(reply[16..24].try_into().unwrap());
@@ -166,7 +175,13 @@ fn clock_offset(stream: &mut TcpStream, probes: usize) -> (i64, i64) {
         // Spaces the probes out; not a readiness wait.
         thread::sleep(Duration::from_micros(200));
     }
-    (best_offset, best_rtt)
+    if best_rtt == i64::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "no clock probe completed",
+        ));
+    }
+    Ok((best_offset, best_rtt))
 }
 
 fn main() {
@@ -239,12 +254,13 @@ fn main() {
             server = server.duplicate(dup);
             server.spawn().unwrap();
             let total = rate * seconds;
+            let epoch = Instant::now();
             let sent: SentTimes = Arc::new((0..=total).map(|_| AtomicI64::new(0)).collect());
             let echoes: Echoes = Arc::new(Mutex::new(Vec::new()));
             let active = Arc::new(AtomicUsize::new(0));
             let listener = TcpListener::bind(clock.as_str()).unwrap();
             let (sent_c, echoes_c, active_c) = (sent.clone(), echoes.clone(), active.clone());
-            thread::spawn(move || clock_service(listener, sent_c, echoes_c, active_c));
+            thread::spawn(move || clock_service(listener, sent_c, echoes_c, active_c, epoch));
             eprintln!(
                 "master: ring {} served on {}, clock on {}",
                 ring.display(),
@@ -260,9 +276,9 @@ fn main() {
                 let mut last_seen = Instant::now();
                 loop {
                     if let Some(msg) = local.try_recv() {
-                        let now = wall_ns();
+                        let now = epoch.elapsed().as_nanos() as i64;
                         if seqs.record(msg.seq) {
-                            samples.push(now - msg.sent_ns as i64);
+                            samples.push(now - msg.sent_mono_ns as i64);
                         }
                         last_seen = Instant::now();
                         if msg.seq >= total {
@@ -285,12 +301,13 @@ fn main() {
                 if (seq - 1) % burst == 0 {
                     pace.wait_next();
                 }
-                let now = wall_ns();
-                sent[seq as usize].store(now, Ordering::Release);
+                let mono = epoch.elapsed().as_nanos() as i64;
+                sent[seq as usize].store(mono, Ordering::Release);
                 producer.push(&Msg {
-                    sent_ns: now as u64,
+                    sent_ns: wall_ns() as u64,
                     seq,
-                    _pad: [0; 40],
+                    sent_mono_ns: mono as u64,
+                    _pad: [0; 32],
                 });
             }
             let (mut samples, seqs, lapped) = reader.join().unwrap();
@@ -336,7 +353,8 @@ fn main() {
         "slave" => {
             let mut echo = connect_bounded(clock.as_str(), Duration::from_secs(10)).unwrap();
             echo.set_nodelay(true).unwrap();
-            let (offset, sync_rtt) = clock_offset(&mut echo, 400);
+            let (offset, sync_rtt) =
+                clock_offset(&mut echo, 400).expect("initial clock synchronization failed");
             let _ = std::fs::remove_file(&ring);
             let mut mirror = Mirror::builder()
                 .start(MirrorStart::Latest)
@@ -398,9 +416,9 @@ fn main() {
                     core::hint::spin_loop();
                 }
             }
-            // Offset again: its change over the run bounds the clock drift in the samples.
+            // Check the endpoint offset again; this cannot detect every transient wall-clock step.
             let (offset_end, sync_rtt_end) = if echo_errors == 0 {
-                clock_offset(&mut echo, 400)
+                clock_offset(&mut echo, 400).expect("final clock synchronization failed")
             } else {
                 (offset, sync_rtt)
             };
