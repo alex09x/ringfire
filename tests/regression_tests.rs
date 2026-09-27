@@ -396,10 +396,8 @@ fn r9_ffi_consumer_on_registry_ring() {
 /// R10: the header-only C consumer compiles and reads v2 rings (lapping included).
 #[test]
 fn r10_c_header_consumer() {
-    let Ok(cc) = Command::new("cc").arg("--version").output() else {
-        eprintln!("r10: no C compiler, skipped");
-        return;
-    };
+    let cc = Command::new("cc").arg("--version").output()
+        .expect("C interoperability tests require a working C compiler (cc)");
     assert!(cc.status.success());
     let dir = std::env::temp_dir().join(format!("regress_c_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

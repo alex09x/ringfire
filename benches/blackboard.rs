@@ -1,7 +1,13 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ringfire::{BlackboardConsumer, BlackboardProducer};
+//! Uncontended O(1) blackboard read and write of one slot (no concurrent writer while
+//! reading). `cargo bench --bench blackboard`
 
-#[derive(Clone, Copy)]
+mod support;
+
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use ringfire::{BlackboardConsumer, BlackboardProducer};
+use support::TempShm;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 struct SymbolBbo {
     symbol_id: u32,
@@ -12,12 +18,13 @@ struct SymbolBbo {
 }
 
 fn bench_blackboard(c: &mut Criterion) {
-    let tmp_path = std::env::temp_dir().join("bench_ringfire_blackboard.shm");
-    let _ = std::fs::remove_file(&tmp_path);
+    let _watchdog =
+        support::Watchdog::start("bench_blackboard", support::Watchdog::default_limit());
+    let shm = TempShm::new("blackboard");
 
     let slot_count = 1024;
-    let mut producer = BlackboardProducer::<SymbolBbo>::create(&tmp_path, slot_count).unwrap();
-    let consumer = BlackboardConsumer::<SymbolBbo>::attach(&tmp_path).unwrap();
+    let mut producer = BlackboardProducer::<SymbolBbo>::create(shm.path(), slot_count).unwrap();
+    let consumer = BlackboardConsumer::<SymbolBbo>::attach(shm.path()).unwrap();
 
     let bbo = SymbolBbo {
         symbol_id: 42,
@@ -28,6 +35,8 @@ fn bench_blackboard(c: &mut Criterion) {
     };
 
     producer.write(42, &bbo).unwrap();
+    // The read bench must measure a hit that returns the written value.
+    assert_eq!(consumer.read(42).unwrap(), Some(bbo));
 
     let mut group = c.benchmark_group("ringfire_blackboard");
 
@@ -45,7 +54,7 @@ fn bench_blackboard(c: &mut Criterion) {
     });
 
     group.finish();
-    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(consumer.read(42).unwrap(), Some(bbo));
 }
 
 criterion_group!(benches, bench_blackboard);

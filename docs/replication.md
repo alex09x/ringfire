@@ -4,6 +4,11 @@
 what a stress test taught us on the way, and what it costs on a LAN, across an
 ocean and through a cloud hub.*
 
+The numerical LAN/WAN tables and SVG figures below record the v0.5.0 experiments.
+They are historical, not a rerun of the corrected harnesses. In particular, stage
+latencies used a timestamp-before-lock path; see the
+[benchmark audit and definitions](benchmarking.md) before comparing them with new runs.
+
 ## The problem
 
 A market-data process on one machine parses exchange frames into a ring in
@@ -135,6 +140,10 @@ Two Ryzen 9 7950X hosts (`booster`, `ram9`) on a 1 GbE LAN, shared with other wo
 so treat ±10 µs at the median as noise between runs.
 
 ### Per stage, on every host at once
+
+These figures predate the harness revision in [benchmarking.md](benchmarking.md). The
+stage harness then took a lock between stamping a record and pushing it, which can only
+delay a sample; the stage figures have not been re-measured since.
 
 `examples/replication_stages.rs`: the master stamps each record on push; a consumer
 on the master and one on each of eight slaves (six on the second host, two on the

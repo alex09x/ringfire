@@ -2,12 +2,19 @@
 //!
 //! A producer pushes into a source ring; a `ReplicaServer` streams it to a `Mirror` in the
 //! same process; a reader on the mirror ring timestamps arrival. Producer, server, mirror
-//! and reader all busy-poll. Both ends share one clock, so the one-way figure is exact.
+//! and reader all busy-poll. Both ends read one monotonic clock, so the one-way figure is
+//! exact: each record is stamped immediately before its actual push (not its scheduled
+//! time) and the reader stamps it as soon as `try_recv` returns it.
+//!
+//! Every phase ends when its last record arrives or after an idle timeout, so a lost
+//! record is reported as a loss instead of hanging the run.
 //!
 //! ```text
 //! cargo run --release --example replication_latency [-- --paced-us 100 --samples 20000]
-//!     [--multicast 239.255.0.1:7401 --iface LOCAL_ADDR]
+//!     [--burst 2000000] [--idle-ms 2000] [--multicast 239.255.0.1:7401 --iface LOCAL_ADDR]
 //! ```
+
+mod support;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread;
@@ -15,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use ringfire::replication::{Mirror, MirrorStart, MulticastConfig, ReplicaServer};
 use ringfire::{RingConsumer, RingProducer};
+use support::{latency_line, parse_arg, receive_until, elapsed_ns, Pacer, Received, SeqTracker};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -24,44 +32,35 @@ struct Msg {
     _pad: [u8; 40],
 }
 
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-    sorted[idx]
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut paced_us = 100u64;
-    let mut samples = 20_000usize;
+    let mut samples = 20_000u64;
     let mut burst = 2_000_000u64;
+    let mut idle_ms = 2_000u64;
     let mut multicast: Option<SocketAddrV4> = None;
     let mut iface = Ipv4Addr::UNSPECIFIED;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--multicast" if i + 1 < args.len() => {
-                multicast = Some(args[i + 1].parse().unwrap());
-                i += 2;
+        let value = args.get(i + 1).map(String::as_str);
+        match (args[i].as_str(), value) {
+            ("--multicast", Some(v)) => multicast = Some(parse_arg("--multicast", v)),
+            ("--iface", Some(v)) => iface = parse_arg("--iface", v),
+            ("--paced-us", Some(v)) => paced_us = parse_arg("--paced-us", v),
+            ("--samples", Some(v)) => samples = parse_arg("--samples", v),
+            ("--burst", Some(v)) => burst = parse_arg("--burst", v),
+            ("--idle-ms", Some(v)) => idle_ms = parse_arg("--idle-ms", v),
+            _ => {
+                i += 1;
+                continue;
             }
-            "--iface" if i + 1 < args.len() => {
-                iface = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--paced-us" if i + 1 < args.len() => {
-                paced_us = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--samples" if i + 1 < args.len() => {
-                samples = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--burst" if i + 1 < args.len() => {
-                burst = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            _ => i += 1,
         }
+        i += 2;
     }
+    assert!(samples > 0, "--samples must be positive");
+    // Idle timeout: long against the pacing period, so only a stalled stream ends a phase.
+    let idle = Duration::from_millis(idle_ms).max(Duration::from_micros(paced_us) * 10);
+    let first_wait = idle.max(Duration::from_secs(10));
 
     let source =
         std::env::temp_dir().join(format!("ringfire_repl_lat_src_{}.shm", std::process::id()));
@@ -92,62 +91,85 @@ fn main() {
     };
     let handle = mirror.handle().unwrap();
     let mirror_thread = thread::spawn(move || {
-        let _ = mirror.run();
-        (mirror.sequence(), mirror.gaps())
+        let result = mirror.run();
+        (result, mirror.sequence(), mirror.gaps())
     });
     let mut reader = RingConsumer::<Msg>::attach(&copy).unwrap();
     let epoch = Instant::now();
     let now_ns = move || epoch.elapsed().as_nanos() as u64;
 
     // Paced one-way latency: one message every `paced_us`, like a live feed.
-    let pacer = {
-        let period = Duration::from_micros(paced_us);
-        thread::spawn(move || {
-            let mut next = Instant::now();
-            for seq in 1..=samples as u64 {
-                while Instant::now() < next {
-                    core::hint::spin_loop();
-                }
-                producer.push(&Msg {
-                    sent_ns: now_ns(),
-                    seq,
-                    _pad: [0; 40],
-                });
-                next += period;
-            }
-            producer
-        })
-    };
-    let mut lat = Vec::with_capacity(samples);
-    while lat.len() < samples {
-        if let Some(msg) = reader.try_recv() {
-            lat.push(now_ns() - msg.sent_ns);
-        } else {
-            core::hint::spin_loop();
+    let pacer = thread::spawn(move || {
+        let mut pace = Pacer::every(Duration::from_micros(paced_us));
+        for seq in 1..=samples {
+            pace.wait_next();
+            producer.push(&Msg {
+                sent_ns: now_ns(),
+                seq,
+                _pad: [0; 40],
+            });
         }
-    }
-    let mut producer = pacer.join().unwrap();
-    lat.sort_unstable();
+        producer
+    });
+    let mut lat: Vec<i64> = Vec::with_capacity(samples as usize);
+    let mut paced = SeqTracker::new(samples);
+    let paced_end = receive_until(
+        || reader.try_recv(),
+        |m| m.seq,
+        samples,
+        first_wait,
+        idle,
+        |m| {
+            let arrived = now_ns();
+            if paced.record(m.seq) {
+                lat.push(elapsed_ns(m.sent_ns, arrived));
+            }
+        },
+    );
+    let producer = pacer.join().unwrap();
     println!(
-        "paced ({} us, {}): one-way source ring -> mirror ring, {} samples, {} B slots",
+        "paced ({} us, {}): one-way source ring -> mirror ring (actual push -> read), {} B slots",
         paced_us,
         transport,
-        samples,
         std::mem::size_of::<Msg>() + 8
     );
+    println!("  {}", latency_line(&mut lat));
     println!(
-        "  p50 {:.1} us  p90 {:.1} us  p99 {:.1} us  p99.9 {:.1} us  max {:.1} us",
-        percentile(&lat, 0.50) as f64 / 1000.0,
-        percentile(&lat, 0.90) as f64 / 1000.0,
-        percentile(&lat, 0.99) as f64 / 1000.0,
-        percentile(&lat, 0.999) as f64 / 1000.0,
-        lat[lat.len() - 1] as f64 / 1000.0
+        "  {}{}",
+        paced.summary(1, samples),
+        if paced_end == Received::Idle {
+            ", ended by idle timeout"
+        } else {
+            ""
+        }
     );
 
     // Burst throughput: push as fast as possible, measure what the mirror delivers.
-    let start = Instant::now();
-    let first_seq = samples as u64 + 1;
+    if burst > 0 {
+        run_burst(&mut reader, producer, samples + 1, burst, first_wait, idle);
+    }
+
+    handle.shutdown().unwrap();
+    let (result, seq, gaps) = mirror_thread.join().unwrap();
+    println!("mirror: last seq {}, gaps {}", seq, gaps);
+    let _ = std::fs::remove_file(&copy);
+    if let Err(e) = result {
+        eprintln!("mirror failed: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_burst(
+    reader: &mut RingConsumer<Msg>,
+    mut producer: RingProducer<Msg>,
+    first_seq: u64,
+    burst: u64,
+    first_wait: Duration,
+    idle: Duration,
+) {
     let last_seq = first_seq + burst - 1;
+    let lapped_before = reader.lapped_count();
+    let start = Instant::now();
     let pusher = thread::spawn(move || {
         for seq in first_seq..=last_seq {
             producer.push(&Msg {
@@ -158,32 +180,43 @@ fn main() {
         }
         (producer, start.elapsed())
     });
-    let mut delivered = 0u64;
-    let mut last = 0u64;
-    while last < last_seq {
-        if let Some(msg) = reader.try_recv() {
-            delivered += 1;
-            last = msg.seq;
-        } else {
-            core::hint::spin_loop();
-        }
-    }
-    let recv_elapsed = start.elapsed();
+    let mut delivered = SeqTracker::new(last_seq);
+    let mut last_arrival = start;
+    let burst_end = receive_until(
+        || reader.try_recv(),
+        |m| m.seq,
+        last_seq,
+        first_wait,
+        idle,
+        |m| {
+            // Late paced records still in flight are not part of the burst. The clock is
+            // read on the last record and every 1,024th, to keep the reader fast.
+            if m.seq >= first_seq
+                && delivered.record(m.seq)
+                && (m.seq >= last_seq || delivered.unique().is_multiple_of(1024))
+            {
+                last_arrival = Instant::now();
+            }
+        },
+    );
+    let recv_elapsed = last_arrival - start;
     let (_producer, push_elapsed) = pusher.join().unwrap();
+    let got = delivered.unique();
     println!(
-        "burst: {} pushed in {:.1} ms ({:.1} M/s); mirror delivered {} ({:.1}%) in {:.1} ms ({:.1} M/s), lapped {}",
+        "burst: {} pushed in {:.1} ms ({:.1} M/s); mirror delivered {} ({:.1}%) in {:.1} ms ({:.1} M/s), reader lapped {}{}",
         burst,
         push_elapsed.as_secs_f64() * 1e3,
-        burst as f64 / push_elapsed.as_secs_f64() / 1e6,
-        delivered,
-        delivered as f64 * 100.0 / burst as f64,
+        burst as f64 / push_elapsed.as_secs_f64().max(1e-9) / 1e6,
+        got,
+        got as f64 * 100.0 / burst.max(1) as f64,
         recv_elapsed.as_secs_f64() * 1e3,
-        delivered as f64 / recv_elapsed.as_secs_f64() / 1e6,
-        reader.lapped_count()
+        got as f64 / recv_elapsed.as_secs_f64().max(1e-9) / 1e6,
+        reader.lapped_count() - lapped_before,
+        if burst_end == Received::Idle {
+            ", ended by idle timeout"
+        } else {
+            ""
+        }
     );
-
-    handle.shutdown().unwrap();
-    let (seq, gaps) = mirror_thread.join().unwrap();
-    println!("mirror: last seq {}, gaps {}", seq, gaps);
-    let _ = std::fs::remove_file(&copy);
+    println!("  {}", delivered.summary(first_seq, last_seq));
 }

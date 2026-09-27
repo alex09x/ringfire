@@ -74,6 +74,8 @@ SUBCOMMANDS:
 OPTIONS:
     --json                          Output in JSON format (stat only)
     --interval-ms <N>               Refresh interval in milliseconds for top (default: 500)
+    --iterations <N>                top: exit after N refreshes instead of running forever
+                                     (must be a positive integer)
     --tail <N>                      Number of recent slots to inspect in dump (default: 10)
     --hex                           Print slot payload in hex format
     --bind <ADDR>                   Listen address for serve (e.g. 0.0.0.0:7400)
@@ -88,7 +90,9 @@ OPTIONS:
     --batch <N>                     Max records per frame for serve (default: 256)
     --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
     --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
-    --once                          Exit when the source disconnects instead of reconnecting
+    --once                          serve: accept one TCP mirror and exit once it disconnects
+                                     (no other mirror is accepted); mirror: exit once the source
+                                     disconnects instead of reconnecting to it
     --reconnect-ms <N>              Delay between reconnect attempts (default: 500)
     -h, --help                      Show help information
     -V, --version                   Show version
@@ -130,12 +134,26 @@ fn main() {
             }
             let path = &args[2];
             let mut interval_ms = 500u64;
-            for i in 3..args.len() {
+            let mut iterations: Option<u64> = None;
+            let mut i = 3;
+            while i < args.len() {
                 if args[i] == "--interval-ms" && i + 1 < args.len() {
                     interval_ms = args[i + 1].parse().unwrap_or(500);
+                    i += 2;
+                } else if args[i] == "--iterations" {
+                    match args.get(i + 1).and_then(|value| value.parse::<u64>().ok()) {
+                        Some(n) if n > 0 => iterations = Some(n),
+                        _ => {
+                            eprintln!("Error: --iterations expects a positive integer.");
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
-            if let Err(e) = cmd_top(path, interval_ms) {
+            if let Err(e) = cmd_top(path, interval_ms, iterations) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -185,6 +203,7 @@ fn main() {
             let mut bind = None;
             let mut batch = 256usize;
             let mut spin = false;
+            let mut once = false;
             let mut multicast: Option<MulticastConfig> = None;
             let mut iface = None;
             let mut mtu = None;
@@ -234,6 +253,9 @@ fn main() {
                 } else if args[i] == "--spin" {
                     spin = true;
                     i += 1;
+                } else if args[i] == "--once" {
+                    once = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
@@ -263,6 +285,7 @@ fn main() {
                 udp_port,
                 mtu.unwrap_or(1472),
                 dup,
+                once,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -661,7 +684,11 @@ fn print_blackboard_stat(
     Ok(())
 }
 
-fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_top(
+    path_str: &str,
+    interval_ms: u64,
+    iterations: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let is_lossless = (header.flags & FLAG_POLICY_LOSSLESS_BACKPRESSURE) != 0;
@@ -677,6 +704,7 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
 
     println!("\x1B[2J"); // Clear screen
 
+    let mut count = 0u64;
     loop {
         std::thread::sleep(interval);
         let now = Instant::now();
@@ -752,7 +780,14 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
             "--------------------------------------------------------------------------------"
         );
         println!("Press Ctrl+C to exit.");
+        count += 1;
+        if let Some(limit) = iterations
+            && count >= limit
+        {
+            break;
+        }
     }
+    Ok(())
 }
 
 fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -878,7 +913,11 @@ fn cmd_serve(
     udp_port: Option<u16>,
     udp_mtu: usize,
     dup: u8,
+    once: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if once && (multicast.is_some() || udp_port.is_some()) {
+        return Err("serve --once supports TCP only; omit --multicast and --udp".into());
+    }
     let mut server = ReplicaServer::bind(path, bind)?
         .batch(batch)
         .spin(spin)
@@ -911,7 +950,22 @@ fn cmd_serve(
             port, udp_mtu, dup
         );
     }
-    server.run()?;
+    if once {
+        match server.serve_one() {
+            Ok(()) => {}
+            Err(ringfire::RingfireError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        server.run()?;
+    }
     Ok(())
 }
 

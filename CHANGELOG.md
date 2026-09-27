@@ -5,6 +5,49 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-09-26
+
+### Fixed
+- Receive benches (`throughput`, `arena_vs_fixed`) time only successful,
+  sequence-checked receives. Messages are refilled outside the timer. Before, they timed
+  empty polls once the backlog drained, or pushes whenever the reader caught up. The
+  in-place view bench no longer reuses a drained consumer. `recv_batch(32)` counts 32
+  messages per iteration.
+- Benches use unique ring paths on `/dev/shm` (or `RINGFIRE_BENCH_DIR`) and remove them.
+  They validate replies; watchdogs and smoke-run process deadlines bound stalls.
+- Replication examples no longer hang when a record is lost: phases end on the last
+  sequence or an idle timeout. Losses, duplicates and reordering are counted by distinct
+  sequence, pacing no longer drifts, mirror errors set the exit status, and
+  `replication_stages` stamps pushes without a lock and checks clock drift.
+
+### Added
+- CI requires at least 95% production Rust line coverage, including CLI/FFI and
+  optional Tokio/replication code. Test source is excluded; no production module is.
+  JSON/HTML coverage reports and benchmark smoke logs are uploaded as artifacts.
+  Measured Linux AArch64 production line coverage: 96.67% (4,961 / 5,132).
+- Behavioral coverage of malformed layouts, cursor/checkpoint/registry behavior,
+  async wake-up/fairness, FFI errors and data transfer, CLI commands, and TCP/UDP
+  protocol recovery. Multicast prerequisites and real connection errors fail tests.
+- Multiprocess stress verifies all eight child readers actually execute the test,
+  receive 100,000 records each and validate the full payload with zero lapping.
+- `scripts/bench-measure.sh` records three Criterion runs, raw samples and host metadata.
+  Corrected ARM results are published in `docs/measurements/2026-09-27-arm/`.
+- Separate IPC measurements for default adaptive futex waiting (32 spin attempts)
+  and zero-spin futex waiting, with full reply validation on every transport.
+- CLI `top --iterations N` and TCP `serve --once` support finite, observable runs;
+  SIGINT/SIGTERM retain their normal behavior.
+- `docs/benchmarking.md`: measurement definitions, clock domains, the audit, the status of
+  every published figure, and how to reproduce a measurement.
+- `scripts/bench-smoke.sh` and `tests/harness_support_tests.rs` check the harnesses.
+- `--exit-on-close` for the pongers of `replication_pingpong` and `replication_stress`.
+  `--warmup` and `--timeout-ms` for the pingpong pinger, `--idle-ms` for
+  `replication_latency` and `replication_stress`, and `--drain-secs` for the
+  `replication_stages` master.
+
+### Changed
+- README: invalid historical receive numbers are withdrawn; historical network results
+  are labelled separately from measurements made with the corrected harnesses.
+
 ## [0.5.1] - 2026-09-26
 
 Documentation release; library behavior and wire protocols are unchanged from v0.5.0.

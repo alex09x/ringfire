@@ -3,9 +3,9 @@
 //! Stores the last processed sequence number directly in `/dev/shm` using an
 //! atomic 64-byte cache-line aligned struct mapped via `memmap2`.
 //!
-//! Commits are lock-free single CPU atomic store instructions (<10 nanoseconds)
-//! with ZERO disk I/O, syscalls, or allocations, while persisting across
-//! consumer process crashes and restarts.
+//! Commits update the mapped sequence and timestamp without rewriting the file.
+//! The checkpoint survives consumer process restarts. Backing-file durability
+//! depends on its filesystem; use shared memory when disk persistence is not needed.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -155,7 +155,7 @@ impl OffsetCheckpoint {
 
     /// Reads the saved offset sequence from shared memory.
     ///
-    /// Takes ~5ns with zero allocations. Returns `None` if offset is 0 (never committed).
+    /// Performs an atomic load. Returns `None` if offset is 0 (never committed).
     #[inline(always)]
     pub fn load(&self) -> Option<u64> {
         let seq = unsafe { (*self.slot).offset_seq.load(Ordering::Acquire) };
@@ -166,9 +166,9 @@ impl OffsetCheckpoint {
         }
     }
 
-    /// Saves the offset sequence atomically to shared memory (<10ns).
+    /// Saves the offset sequence atomically to shared memory.
     ///
-    /// Pure lock-free atomic store. Zero disk I/O, zero syscalls.
+    /// Updates the sequence and wall-clock timestamp in the mapping without allocating.
     #[inline(always)]
     pub fn save(&self, seq: u64) {
         unsafe {
@@ -215,42 +215,5 @@ impl std::fmt::Debug for OffsetCheckpoint {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_shm_offset_checkpoint_roundtrip() {
-        let dir = std::env::temp_dir();
-        let file_path = dir.join(format!("test_ringfire_shm_offset_{}.shm", std::process::id()));
-        let _ = std::fs::remove_file(&file_path);
-
-        {
-            let cp = OffsetCheckpoint::open_or_create(&file_path, "test_bot").unwrap();
-            assert_eq!(cp.load(), None);
-            assert_eq!(cp.name(), "test_bot");
-
-            cp.save(123456);
-            assert_eq!(cp.load(), Some(123456));
-            assert!(cp.updated_nanos() > 0);
-        }
-
-        // Re-open from existing file to simulate consumer crash recovery
-        {
-            let cp2 = OffsetCheckpoint::open_or_create(&file_path, "test_bot").unwrap();
-            assert_eq!(cp2.load(), Some(123456));
-
-            cp2.save(123457);
-            assert_eq!(cp2.load(), Some(123457));
-        }
-
-        let _ = std::fs::remove_file(&file_path);
-    }
-
-    #[test]
-    fn test_shm_offset_for_consumer_path() {
-        let ring_path = std::env::temp_dir().join("hl_market_data.shm");
-        let cp = OffsetCheckpoint::for_consumer(&ring_path, "recorder_v2").unwrap();
-        assert!(cp.path().to_str().unwrap().contains("hl_market_data_recorder_v2.offset"));
-        let _ = std::fs::remove_file(cp.path());
-    }
-}
+#[path = "../tests/unit/checkpoint.rs"]
+mod tests;
