@@ -97,7 +97,15 @@ OPTIONS:
     );
 }
 
+extern "C" fn sig_handler(_: libc::c_int) {
+    unsafe { libc::exit(0) };
+}
+
 fn main() {
+    unsafe {
+        libc::signal(libc::SIGINT, sig_handler as *const () as _);
+        libc::signal(libc::SIGTERM, sig_handler as *const () as _);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         print_usage();
@@ -130,12 +138,22 @@ fn main() {
             }
             let path = &args[2];
             let mut interval_ms = 500u64;
-            for i in 3..args.len() {
+            let mut iterations: Option<u64> = std::env::var("RINGFIRE_TOP_ITERATIONS")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let mut i = 3;
+            while i < args.len() {
                 if args[i] == "--interval-ms" && i + 1 < args.len() {
                     interval_ms = args[i + 1].parse().unwrap_or(500);
+                    i += 2;
+                } else if args[i] == "--iterations" && i + 1 < args.len() {
+                    iterations = args[i + 1].parse().ok();
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
-            if let Err(e) = cmd_top(path, interval_ms) {
+            if let Err(e) = cmd_top(path, interval_ms, iterations) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -185,6 +203,7 @@ fn main() {
             let mut bind = None;
             let mut batch = 256usize;
             let mut spin = false;
+            let mut once = false;
             let mut multicast: Option<MulticastConfig> = None;
             let mut iface = None;
             let mut mtu = None;
@@ -234,6 +253,9 @@ fn main() {
                 } else if args[i] == "--spin" {
                     spin = true;
                     i += 1;
+                } else if args[i] == "--once" {
+                    once = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
@@ -263,6 +285,7 @@ fn main() {
                 udp_port,
                 mtu.unwrap_or(1472),
                 dup,
+                once,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -661,7 +684,7 @@ fn print_blackboard_stat(
     Ok(())
 }
 
-fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_top(path_str: &str, interval_ms: u64, iterations: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let is_lossless = (header.flags & FLAG_POLICY_LOSSLESS_BACKPRESSURE) != 0;
@@ -677,6 +700,7 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
 
     println!("\x1B[2J"); // Clear screen
 
+    let mut count = 0u64;
     loop {
         std::thread::sleep(interval);
         let now = Instant::now();
@@ -752,7 +776,14 @@ fn cmd_top(path_str: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::E
             "--------------------------------------------------------------------------------"
         );
         println!("Press Ctrl+C to exit.");
+        count += 1;
+        if let Some(limit) = iterations {
+            if count >= limit {
+                break;
+            }
+        }
     }
+    Ok(())
 }
 
 fn cmd_dump(path_str: &str, tail: usize, hex: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -878,6 +909,7 @@ fn cmd_serve(
     udp_port: Option<u16>,
     udp_mtu: usize,
     dup: u8,
+    once: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = ReplicaServer::bind(path, bind)?
         .batch(batch)
@@ -911,7 +943,11 @@ fn cmd_serve(
             port, udp_mtu, dup
         );
     }
-    server.run()?;
+    if once {
+        server.serve_one()?;
+    } else {
+        server.run()?;
+    }
     Ok(())
 }
 
