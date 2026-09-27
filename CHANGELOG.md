@@ -5,6 +5,19 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-26
+
+Documentation release; library behavior and wire protocols are unchanged from v0.5.0.
+
+### Added
+- Seven SVG figures covering the mirror pipeline, LAN multicast topology, WAN site hubs,
+  protocol exchanges, per-stage latency, WAN latency percentiles, and frame pacing.
+- A dependency-free generator, `docs/gen_replication_figures.py`, to reproduce the figures.
+
+### Changed
+- README and network mirror guide use the figures alongside measured results and recipes.
+- The published crate now includes the illustrated documentation added after v0.5.0.
+
 ## [0.5.0] - 2026-09-26
 
 Network mirrors: a ring on one host, identical copies with the same sequence numbers on
