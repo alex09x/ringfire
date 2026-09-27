@@ -6,8 +6,14 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
 pub fn reserve(group: Ipv4Addr) -> (MulticastConfig, UdpSocket) {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    #[cfg(target_os = "linux")]
+    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let sock_type = libc::SOCK_DGRAM;
+
+    let fd = unsafe { libc::socket(libc::AF_INET, sock_type, 0) };
     assert!(fd >= 0, "UDP socket: {}", std::io::Error::last_os_error());
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
     let enabled: libc::c_int = 1;
     assert_eq!(
@@ -22,20 +28,29 @@ pub fn reserve(group: Ipv4Addr) -> (MulticastConfig, UdpSocket) {
         },
         0
     );
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0,
-        sin_addr: libc::in_addr {
-            s_addr: libc::INADDR_ANY,
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
         },
-        sin_zero: [0; 8],
-    };
+        0
+    );
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    address.sin_family = libc::AF_INET as libc::sa_family_t;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = u32::from(Ipv4Addr::UNSPECIFIED).to_be();
     assert_eq!(
         unsafe {
             libc::bind(
                 socket.as_raw_fd(),
                 (&address as *const libc::sockaddr_in).cast(),
-                std::mem::size_of_val(&address) as libc::socklen_t,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
         },
         0,
