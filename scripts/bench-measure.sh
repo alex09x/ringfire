@@ -14,8 +14,12 @@ OUTPUT=$(mktemp -d "$TARGET_DIR/measurements/run.XXXXXX")
 OUTPUT=$(cd "$OUTPUT" && pwd)
 printf 'Reports: %s\n' "$OUTPUT"
 {
-    git rev-parse HEAD
-    git status --short
+    if [[ -n ${BENCH_COMMIT:-} ]]; then
+        printf 'commit=%s\ntree=%s\n' "$BENCH_COMMIT" "${BENCH_TREE_STATE:-unknown}"
+    else
+        git rev-parse HEAD
+        git status --short
+    fi
     uname -srmo
     rustc -Vv
     lscpu
