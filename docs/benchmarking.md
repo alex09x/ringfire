@@ -65,10 +65,17 @@ it even when a child fails.
   read only once per 65,536 empty polls), and the echo thread aborts the process if it
   panics.
 - **`ipc_rtt_64B/<transport>`**: one round trip of a 64-byte message, bench thread to
-  echo thread, over ringfire (busy spin or `FutexWait`), a Unix domain socket, a pipe
+  echo thread, over ringfire (busy spin, adaptive `FutexWait`, or zero-spin `FutexWait`), a Unix domain socket, a pipe
   pair and TCP loopback with `TCP_NODELAY`. Replies are checked for sequence and all 64 bytes on every transport. A failing
   stream echo closes its end; a whole-case watchdog also covers live but stalled peers
   and helper-thread teardown, without per-operation counters or clock reads.
+
+`ringfire_futex_wait` uses `FutexWait::default()`: 32 spin attempts before a possible
+kernel wait. Fast replies can arrive during that spin phase. `ringfire_futex_no_spin`
+uses `FutexWait::new(0, None)`, with no deliberate spinning and a 10 ms safety bound per
+sleep. A ready reply bypasses sleeping in either mode; neither benchmark guarantees a
+context switch for every message. Compare the zero-spin policy with blocking transports
+and label the adaptive policy explicitly.
 
 `black_box` wraps every message or payload a bench receives, and every input a bench
 pushes. Sequence validation and loop overhead are included in reported receive costs;
@@ -189,11 +196,15 @@ excludes setup, bounded spin waits, and unique, self-removing ring paths.
 
 | Figure | Where | Status |
 | :--- | :--- | :--- |
-| `try_recv` 6.4 ns, `recv_batch(32)` 2.3 ns/msg (74.2 ns) | README | **Withdrawn**: defect 2. Pending re-measurement. |
+| `try_recv` 6.4 ns, `recv_batch(32)` 2.3 ns/msg (74.2 ns) | README | **Withdrawn**: defect 2. Corrected ARM measurements are linked below; different host. |
 | SPMC recv 83.74 M msg/s (11.94 ns) | ROADMAP (v0.1 history) | **Withdrawn**: same harness. |
 | `push` 1.88 ns, push with a reader 41 / 42 ns, blackboard 2.1 / 1.1 ns, ping-pong 249.6 ns, `ipc_compare` round trips | README | Historical x86-64 results; validation cost in IPC now includes the full payload. Do not compare directly with corrected ARM results. |
 | Replication round trips, stress and WAN tables | `docs/replication.md`, README | Definitions unchanged; not re-measured in this revision. The stress runs are published as having no loss or reordering, and the old reordering counter also counted duplicates, so none were hidden. |
 | Per-stage push → read (0.1 µs, 3.8 µs, 30–32 µs, …) | README, `docs/replication.md` | Taken with the stamp-then-mutex harness (defect 7). That lock could only add delay to a sample, and only when an echo handler held it. Not re-measured yet. |
+
+Corrected measurements from three full Criterion runs on Linux AArch64 are in
+[the 2026-09-27 report](measurements/2026-09-27-arm/README.md), including all run medians,
+raw samples, environment metadata and the separate zero-spin futex case.
 
 Smoke runs validate behavior; their latencies are not treated as performance measurements.
 

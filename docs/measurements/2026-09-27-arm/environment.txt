@@ -1,0 +1,62 @@
+commit=7fde3b10ab2f2c070db2a15d064c2f5d0d23d309
+tree=clean
+Linux 6.8.0-137-generic aarch64 GNU/Linux
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+binary: rustc
+commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+commit-date: 2026-07-14
+host: aarch64-unknown-linux-gnu
+release: 1.97.1
+LLVM version: 22.1.6
+Architecture:                            aarch64
+CPU op-mode(s):                          32-bit, 64-bit
+Byte Order:                              Little Endian
+CPU(s):                                  128
+On-line CPU(s) list:                     0-127
+Vendor ID:                               ARM
+Model name:                              Neoverse-N1
+Model:                                   1
+Thread(s) per core:                      1
+Core(s) per socket:                      128
+Socket(s):                               1
+Stepping:                                r3p1
+Frequency boost:                         disabled
+CPU(s) scaling MHz:                      100%
+CPU max MHz:                             3000.0000
+CPU min MHz:                             1000.0000
+BogoMIPS:                                50.00
+Flags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp ssbs
+L1d cache:                               8 MiB (128 instances)
+L1i cache:                               8 MiB (128 instances)
+L2 cache:                                128 MiB (128 instances)
+NUMA node(s):                            4
+NUMA node0 CPU(s):                       0-31
+NUMA node1 CPU(s):                       32-63
+NUMA node2 CPU(s):                       64-95
+NUMA node3 CPU(s):                       96-127
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; CSV2, BHB
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+ 03:02:23 up 43 days,  8:41,  0 user,  load average: 13.81, 18.31, 16.50
+affinity=32,33 runs=3 warmup_seconds=1 measurement_seconds=3 samples=50
+performance
+performance
+
+Run 3 IPC launch interrupted before execution by concurrent dev-dependency lockfile update; resumed with the same benchmark source and settings. CLI-only/test JSON changes do not affect timed code.
+ 03:10:26 up 43 days,  8:50,  0 user,  load average: 15.57, 15.56, 15.78
+
+Additional zero-spin FutexWait benchmark: revision f323a2b4b22358f162694da0462760465d0955e0; three separate runs with the same 1 s warm-up, 3 s sampling, 50 samples, CPU affinity 32,33. Other 27 cases retain their original measurements.

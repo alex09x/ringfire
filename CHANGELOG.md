@@ -24,12 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI requires at least 95% production Rust line coverage, including CLI/FFI and
   optional Tokio/replication code. Test source is excluded; no production module is.
   JSON/HTML coverage reports and benchmark smoke logs are uploaded as artifacts.
+  Measured Linux AArch64 production line coverage: 96.67% (4,961 / 5,132).
 - Behavioral coverage of malformed layouts, cursor/checkpoint/registry behavior,
   async wake-up/fairness, FFI errors and data transfer, CLI commands, and TCP/UDP
   protocol recovery. Multicast prerequisites and real connection errors fail tests.
 - Multiprocess stress verifies all eight child readers actually execute the test,
   receive 100,000 records each and validate the full payload with zero lapping.
 - `scripts/bench-measure.sh` records three Criterion runs, raw samples and host metadata.
+  Corrected ARM results are published in `docs/measurements/2026-09-27-arm/`.
+- Separate IPC measurements for default adaptive futex waiting (32 spin attempts)
+  and zero-spin futex waiting, with full reply validation on every transport.
+- CLI `top --iterations N` and TCP `serve --once` support finite, observable runs;
+  SIGINT/SIGTERM retain their normal behavior.
 - `docs/benchmarking.md`: measurement definitions, clock domains, the audit, the status of
   every published figure, and how to reproduce a measurement.
 - `scripts/bench-smoke.sh` and `tests/harness_support_tests.rs` check the harnesses.

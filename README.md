@@ -12,53 +12,57 @@ It is engineered for high-frequency trading (HFT) engines, real-time market data
 
 ## ⚡ Performance at a Glance
 
-The Ryzen/LAN/WAN tables and diagrams below are historical measurements from v0.4–v0.5.
-The receive figures have been withdrawn after a harness audit; per-stage network figures
-used a timestamp-before-lock harness and await remeasurement. See the
-[measurement definitions and limitations](docs/benchmarking.md) and
-[95% production coverage contract](docs/testing.md).
+**Corrected measurements, Linux ARM Neoverse-N1, 2026-09-27.** Three runs per
+case on two physical cores, 64-byte messages, full reply validation. This was a shared
+machine; values below are medians of three Criterion run medians, with the full run range.
+[All 28 cases, raw samples and machine settings](docs/measurements/2026-09-27-arm/README.md).
 
-**Round trip of a 64-byte message between two threads**, same machine, same harness
-(`cargo bench --bench ipc_compare`, AMD Ryzen 9 7950X, Linux 6.8, v0.4.0):
-
-| Transport | Round trip | vs. ringfire (spin) |
-| :--- | ---: | ---: |
-| **ringfire**, busy-spin readers | **0.32 µs** | 1× |
-| **ringfire**, `FutexWait` (sleeps in the kernel when idle) | **2.27 µs** | 7× |
-| Unix domain socket | 4.76 µs | 15× |
-| Pipe | 4.93 µs | 15× |
-| TCP loopback (`TCP_NODELAY`) | 10.28 µs | 32× |
+| Transport | Round trip, µs (range of runs) |
+| :--- | ---: |
+| **ringfire**, busy spin | 0.29 (0.29–0.30) |
+| **ringfire**, adaptive futex (32 spin attempts) | 0.42 (0.36–0.44) |
+| **ringfire**, zero-spin futex | 4.46 (4.43–6.08) |
+| Unix domain socket | 6.55 (6.54–7.16) |
+| Pipe | 10.14 (9.61–10.22) |
+| TCP loopback (`TCP_NODELAY`) | 21.51 (21.48–21.67) |
 
 ```mermaid
 xychart-beta
-    title "64-byte round trip, microseconds (lower is better)"
-    x-axis ["ringfire spin", "ringfire futex", "Unix socket", "Pipe", "TCP loopback"]
-    y-axis "µs" 0 --> 11
-    bar [0.32, 2.27, 4.76, 4.93, 10.28]
+    title "64-byte round trip on ARM, median of three runs"
+    x-axis ["Spin", "Adaptive futex", "Zero-spin futex", "Unix socket", "Pipe", "TCP"]
+    y-axis "microseconds (lower is better)" 0 --> 23
+    bar [0.29, 0.42, 4.46, 6.55, 10.14, 21.51]
 ```
 
-**Hot-path costs** (`cargo bench --bench throughput`, 64-byte messages):
+Futex's default policy spins briefly before sleeping. Zero-spin removes that budget;
+an already-ready reply can still bypass sleep. Neither mode forces a context switch
+for every message. [Exact timing definitions](docs/benchmarking.md).
 
-| Operation | Time | Rate |
-| :--- | ---: | ---: |
-| `push` (no reader attached) | 1.88 ns | 533 M msg/s |
-| `try_recv` | pending re-measurement¹ | — |
-| `recv_batch(32)` | pending re-measurement¹ | — |
-| `push` with a reader draining on another core | 41 ns | 24 M msg/s |
-| Blackboard read / write (O(1) seqlock) | 2.1 / 1.1 ns | — |
+**Warm-cache operations on the same ARM host** (ns per operation, range of runs).
+Receive loops include sequence validation; chunk refill happens outside the timer.
 
-¹ The earlier `try_recv` (6.4 ns) and `recv_batch(32)` (2.3 ns / msg) figures are withdrawn:
-that harness timed a push whenever the reader had caught up, so they averaged receives with
-empty polls and pushes. The corrected benches time only successful, sequence-checked
-receives; new figures will be published once measured. See
-[docs/benchmarking.md](docs/benchmarking.md).
+| Operation | ns (range of runs) |
+| :--- | ---: |
+| `push` (no reader) | 11.08 (10.26–11.32) |
+| Successful `try_recv` | 10.84 (10.83–10.91) |
+| `recv_batch(32)`, per batch | 363.10 (361.58–364.85) |
+| `recv_batch(32)`, per message | 11.35 (11.30–11.40) |
+| `push` with a lossy reader | 35.46 (35.01–36.49) |
+| `push` with a lossless reader | 36.38 (35.25–36.55) |
+| Blackboard read | 11.10 (11.08–11.13) |
+| Blackboard write | 7.06 (7.06–7.07) |
 
-The last `push` row measures two threads on separate cores: it is bound by moving cache lines
-between cores, and had a 0.8 ns difference with lossless backpressure in that historical run. Every read is
-validated against concurrent overwrites; the regression suite verifies zero torn records under
-continuous lapping on x86-64 and AArch64. Full numbers: [Detailed Benchmarks](#-detailed-benchmarks-amd-ryzen-9-7950x-on-linux-booster).
+The earlier Ryzen receive figures (6.4 ns and 2.3 ns/message) are withdrawn because
+the old harness mixed receives with empty polls and refills. The corrected ARM figures
+are a different-host measurement, not a before/after speed comparison. Historical
+Ryzen and LAN/WAN results remain below with their original context; per-stage network
+measurements used a timestamp-before-lock harness and await remeasurement.
 
-**Network mirrors** (v0.5.0): the same ring, with the same sequence numbers, on other
+**Production test coverage: 96.67% of lines** in the Linux ARM all-features run,
+including CLI, FFI and replication. CI enforces a 95% minimum and uploads its report.
+[Coverage scope, per-file results and limitations](docs/testing.md).
+
+**Network mirrors — historical measurements** (v0.5.0): the same ring, with the same sequence numbers, on other
 hosts. Readers there attach to it as if it were local.
 
 | Path, 64-byte records, 1,000 msg/s | push → read |
@@ -76,14 +80,14 @@ and [docs/replication.md](docs/replication.md).
 
 ## 💡 The Problem: Why Traditional IPC Fails Under High Load
 
-When communicating between processes on the same host, developers usually default to Unix Domain Sockets (UDS), TCP loopback, pipes, ZeroMQ, or broker-based message queues (NATS, Redis). In high-throughput, low-latency environments, these primitives introduce severe architectural bottlenecks:
+When communicating between processes on the same host, developers usually default to Unix Domain Sockets (UDS), TCP loopback, pipes, ZeroMQ, or broker-based message queues (NATS, Redis). Historical Ryzen RTT/2 estimates below assume symmetric paths; they are not measured one-way latencies. Kernel paths and backpressure differ:
 
 | IPC Mechanism | Kernel Overhead | Memory Copies | One-way Latency | Backpressure / Crash Behavior |
 | :--- | :--- | :--- | :--- | :--- |
 | **Unix Domain Sockets (UDS)** | 2 syscalls (`send`/`recv`) + context switch | User $\to$ Kernel $\to$ User (2 copies) | ~2,400 ns measured (RTT / 2) | Socket buffer fills up; blocks producer or drops packets |
 | **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | ~5,100 ns measured (RTT / 2) | Heavy CPU jitter, flow control stalls |
 | **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | ~2,500 ns measured (RTT / 2) | Blocking write when pipe buffer (64 KB) fills |
-| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (typical, not measured) | High GC/memory pressure, single point of failure |
+| **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | not measured here | High GC/memory pressure, single point of failure |
 | **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **payload copied into slot and out to reader** | **~160 ns (historical RTT / 2 estimate)** | **Writer never blocks (lossy) or throttles on the slowest reader (lossless); crash-isolated** |
 
 ### The Three Critical Pain Points:
@@ -151,8 +155,8 @@ Measured with protocol v2 (v0.4.0), 64-byte messages:
 | Metric | Measured Value | Rate / Notes |
 | :--- | :--- | :--- |
 | **SPMC Single-Message Push** (no reader) | **1.88 ns** | 533 Million msgs / sec |
-| **SPMC Non-Blocking `try_recv`** | pending re-measurement | earlier 6.41 ns withdrawn (harness timed pushes and empty polls) |
-| **SPMC Batch Drain (`recv_batch(32)`)** | pending re-measurement | earlier 74.2 ns withdrawn (same defect) |
+| **SPMC Non-Blocking `try_recv`** | withdrawn | earlier 6.41 ns was invalid; corrected ARM results above |
+| **SPMC Batch Drain (`recv_batch(32)`)** | withdrawn | earlier 74.2 ns was invalid; corrected ARM results above |
 | **Push with a reader draining on another core** | **41.2 ns** lossy / **42.0 ns** lossless | Cross-core cache-line transfer; the lossless gate adds < 1 ns |
 | **Roundtrip Latency (Ping-Pong RTT)** | **249.6 ns** | ~125 ns one-way cross-thread IPC |
 | **Blackboard Seqlock Read (O(1))** | **2.13 ns** | Tear-free snapshot read |
