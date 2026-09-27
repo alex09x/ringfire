@@ -24,7 +24,7 @@
 <text x='743.0' y='206.5' text-anchor='middle' fill='#1f2328' font-size='11'>213</text>
 <text x='677.5' y='276' text-anchor='middle' fill='#1f2328'>50,000/s</text>
 <rect x='70' y='296' width='12' height='12' fill='#8fa3b8' rx='2'/>
-<text x='86' y='306' fill='#1f2328'>one record per datagram</text>
-<rect x='284.5' y='296' width='12' height='12' fill='#1d4ed8' rx='2'/>
-<text x='300.5' y='306' fill='#1f2328'>frames paced / lingered</text>
+<text x='86' y='306' fill='#1f2328'>no linger / unpaced</text>
+<rect x='254.5' y='296' width='12' height='12' fill='#1d4ed8' rx='2'/>
+<text x='270.5' y='306' fill='#1f2328'>frames paced / lingered</text>
 </svg>

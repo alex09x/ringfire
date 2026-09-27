@@ -116,8 +116,8 @@ number was worth reporting:
    back at 500 k msg/s. It now handles at most 32 datagrams per call.
 3. **No batching while keeping up.** A sender that keeps pace with the producer sends one
    record per datagram. Above ~20,000 msg/s that is a system call and a packet per record,
-   and this kernel path sustains about 40,000 datagrams/s: latency went from 50 µs to over
-   a millisecond. Frames are now paced: they leave at most once per 50 µs unless full,
+   and this kernel path sustains about 40,000 datagrams/s. At 50,000 msg/s without
+   linger, round-trip latency reached 830 µs p50 and 1.5 ms p99. Frames are now paced: they leave at most once per 50 µs unless full,
    and a lone record arriving later than that after the previous frame goes out at once,
    so quiet and bursty streams pay nothing. Three pacing rules were tried; the two that
    waited "whenever the previous frame was recent" or "whenever a backlog was seen"

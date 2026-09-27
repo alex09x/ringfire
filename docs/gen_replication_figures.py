@@ -259,12 +259,12 @@ grouped("wan-percentiles.svg", "Tokyo → Los Angeles, one-way latency by percen
         [("TCP", [50.4, 50.5, 99.6, 127, 132], OTHER),
          ("UDP unicast", [51.7, 51.7, 51.7, 56.2, 61.2], NET),
          ("UDP unicast, every datagram twice", [51.5, 51.5, 51.6, 53.6, 57.6], OK)],
-        "milliseconds; 100 ms ping; TCP recovers about one record in a hundred with a full extra round trip")
+        "milliseconds; clock-offset error is a few ms: compare tail spreads, not medians; 100 ms ping")
 
 # 7. Pacing under load -------------------------------------------------------------------------------------
 grouped("pacing.svg", "Why frames are paced: round trip p50 by publish rate, multicast",
         ["20,000/s", "50,000/s"],
-        [("one record per datagram", [51, 830], OTHER),
+        [("no linger / unpaced", [51, 830], OTHER),
          ("frames paced / lingered", [88, 213], NET)],
         "microseconds; blue: adaptive pacing at 20,000/s, 100 µs linger at 50,000/s; 5 seconds per run",
         h=320)

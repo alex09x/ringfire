@@ -2,7 +2,7 @@
 <defs><marker id='a' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1f2328'/></marker><marker id='n' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1d4ed8'/></marker><marker id='r' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#c0392b'/></marker></defs>
 <rect width='900' height='340' fill='white'/>
 <text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>Tokyo → Los Angeles, one-way latency by percentile, 1,000 msg/s for 5 s</text>
-<text x='16' y='42' fill='#6a737d'>milliseconds; 100 ms ping; TCP recovers about one record in a hundred with a full extra round trip</text>
+<text x='16' y='42' fill='#6a737d'>milliseconds; clock-offset error is a few ms: compare tail spreads, not medians; 100 ms ping</text>
 <line x1='70' x2='880' y1='278.0' y2='278.0' stroke='#d0d7de'/>
 <text x='64' y='282.0' text-anchor='end' fill='#6a737d'>0</text>
 <line x1='70' x2='880' y1='200.8' y2='200.8' stroke='#d0d7de'/>
