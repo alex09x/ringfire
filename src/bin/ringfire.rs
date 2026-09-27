@@ -74,6 +74,8 @@ SUBCOMMANDS:
 OPTIONS:
     --json                          Output in JSON format (stat only)
     --interval-ms <N>               Refresh interval in milliseconds for top (default: 500)
+    --iterations <N>                top: exit after N refreshes instead of running forever
+                                     (must be a positive integer)
     --tail <N>                      Number of recent slots to inspect in dump (default: 10)
     --hex                           Print slot payload in hex format
     --bind <ADDR>                   Listen address for serve (e.g. 0.0.0.0:7400)
@@ -88,7 +90,9 @@ OPTIONS:
     --batch <N>                     Max records per frame for serve (default: 256)
     --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
     --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
-    --once                          Exit when the source disconnects instead of reconnecting
+    --once                          serve: accept a single mirror and exit once it disconnects
+                                     (no other mirror is accepted); mirror: exit once the source
+                                     disconnects instead of reconnecting to it
     --reconnect-ms <N>              Delay between reconnect attempts (default: 500)
     -h, --help                      Show help information
     -V, --version                   Show version
@@ -97,15 +101,7 @@ OPTIONS:
     );
 }
 
-extern "C" fn sig_handler(_: libc::c_int) {
-    unsafe { libc::exit(0) };
-}
-
 fn main() {
-    unsafe {
-        libc::signal(libc::SIGINT, sig_handler as *const () as _);
-        libc::signal(libc::SIGTERM, sig_handler as *const () as _);
-    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         print_usage();
@@ -138,16 +134,20 @@ fn main() {
             }
             let path = &args[2];
             let mut interval_ms = 500u64;
-            let mut iterations: Option<u64> = std::env::var("RINGFIRE_TOP_ITERATIONS")
-                .ok()
-                .and_then(|v| v.parse().ok());
+            let mut iterations: Option<u64> = None;
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "--interval-ms" && i + 1 < args.len() {
                     interval_ms = args[i + 1].parse().unwrap_or(500);
                     i += 2;
                 } else if args[i] == "--iterations" && i + 1 < args.len() {
-                    iterations = args[i + 1].parse().ok();
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) if n > 0 => iterations = Some(n),
+                        _ => {
+                            eprintln!("Error: --iterations expects a positive integer.");
+                            std::process::exit(1);
+                        }
+                    }
                     i += 2;
                 } else {
                     i += 1;
@@ -777,10 +777,10 @@ fn cmd_top(path_str: &str, interval_ms: u64, iterations: Option<u64>) -> Result<
         );
         println!("Press Ctrl+C to exit.");
         count += 1;
-        if let Some(limit) = iterations {
-            if count >= limit {
-                break;
-            }
+        if let Some(limit) = iterations
+            && count >= limit
+        {
+            break;
         }
     }
     Ok(())
