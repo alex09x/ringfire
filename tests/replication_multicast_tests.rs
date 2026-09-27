@@ -117,22 +117,28 @@ fn multicast_or_skip(index: u16) -> Option<MulticastConfig> {
     if multicast_works(&cfg) {
         Some(cfg)
     } else {
-        eprintln!("skipping multicast test: no multicast delivery on this host");
+        let is_linux_ci = cfg!(target_os = "linux") && std::env::var_os("CI").is_some();
+        if is_linux_ci {
+            panic!(
+                "multicast delivery must work in Linux CI, but probe failed for group {}:{}",
+                cfg.group, cfg.port
+            );
+        }
+        eprintln!(
+            "SKIPPED: unsupported environment (multicast delivery not available on this host for group {}:{})",
+            cfg.group, cfg.port
+        );
         None
     }
 }
 
-fn connect_or_skip(addr: SocketAddr, copy: &PathBuf, start: MirrorStart) -> Option<Mirror> {
-    match Mirror::builder().start(start).connect(addr, copy) {
-        Ok(mirror) => {
-            assert!(mirror.is_multicast());
-            Some(mirror)
-        }
-        Err(e) => {
-            eprintln!("skipping multicast test: {}", e);
-            None
-        }
-    }
+fn connect_or_skip(addr: SocketAddr, copy: &PathBuf, start: MirrorStart) -> Mirror {
+    let mirror = Mirror::builder()
+        .start(start)
+        .connect(addr, copy)
+        .expect("mirror failed to connect to replica server");
+    assert!(mirror.is_multicast());
+    mirror
 }
 
 #[test]
@@ -147,9 +153,7 @@ fn multicast_delivers_live_records_in_order() {
         return;
     };
     let addr = start_server(&source, cfg);
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Latest);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();
@@ -186,9 +190,7 @@ fn multicast_history_is_fetched_over_tcp_then_live_continues() {
         return;
     };
     let addr = start_server(&source, cfg);
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Oldest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Oldest);
     assert_eq!(mirror.first_sequence(), 1);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
@@ -232,9 +234,7 @@ fn multicast_recovers_dropped_datagrams_in_order() {
         return;
     };
     let addr = start_server(&source, cfg.drop_every(3));
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Latest);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();
@@ -273,9 +273,7 @@ fn multicast_last_datagram_loss_is_recovered_by_heartbeat() {
         return;
     };
     let addr = start_server(&source, cfg.drop_every(2));
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Latest);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();
@@ -309,9 +307,7 @@ fn multicast_lapped_source_yields_gaps_but_never_disorder() {
         return;
     };
     let addr = start_server(&source, cfg);
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Oldest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Oldest);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();
@@ -368,9 +364,7 @@ fn multicast_ignores_datagrams_from_another_session() {
         return;
     };
     let addr = start_server(&source, cfg);
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Latest);
     let session = mirror.session();
     let mut consumer = RingConsumer::<Tick>::attach(&copy).unwrap();
 
@@ -451,9 +445,7 @@ fn multicast_reordered_datagrams_are_written_in_order() {
         return;
     };
     let addr = start_server(&source, cfg.swap_every(4));
-    let Some(mut mirror) = connect_or_skip(addr, &copy, MirrorStart::Latest) else {
-        return;
-    };
+    let mut mirror = connect_or_skip(addr, &copy, MirrorStart::Latest);
     let handle = mirror.handle().unwrap();
     let runner = thread::spawn(move || {
         mirror.run().unwrap();

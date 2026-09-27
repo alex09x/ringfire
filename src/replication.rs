@@ -2548,3 +2548,6 @@ impl std::fmt::Debug for Mirror {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests;
