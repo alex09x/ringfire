@@ -123,7 +123,7 @@ copying, which is what lets a `LosslessBackpressure` producer reuse slots safely
 - [x] **Tokio Concurrency Stress Test**: Background tasks verify zero starvation during heavy stream ingestion (`tests/tokio_tests.rs`).
 - [x] **Criterion Benchmark Suite on AMD Ryzen 9 7950X (`booster`)**:
   - **SPMC Push Throughput**: **588.70 Million messages / sec** (1.70 ns per push)
-  - **SPMC Recv Throughput**: **83.74 Million messages / sec** (11.94 ns per try_recv)
+  - **SPMC Recv Throughput**: withdrawn (the 83.74 M msg/s, 11.94 ns figure came from a harness that also timed pushes and empty polls; see `docs/benchmarking.md`)
   - **Ping-Pong RTT Latency**: **245.80 ns** round-trip across threads via shared memory (~61 ns one-way)
   - **Blackboard Read**: **4.09 ns**
   - **Blackboard Write**: **1.19 ns**

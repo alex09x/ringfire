@@ -5,6 +5,33 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Receive benches (`throughput`, `arena_vs_fixed`) time only successful,
+  sequence-checked receives. Messages are refilled outside the timer. Before, they timed
+  empty polls once the backlog drained, or pushes whenever the reader caught up. The
+  in-place view bench no longer reuses a drained consumer. `recv_batch(32)` counts 32
+  messages per iteration.
+- Benches use unique ring paths on `/dev/shm` (or `RINGFIRE_BENCH_DIR`) and remove them.
+  They check replies by sequence and bound every wait.
+- Replication examples no longer hang when a record is lost: phases end on the last
+  sequence or an idle timeout. Losses, duplicates and reordering are counted by distinct
+  sequence, pacing no longer drifts, mirror errors set the exit status, and
+  `replication_stages` stamps pushes without a lock and checks clock drift.
+
+### Added
+- `docs/benchmarking.md`: measurement definitions, clock domains, the audit, the status of
+  every published figure, and how to reproduce a measurement.
+- `scripts/bench-smoke.sh` and `tests/harness_support_tests.rs` check the harnesses.
+- `--exit-on-close` for the pongers of `replication_pingpong` and `replication_stress`.
+  `--warmup` and `--timeout-ms` for the pingpong pinger, `--idle-ms` for
+  `replication_latency` and `replication_stress`, and `--drain-secs` for the
+  `replication_stages` master.
+
+### Changed
+- README: the `try_recv` and `recv_batch(32)` figures are withdrawn until re-measured.
+
 ## [0.5.1] - 2026-09-26
 
 Documentation release; library behavior and wire protocols are unchanged from v0.5.0.

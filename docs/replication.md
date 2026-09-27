@@ -136,6 +136,10 @@ so treat ±10 µs at the median as noise between runs.
 
 ### Per stage, on every host at once
 
+These figures predate the harness revision in [benchmarking.md](benchmarking.md). The
+stage harness then took a lock between stamping a record and pushing it, which can only
+delay a sample; the stage figures have not been re-measured since.
+
 `examples/replication_stages.rs`: the master stamps each record on push; a consumer
 on the master and one on each of eight slaves (six on the second host, two on the
 master's own host) stamp the read. Slave clocks are translated into the master's with

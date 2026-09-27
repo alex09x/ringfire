@@ -1,8 +1,11 @@
 //! Round-trip latency of a 64-byte message between two threads over different IPC
 //! mechanisms, measured the same way: the bench thread sends a ping and waits for the
-//! echo thread's reply. One iteration = one round trip.
+//! echo thread's reply. One iteration = one round trip; exactly one ping is in flight, so
+//! every reply must carry the sequence just sent.
 //!
 //! `cargo bench --bench ipc_compare`
+
+mod support;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ringfire::{FutexWait, RingConsumer, RingProducer};
@@ -11,6 +14,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
+use support::{AbortOnPanic, SpinBound, TempShm, REPLY_TIMEOUT};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -28,18 +32,16 @@ fn msg(seq: u64) -> Msg64 {
 /// Ping-pong over two rings. `blocking` selects `FutexWait` (sleeps in the kernel when
 /// idle, like a socket read) instead of busy polling on both sides.
 fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
-    let dir = std::env::temp_dir();
-    let fwd = dir.join(format!("bench_cmp_fwd_{}.shm", name));
-    let rev = dir.join(format!("bench_cmp_rev_{}.shm", name));
-    let _ = std::fs::remove_file(&fwd);
-    let _ = std::fs::remove_file(&rev);
+    let fwd = TempShm::new(&format!("cmp_fwd_{}", name));
+    let rev = TempShm::new(&format!("cmp_rev_{}", name));
 
-    let mut prod_fwd = RingProducer::<Msg64>::create(&fwd, 4096).unwrap();
-    let mut prod_rev = RingProducer::<Msg64>::create(&rev, 4096).unwrap();
-    let mut cons_fwd = RingConsumer::<Msg64>::attach(&fwd).unwrap();
-    let mut cons_rev = RingConsumer::<Msg64>::attach(&rev).unwrap();
+    let mut prod_fwd = RingProducer::<Msg64>::create(fwd.path(), 4096).unwrap();
+    let mut prod_rev = RingProducer::<Msg64>::create(rev.path(), 4096).unwrap();
+    let mut cons_fwd = RingConsumer::<Msg64>::attach(fwd.path()).unwrap();
+    let mut cons_rev = RingConsumer::<Msg64>::attach(rev.path()).unwrap();
 
     let echo = thread::spawn(move || {
+        let _abort = AbortOnPanic("ringfire echo");
         let mut wait = FutexWait::default();
         loop {
             let ping = if blocking {
@@ -64,36 +66,36 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
     c.bench_function(&format!("ipc_rtt_64B/{}", name), |b| {
         b.iter(|| {
             prod_fwd.push(black_box(&msg(seq)));
-            loop {
-                let resp = if blocking {
-                    cons_rev.recv_blocking(&mut wait)
-                } else {
-                    match cons_rev.try_recv() {
-                        Some(r) => r,
-                        None => {
-                            core::hint::spin_loop();
-                            continue;
-                        }
+            // The echo thread aborts the process if it panics, so the blocking receive
+            // cannot wait for a reply that will never come.
+            let resp = if blocking {
+                cons_rev.recv_blocking(&mut wait)
+            } else {
+                let mut bound = SpinBound::new("ringfire reply", REPLY_TIMEOUT);
+                loop {
+                    if let Some(r) = cons_rev.try_recv() {
+                        break r;
                     }
-                };
-                if resp.seq == seq {
-                    black_box(resp);
-                    break;
+                    bound.spin();
                 }
-            }
+            };
+            assert_eq!(resp.seq, seq, "{}: reply out of sequence", name);
+            black_box(resp);
             seq += 1;
         });
     });
 
     prod_fwd.push(&msg(STOP));
     echo.join().unwrap();
+    assert_eq!(cons_rev.lapped_count(), 0, "{}: reply reader was lapped", name);
 }
 
 fn as_bytes(m: &Msg64) -> &[u8] {
     unsafe { std::slice::from_raw_parts((m as *const Msg64).cast::<u8>(), 64) }
 }
 
-/// Ping-pong over a byte stream (socket or pipe pair). The echo side exits on EOF.
+/// Ping-pong over a byte stream (socket or pipe pair). The echo side exits on EOF, and a
+/// failed echo closes its end, so the bench's `read_exact` fails instead of blocking.
 fn bench_stream<R, W>(c: &mut Criterion, name: &str, mut tx: W, mut rx: R, echo: impl FnOnce() + Send + 'static)
 where
     R: Read,
@@ -106,6 +108,8 @@ where
         b.iter(|| {
             tx.write_all(as_bytes(&msg(seq))).unwrap();
             rx.read_exact(&mut buf).unwrap();
+            let got = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            assert_eq!(got, seq, "{}: reply out of sequence", name);
             black_box(&buf);
             seq += 1;
         });

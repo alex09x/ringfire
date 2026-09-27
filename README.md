@@ -36,10 +36,16 @@ xychart-beta
 | Operation | Time | Rate |
 | :--- | ---: | ---: |
 | `push` (no reader attached) | 1.88 ns | 533 M msg/s |
-| `try_recv` | 6.4 ns | 156 M msg/s |
-| `recv_batch(32)` | 2.3 ns / msg | 431 M msg/s |
+| `try_recv` | pending re-measurement¹ | — |
+| `recv_batch(32)` | pending re-measurement¹ | — |
 | `push` with a reader draining on another core | 41 ns | 24 M msg/s |
 | Blackboard read / write (O(1) seqlock) | 2.1 / 1.1 ns | — |
+
+¹ The earlier `try_recv` (6.4 ns) and `recv_batch(32)` (2.3 ns / msg) figures are withdrawn:
+that harness timed a push whenever the reader had caught up, so they averaged receives with
+empty polls and pushes. The corrected benches time only successful, sequence-checked
+receives; new figures will be published once measured. See
+[docs/benchmarking.md](docs/benchmarking.md).
 
 The last `push` row is the realistic cross-process figure: it is bound by moving cache lines
 between cores, and costs the same with lossless backpressure enabled (+0.8 ns). Every read is
@@ -139,8 +145,8 @@ Measured with protocol v2 (v0.4.0), 64-byte messages:
 | Metric | Measured Value | Rate / Notes |
 | :--- | :--- | :--- |
 | **SPMC Single-Message Push** (no reader) | **1.88 ns** | 533 Million msgs / sec |
-| **SPMC Non-Blocking `try_recv`** | **6.41 ns** | 156 Million msgs / sec |
-| **SPMC Batch Drain (`recv_batch(32)`)** | **74.2 ns** (2.3 ns / msg) | 431 Million msgs / sec |
+| **SPMC Non-Blocking `try_recv`** | pending re-measurement | earlier 6.41 ns withdrawn (harness timed pushes and empty polls) |
+| **SPMC Batch Drain (`recv_batch(32)`)** | pending re-measurement | earlier 74.2 ns withdrawn (same defect) |
 | **Push with a reader draining on another core** | **41.2 ns** lossy / **42.0 ns** lossless | Cross-core cache-line transfer; the lossless gate adds < 1 ns |
 | **Roundtrip Latency (Ping-Pong RTT)** | **249.6 ns** | ~125 ns one-way cross-thread IPC |
 | **Blackboard Seqlock Read (O(1))** | **2.13 ns** | Tear-free snapshot read |
@@ -150,6 +156,8 @@ Measured with protocol v2 (v0.4.0), 64-byte messages:
 Single-threaded figures measure the instruction path with a warm cache; real cross-process
 throughput is bounded by the cross-core transfer shown in the "with a reader" row.
 `tests/regression_tests.rs` checks that no torn record is ever returned under continuous lapping.
+What each bench and replication example measures, how to run them on an isolated host, and
+the status of every published figure: [docs/benchmarking.md](docs/benchmarking.md).
 
 ---
 
