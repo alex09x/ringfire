@@ -76,7 +76,7 @@ fn encode_frame(kind: u8, flags: u8, count: u16, len: u32, seq: u64) -> [u8; 16]
 fn valid_geometry_payload(capacity: u64, element_size: u32) -> [u8; GEOMETRY_LEN] {
     let mut b = [0u8; GEOMETRY_LEN];
     let flags = 0u32;
-    let schema_sig = 0x1234_5678u64;
+    let schema_sig = 0u64; // mock wire records are untyped bytes
     let registry_count = 0u32;
     let slots_offset = 128u32;
     let arena_offset = 0u64;
@@ -832,6 +832,12 @@ fn test_unicast_mock_protocol_recovery_and_edge_cases() {
 
     mirror.step().unwrap();
     assert_eq!(mirror.sequence(), 3);
+    let mut reader = RingConsumer::<[u8; 24]>::attach(&dst).unwrap();
+    for byte in 1..=3 {
+        assert_eq!(reader.try_recv(), Some([byte; 24]));
+    }
+    assert_eq!(reader.try_recv(), None);
+    assert_eq!(reader.lapped_count(), 0);
 
     let (mut tcp_stream, udp_sock, mirror_addr) = srv.join().unwrap();
 
@@ -1518,6 +1524,11 @@ fn test_mirror_multicast_out_of_order_datagram_pending() {
         let _ = mirror.step();
     }
     assert_eq!(mirror.sequence(), 2);
+    let mut reader = RingConsumer::<[u8; 24]>::attach(&dst).unwrap();
+    assert_eq!(reader.try_recv(), Some([11; 24]));
+    assert_eq!(reader.try_recv(), Some([42; 24]));
+    assert_eq!(reader.try_recv(), None);
+    assert_eq!(reader.lapped_count(), 0);
 
     drop(srv.join().unwrap());
     let _ = std::fs::remove_file(&dst);
@@ -1626,6 +1637,14 @@ fn test_mirror_duplicate_arena_frame() {
     assert_eq!(mirror.sequence(), 1);
     assert!(mirror.step().unwrap());
     assert_eq!(mirror.sequence(), 1);
+    let mut reader = BlobConsumer::<u64>::attach(&dst).unwrap();
+    let mut meta = 99;
+    let mut blob = [0; 10];
+    assert_eq!(reader.recv(&mut meta, &mut blob).unwrap(), Some(10));
+    assert_eq!(meta, 0);
+    assert_eq!(blob, [42; 10]);
+    assert_eq!(reader.recv(&mut meta, &mut blob).unwrap(), None);
+    assert_eq!(reader.lapped_count(), 0);
 
     drop(srv.join().unwrap());
     let _ = std::fs::remove_file(&dst);
