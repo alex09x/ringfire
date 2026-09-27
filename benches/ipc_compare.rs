@@ -1,7 +1,13 @@
 //! Round-trip latency of a 64-byte message between two threads over different IPC
 //! mechanisms, measured the same way: the bench thread sends a ping and waits for the
 //! echo thread's reply. One iteration = one round trip; exactly one ping is in flight, so
-//! every reply must carry the sequence just sent.
+//! every reply must carry the sequence and payload just sent, unmodified — checked in
+//! full for every mechanism, not just the sequence, so a corruption in the other 56 bytes
+//! cannot pass unnoticed on one transport but not another.
+//!
+//! Every wait here is bounded: a per-mechanism [`Watchdog`] aborts the process if a round
+//! trip stalls, so a peer that stays alive but stops making progress cannot hang the
+//! bench (unlike [`AbortOnPanic`], which only covers a peer that panics).
 //!
 //! `cargo bench --bench ipc_compare`
 
@@ -14,7 +20,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
-use support::{AbortOnPanic, SpinBound, TempShm, REPLY_TIMEOUT};
+use support::{AbortOnPanic, SpinBound, TempShm, Watchdog, REPLY_TIMEOUT};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -63,11 +69,15 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
 
     let mut seq = 1u64;
     let mut wait = FutexWait::default();
+    // `recv_blocking` is a real kernel wait with no built-in timeout, so `SpinBound`
+    // (which only bounds the busy-poll loop) cannot cover it. The watchdog is an
+    // independent guard against the echo thread staying alive but stuck; `AbortOnPanic`
+    // on that thread only covers it panicking outright.
+    let watchdog = Watchdog::start(name, Watchdog::default_limit());
     c.bench_function(&format!("ipc_rtt_64B/{}", name), |b| {
         b.iter(|| {
-            prod_fwd.push(black_box(&msg(seq)));
-            // The echo thread aborts the process if it panics, so the blocking receive
-            // cannot wait for a reply that will never come.
+            let ping = msg(seq);
+            prod_fwd.push(black_box(&ping));
             let resp = if blocking {
                 cons_rev.recv_blocking(&mut wait)
             } else {
@@ -79,11 +89,14 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
                     bound.spin();
                 }
             };
+            watchdog.heartbeat();
             assert_eq!(resp.seq, seq, "{}: reply out of sequence", name);
+            assert_eq!(resp.payload, ping.payload, "{}: reply payload corrupted", name);
             black_box(resp);
             seq += 1;
         });
     });
+    drop(watchdog);
 
     prod_fwd.push(&msg(STOP));
     echo.join().unwrap();
@@ -95,7 +108,9 @@ fn as_bytes(m: &Msg64) -> &[u8] {
 }
 
 /// Ping-pong over a byte stream (socket or pipe pair). The echo side exits on EOF, and a
-/// failed echo closes its end, so the bench's `read_exact` fails instead of blocking.
+/// failed echo closes its end, so the bench's `read_exact` fails instead of blocking. A
+/// peer that stays open but stalls (no EOF, no bytes) has no such signal, so it is bounded
+/// by the watchdog instead.
 fn bench_stream<R, W>(c: &mut Criterion, name: &str, mut tx: W, mut rx: R, echo: impl FnOnce() + Send + 'static)
 where
     R: Read,
@@ -104,16 +119,21 @@ where
     let handle = thread::spawn(echo);
     let mut seq = 1u64;
     let mut buf = [0u8; 64];
+    let watchdog = Watchdog::start(name, Watchdog::default_limit());
     c.bench_function(&format!("ipc_rtt_64B/{}", name), |b| {
         b.iter(|| {
-            tx.write_all(as_bytes(&msg(seq))).unwrap();
+            let ping = msg(seq);
+            tx.write_all(as_bytes(&ping)).unwrap();
             rx.read_exact(&mut buf).unwrap();
-            let got = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-            assert_eq!(got, seq, "{}: reply out of sequence", name);
+            watchdog.heartbeat();
+            let got_seq = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            assert_eq!(got_seq, seq, "{}: reply out of sequence", name);
+            assert_eq!(&buf[..], as_bytes(&ping), "{}: reply payload corrupted", name);
             black_box(&buf);
             seq += 1;
         });
     });
+    drop(watchdog);
     drop(tx);
     drop(rx);
     handle.join().unwrap();

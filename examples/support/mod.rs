@@ -200,11 +200,13 @@ pub enum Received {
     Idle,
 }
 
-/// Polls `poll` until it yields a record whose sequence is at least `last`, or until
-/// no record arrived for `idle` (`first_wait` before the first record). `on_record` is
-/// called for every record right after `poll` returns it, so it can take the arrival
-/// timestamp. The clock is read only every 256 empty polls. Never waits forever, so a
-/// lost record ends the run with a loss count instead of a hang.
+/// Polls `poll` until it yields a record whose sequence is at least `last`, or until no
+/// *new* highest sequence has arrived for `idle` (`first_wait` before the first record).
+/// `on_record` is called for every record right after `poll` returns it, so it can take
+/// the arrival timestamp. The clock is read only every 256 polls, whether or not `poll`
+/// returned a record. Never waits forever: a lost record ends the run with a loss count
+/// instead of a hang, and neither a flood of duplicates/stale sequences nor a `poll` that
+/// never returns `None` can keep resetting the idle timer without real progress.
 pub fn receive_until<T>(
     mut poll: impl FnMut() -> Option<T>,
     seq_of: impl Fn(&T) -> u64,
@@ -215,25 +217,33 @@ pub fn receive_until<T>(
 ) -> Received {
     let mut last_arrival = Instant::now();
     let mut any = false;
-    let mut empty = 0u32;
+    let mut highest = 0u64;
+    let mut polls = 0u32;
     loop {
-        if let Some(record) = poll() {
-            on_record(&record);
-            any = true;
-            empty = 0;
-            if seq_of(&record) >= last {
-                return Received::Complete;
-            }
-            last_arrival = Instant::now();
-        } else {
-            empty = empty.wrapping_add(1);
-            if empty.is_multiple_of(256) {
-                let limit = if any { idle } else { first_wait };
-                if last_arrival.elapsed() > limit {
-                    return Received::Idle;
+        match poll() {
+            Some(record) => {
+                on_record(&record);
+                any = true;
+                let seq = seq_of(&record);
+                if seq >= last {
+                    return Received::Complete;
+                }
+                // Only a new highest sequence counts as progress: a duplicate or a
+                // record below the highest seen so far must not be able to stall the
+                // idle timeout forever.
+                if seq > highest {
+                    highest = seq;
+                    last_arrival = Instant::now();
                 }
             }
-            core::hint::spin_loop();
+            None => core::hint::spin_loop(),
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(256) {
+            let limit = if any { idle } else { first_wait };
+            if last_arrival.elapsed() > limit {
+                return Received::Idle;
+            }
         }
     }
 }

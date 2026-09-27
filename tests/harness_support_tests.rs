@@ -11,7 +11,7 @@ mod bench_support;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use bench_support::{timed_chunks, SpinBound, TempShm};
+use bench_support::{timed_chunks, timed_chunks_with_clock, SpinBound, TempShm};
 use support::{latency_line, percentile, receive_until, Pacer, Received, SeqTracker};
 
 #[test]
@@ -150,6 +150,27 @@ fn receive_until_gives_up_when_nothing_arrives() {
 }
 
 #[test]
+fn receive_until_bounds_a_flood_of_records_that_never_advances() {
+    // `poll` always returns a record (never `None`) and it never reaches `last`: a naive
+    // idle timer that only resets on *any* arrival, or that is only checked on an empty
+    // poll, would spin forever instead of ending on the idle timeout.
+    let start = Instant::now();
+    let end = receive_until(
+        || Some(1u64),
+        |s| *s,
+        10,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        |_| {},
+    );
+    assert_eq!(end, Received::Idle);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a stream of non-advancing records was not bounded"
+    );
+}
+
+#[test]
 fn timed_chunks_prepares_every_operation_and_times_only_runs() {
     let mut prepared = Vec::new();
     let mut ran = Vec::new();
@@ -158,14 +179,45 @@ fn timed_chunks_prepares_every_operation_and_times_only_runs() {
         4,
         |n| {
             prepared.push(n);
-            // Setup cost that must not show up in the result.
-            std::thread::sleep(Duration::from_millis(30));
         },
         |n| ran.push(n),
     );
     assert_eq!(prepared, vec![4, 4, 2]);
     assert_eq!(ran, vec![4, 4, 2]);
-    assert!(total < Duration::from_millis(30), "setup was timed: {:?}", total);
+    assert!(total < Duration::from_secs(1), "run itself should be near-instant: {:?}", total);
+}
+
+#[test]
+fn timed_chunks_excludes_setup_time_from_the_result() {
+    // Real timing is deterministic here: `now`/`elapsed` are a fake clock driven only by
+    // how much time `prepare`/`run` say they took, not by wall-clock scheduling. A real
+    // sleep timed against a wall-clock upper bound would be flaky under a loaded machine;
+    // this is exact instead of a fragile bound.
+    let fake_ns = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let now = {
+        let fake_ns = fake_ns.clone();
+        move || fake_ns.get()
+    };
+    let elapsed = {
+        let fake_ns = fake_ns.clone();
+        move |start: &u64| Duration::from_nanos(fake_ns.get() - start)
+    };
+    const SETUP_NS: u64 = 30_000_000;
+    const RUN_NS: u64 = 1_000_000;
+    let prepare = {
+        let fake_ns = fake_ns.clone();
+        move |_: u64| fake_ns.set(fake_ns.get() + SETUP_NS)
+    };
+    let run = {
+        let fake_ns = fake_ns.clone();
+        move |_: u64| fake_ns.set(fake_ns.get() + RUN_NS)
+    };
+
+    let total = timed_chunks_with_clock(10, 4, prepare, run, now, elapsed);
+
+    // 3 chunks (4, 4, 2) each contribute one `run`'s worth of fake time; none of the 3
+    // `prepare` calls' fake time is included.
+    assert_eq!(total, Duration::from_nanos(3 * RUN_NS));
 }
 
 #[test]

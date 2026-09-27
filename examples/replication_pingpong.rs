@@ -19,6 +19,13 @@
 //! come within `--timeout-ms` is counted lost, and a reply that comes later is counted
 //! late (not as a sample). The ponger echoes forever, or with `--exit-on-close 1` exits
 //! once the pinger's source closes.
+//!
+//! Warm-up and measured pings are counted separately: the headline lost/late/unexpected
+//! counts cover only the `samples` pings after warm-up, with the warm-up counts reported
+//! alongside so a warm-up error is never silently folded into the measured figure. Each
+//! ping's wait also enforces `--timeout-ms` as a hard deadline every iteration of the
+//! wait loop, not only when nothing has arrived: a continuous stream of late/unexpected
+//! replies cannot keep postponing the deadline check.
 
 mod support;
 
@@ -177,7 +184,10 @@ fn main() {
             let now_ns = || epoch.elapsed().as_nanos() as u64;
             let timeout = Duration::from_millis(timeout_ms);
             let mut rtt: Vec<i64> = Vec::with_capacity(samples as usize);
+            // Measured (post-warmup) and warm-up counts are kept apart so a warm-up loss
+            // or reorder never hides inside the headline "after warm-up" figures.
             let (mut lost, mut late, mut unexpected) = (0u64, 0u64, 0u64);
+            let (mut warmup_lost, mut warmup_late, mut warmup_unexpected) = (0u64, 0u64, 0u64);
             let mut pace = Pacer::every(Duration::from_micros(paced_us));
             // The first `warmup` pings warm up the path (connections, page faults) and are
             // not measured.
@@ -188,30 +198,45 @@ fn main() {
                     seq,
                     _pad: [0; 40],
                 });
+                let measured = seq > warmup;
                 let deadline = Instant::now() + timeout;
                 loop {
+                    // Checked on every iteration, not only when nothing arrived: a
+                    // continuous stream of late/unexpected replies must not be able to
+                    // evade the deadline by always taking the `Some` branch below.
+                    if Instant::now() > deadline {
+                        if measured {
+                            lost += 1;
+                        } else {
+                            warmup_lost += 1;
+                        }
+                        break;
+                    }
                     if let Some(msg) = input.try_recv() {
                         let arrived = now_ns();
                         if msg.seq == seq {
-                            if seq > warmup {
+                            if measured {
                                 rtt.push(elapsed_ns(msg.sent_ns, arrived));
                             }
                             break;
                         } else if msg.seq < seq {
-                            late += 1;
-                        } else {
+                            if measured {
+                                late += 1;
+                            } else {
+                                warmup_late += 1;
+                            }
+                        } else if measured {
                             unexpected += 1;
+                        } else {
+                            warmup_unexpected += 1;
                         }
-                    } else if Instant::now() > deadline {
-                        lost += 1;
-                        break;
                     } else {
                         core::hint::spin_loop();
                     }
                 }
             }
             println!(
-                "pinger -> ponger -> pinger round trip, {} pings after {} warm-up, paced {} us, {} B slots: {} lost (>{} ms), {} late, {} unexpected, reader lapped {}",
+                "pinger -> ponger -> pinger round trip, {} pings after {} warm-up, paced {} us, {} B slots: measured {} lost (>{} ms), {} late, {} unexpected (warm-up: {} lost, {} late, {} unexpected), reader lapped {}",
                 samples,
                 warmup,
                 paced_us,
@@ -220,6 +245,9 @@ fn main() {
                 timeout_ms,
                 late,
                 unexpected,
+                warmup_lost,
+                warmup_late,
+                warmup_unexpected,
                 input.lapped_count()
             );
             println!("  rtt {}", latency_line(&mut rtt));

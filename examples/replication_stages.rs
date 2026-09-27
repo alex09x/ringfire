@@ -26,7 +26,7 @@
 mod support;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,8 +120,25 @@ fn clock_service(listener: TcpListener, sent: SentTimes, echoes: Echoes, active:
     }
 }
 
+/// Connects to `addr` with a bounded connect time, and sets a bounded read/write timeout
+/// on the resulting socket so a peer that accepts but then stops responding cannot hang a
+/// later `read_exact`/`write_all` on it forever.
+fn connect_bounded(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let target = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {}", addr))
+    })?;
+    let stream = TcpStream::connect_timeout(&target, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
 /// Estimates `master clock - slave clock` from the minimum-round-trip probe on `stream`.
-/// Returns the offset and that probe's round trip.
+/// Returns the offset and that probe's round trip. `stream` is expected to already carry
+/// a read/write timeout (see [`connect_bounded`]), so a probe whose peer stops responding
+/// ends the loop early (returning the best estimate so far) instead of hanging: the
+/// per-probe budget below only bounds how many *successful* probes are attempted, not a
+/// stalled `read_exact`/`write_all`.
 fn clock_offset(stream: &mut TcpStream, probes: usize) -> (i64, i64) {
     let mut best_rtt = i64::MAX;
     let mut best_offset = 0i64;
@@ -135,8 +152,9 @@ fn clock_offset(stream: &mut TcpStream, probes: usize) -> (i64, i64) {
         }
         let t1 = wall_ns();
         req[8..16].copy_from_slice(&t1.to_le_bytes());
-        stream.write_all(&req).unwrap();
-        stream.read_exact(&mut reply).unwrap();
+        if stream.write_all(&req).is_err() || stream.read_exact(&mut reply).is_err() {
+            break;
+        }
         let t4 = wall_ns();
         let t2 = i64::from_le_bytes(reply[8..16].try_into().unwrap());
         let t3 = i64::from_le_bytes(reply[16..24].try_into().unwrap());
@@ -316,7 +334,7 @@ fn main() {
             let _ = std::fs::remove_file(&ring);
         }
         "slave" => {
-            let mut echo = TcpStream::connect(clock.as_str()).unwrap();
+            let mut echo = connect_bounded(clock.as_str(), Duration::from_secs(10)).unwrap();
             echo.set_nodelay(true).unwrap();
             let (offset, sync_rtt) = clock_offset(&mut echo, 400);
             let _ = std::fs::remove_file(&ring);
