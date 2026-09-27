@@ -640,7 +640,7 @@ rely on x86-64 store ordering (Python has no fences); use a Rust or C producer o
 
 ## 👥 Author
 
-**Alexander Panasenko**
+[**Alexander Panasenko**](https://prod.codes/about/)
 - Email: [alex@prod.codes](mailto:alex@prod.codes)
 - GitHub: [@alex09x](https://github.com/alex09x)
 
