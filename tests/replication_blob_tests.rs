@@ -1,3 +1,6 @@
+#[path = "support/multicast.rs"]
+mod multicast_support;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::thread;
@@ -26,37 +29,6 @@ fn payload(seq: u64, max: usize) -> Vec<u8> {
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ringfire_blob_{}_{}.shm", name, std::process::id()))
-}
-
-fn multicast(index: u16) -> MulticastConfig {
-    let base = 44_000 + (std::process::id() % 2_000) as u16 * 8;
-    MulticastConfig::new(Ipv4Addr::new(239, 255, 44, 1 + index as u8), base + index)
-}
-
-/// Whether a datagram sent to `cfg`'s group comes back to a joined socket on this host
-/// within a moment. GitHub's macOS runners, for one, have no multicast route at all.
-fn multicast_works(cfg: &MulticastConfig) -> bool {
-    use std::net::UdpSocket;
-    let Ok(rx) = UdpSocket::bind(("0.0.0.0", cfg.port)) else {
-        return false;
-    };
-    if rx
-        .join_multicast_v4(&cfg.group, &Ipv4Addr::UNSPECIFIED)
-        .is_err()
-    {
-        return false;
-    }
-    rx.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    let Ok(tx) = UdpSocket::bind("0.0.0.0:0") else {
-        return false;
-    };
-    let _ = tx.set_multicast_loop_v4(true);
-    if tx.send_to(b"probe", (cfg.group, cfg.port)).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 8];
-    matches!(rx.recv(&mut buf), Ok(5))
 }
 
 fn start_server(path: &PathBuf, cfg: Option<MulticastConfig>) -> SocketAddr {
@@ -169,11 +141,7 @@ fn blob_ring_is_mirrored_by_multicast_with_payloads_beyond_a_datagram() {
     // what one datagram can carry at all and must come back over TCP.
     let max = 70_000;
     let mut producer = BlobProducer::<Meta>::create(&source, 1024, 1 << 26).unwrap();
-    let cfg = multicast(0);
-    assert!(
-        multicast_works(&cfg),
-        "multicast delivery is required for blob replication tests; configure a multicast-capable local route"
-    );
+    let (cfg, _port_reservation) = multicast_support::reserve(Ipv4Addr::new(239, 255, 44, 1));
     let addr = start_server(&source, Some(cfg));
     let mut mirror = Mirror::builder()
         .start(MirrorStart::Latest)
