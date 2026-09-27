@@ -62,3 +62,21 @@ jobs:
           name: coverage
           path: target/coverage
           if-no-files-found: error
+
+  benchmark-smoke:
+    name: benchmark harnesses (TCP, multicast, unicast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate benchmark execution and delivery
+        run: bash scripts/bench-smoke.sh
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke
+          path: target/bench-smoke
+          if-no-files-found: error

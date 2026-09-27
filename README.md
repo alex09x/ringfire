@@ -12,6 +12,12 @@ It is engineered for high-frequency trading (HFT) engines, real-time market data
 
 ## ⚡ Performance at a Glance
 
+The Ryzen/LAN/WAN tables and diagrams below are historical measurements from v0.4–v0.5.
+The receive figures have been withdrawn after a harness audit; per-stage network figures
+used a timestamp-before-lock harness and await remeasurement. See the
+[measurement definitions and limitations](docs/benchmarking.md) and
+[95% production coverage contract](docs/testing.md).
+
 **Round trip of a 64-byte message between two threads**, same machine, same harness
 (`cargo bench --bench ipc_compare`, AMD Ryzen 9 7950X, Linux 6.8, v0.4.0):
 
@@ -47,8 +53,8 @@ empty polls and pushes. The corrected benches time only successful, sequence-che
 receives; new figures will be published once measured. See
 [docs/benchmarking.md](docs/benchmarking.md).
 
-The last `push` row is the realistic cross-process figure: it is bound by moving cache lines
-between cores, and costs the same with lossless backpressure enabled (+0.8 ns). Every read is
+The last `push` row measures two threads on separate cores: it is bound by moving cache lines
+between cores, and had a 0.8 ns difference with lossless backpressure in that historical run. Every read is
 validated against concurrent overwrites; the regression suite verifies zero torn records under
 continuous lapping on x86-64 and AArch64. Full numbers: [Detailed Benchmarks](#-detailed-benchmarks-amd-ryzen-9-7950x-on-linux-booster).
 
@@ -78,7 +84,7 @@ When communicating between processes on the same host, developers usually defaul
 | **TCP Loopback (`127.0.0.1`)** | Full TCP/IP stack + packetization | Multiple copies + TCP buffers | ~5,100 ns measured (RTT / 2) | Heavy CPU jitter, flow control stalls |
 | **Pipes / FIFOs** | Pipe inode lock + syscalls | Buffer copy through VFS | ~2,500 ns measured (RTT / 2) | Blocking write when pipe buffer (64 KB) fills |
 | **Message Brokers (Redis / NATS)** | Network stack + daemon context switch | Multi-hop serialization | 50,000 – 500,000 ns (typical, not measured) | High GC/memory pressure, single point of failure |
-| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **1 copy (payload into the slot)** | **~160 ns one-way (measured)** | **Writer never blocks (lossy) or throttles on the slowest reader (lossless); crash-isolated** |
+| **`ringfire` (Shared Memory)** | **0 syscalls on hot path** | **payload copied into slot and out to reader** | **~160 ns (historical RTT / 2 estimate)** | **Writer never blocks (lossy) or throttles on the slowest reader (lossless); crash-isolated** |
 
 ### The Three Critical Pain Points:
 1. **The Syscall & Context Switch Tax**: Every `write()` and `read()` triggers CPU privilege elevation from user-space to kernel-space and back, polluting CPU L1/L2 caches and branch predictors.
@@ -95,7 +101,7 @@ When communicating between processes on the same host, developers usually defaul
 - **Atomic Acquire/Release Synchronization**: State is coordinated via 64-bit atomic sequence numbers using CPU-level memory barriers (`core::sync::atomic`), completely bypassing the operating system kernel.
 - **Single-Writer Freedom (`LatestWins` Policy)**: The producer always writes to the ring. Slow, paused, or dead consumers can never block, stall, or crash the producer. If a consumer falls behind the ring buffer capacity, it detects that it was lapped and skips cleanly to the live stream.
 - **Cache-Line Isolated Layout**: Memory structures are aligned to 128-byte cache lines to eliminate false sharing between producer write heads and consumer read heads.
-- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers can instantly inspect the latest state (e.g., current Best Bid & Offer for 500 coins) in ~2 nanoseconds without replaying historical events.
+- **O(1) State Blackboard**: Besides sequential stream events, `ringfire` provides a direct seqlock-synchronized slot table. Consumers inspect the latest state (e.g., current Best Bid & Offer for 500 coins) without replaying historical events.
 - **Polyglot First-Class Support**: Because the layout in `/dev/shm` is standard C-ABI memory, consumers can be written in Rust, C, C++, or Python (`mmap` + `ctypes`/`numpy`) with zero bridge penalty.
 
 ---
@@ -440,7 +446,7 @@ keeps the source's sequence numbers.
 ![Between sites: UDP unicast with NAT punching across the ocean, then a hub mirror serves the instances inside the cloud](docs/img/topology-wan-hub.svg)
 
 Measured through such a hub on the LAN: 52.9 µs p50 end to end against 10.3 µs for a
-direct mirror, i.e. the hub costs its two network hops and nothing of its own. (VPCs have
+direct mirror, This is an end-to-end observation, not an isolated measurement of hub processing cost. (VPCs have
 no native multicast, only Transit Gateway multicast domains, so inside a cloud the hub
 sends unicast to each instance: one `sendto` per instance per frame.)
 
@@ -592,7 +598,7 @@ lapped could accept a half-overwritten payload; the regression suite now hammers
 > **Anti-Pattern: Returning Raw Pointers into Shared Memory (`*const T`)**
 > Some naive IPC designs attempt to return a direct pointer or slice `&[u8]` into `/dev/shm` to claim "zero-memcpy". In a multi-process architecture with a non-blocking writer (`LatestWins`), this is a dangerous anti-pattern: the writer can overwrite that memory slot at any microsecond while the reader is parsing it, causing undefined behavior, silent data races, and torn reads.
 > 
-> `ringfire` deliberately copies the slot payload into the reader's stack/register space inside a seqlock validation boundary (`s1 == s2`). For modern x86_64/ARM64 architectures, copying 32–64 bytes takes **~1 CPU clock cycle** (via `vmovups`) and is orders of magnitude faster than recovering from corrupted state or dealing with UB.
+> `ringfire` deliberately copies the slot payload into the reader's stack/register space inside a seqlock validation boundary (`s1 == s2`). Copy costs depend on payload size, compiler and cache state; the benchmarks measure the complete validated receive loop.
 
 
 ---
@@ -601,9 +607,9 @@ lapped could accept a half-overwritten payload; the regression suite now hammers
 
 `ringfire` supports selectable wait strategies depending on CPU budget:
 
-- **`BusySpin`**: Sub-30ns reaction time. Spins tightly on CPU (`core::hint::spin_loop()`). Recommended for dedicated HFT cores.
-- **`YieldBackoff`**: Spins for $K$ iterations then calls `std::thread::yield_now()`. Balanced CPU usage with ~150ns reaction time.
-- **`FutexWait`**: Sleeps on Linux `futex` when the queue is idle (timed sleep elsewhere). Near-0% CPU while waiting. The producer fast path has no full barrier, so a wake-up can rarely be missed; every sleep is therefore bounded (10 ms when no timeout is set).
+- **`BusySpin`**: Polls continuously with `core::hint::spin_loop()`, consuming a core while idle.
+- **`YieldBackoff`**: Spins for $K$ iterations then calls `std::thread::yield_now()`. Wake-up latency depends on scheduling and load.
+- **`FutexWait`**: Sleeps on Linux `futex` when the queue is idle (timed sleep elsewhere). The consumer uses an asymmetric memory barrier before sleeping on supported Linux kernels. Sleeps remain bounded (10 ms when no timeout is set); latency depends on scheduling and the configured spin limit.
 
 ---
 

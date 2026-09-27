@@ -23,8 +23,9 @@ the README and `docs/replication.md`.
 
 All benches create their rings in `RINGFIRE_BENCH_DIR`, else `/dev/shm` when it exists,
 else the temp dir, under names unique to the process (`ringfire_bench_<name>_<pid>_<n>.shm`).
-Each file is removed when its bench finishes, including when the bench panics
-(`benches/support/mod.rs`).
+Each file is removed when its bench finishes, during normal completion and Rust unwinding (`benches/support/mod.rs`). An abort or
+external kill bypasses destructors; the smoke runner owns a private directory and removes
+it even when a child fails.
 
 ### Definitions
 
@@ -32,9 +33,9 @@ Each file is removed when its bench finishes, including when the bench panics
   single thread, warm cache. Rate is messages per second.
 - **`ringfire_throughput/spmc_try_recv`**: one `try_recv` that returns the next message.
   Messages are pushed in chunks of 4,096 *before* the timer starts
-  (`support::timed_chunks` with `Bencher::iter_custom`), so only receives are timed. The
+  (`support::timed_chunks` with `Bencher::iter_custom`), so refill is excluded. The timed loop includes receives, `black_box` and sequence checks. The
   producer runs on the same thread, so the slots are warm in this core's cache; this is
-  the receive instruction path, not a cross-core figure. Every message carries its
+  a warm-cache validated receive loop, not a cross-core figure or an isolated instruction cost. Every message carries its
   sequence and is checked; the run fails if a receive comes back empty or out of order,
   or if the reader was lapped.
 - **`ringfire_throughput/spmc_batch_recv_32`**: one `recv_batch` call that must return
@@ -91,9 +92,9 @@ Compare against a saved baseline with `-- --save-baseline NAME` and
 ## Replication examples
 
 Build with `cargo build --release --examples`. Ring files carry the process ID in their
-names and are removed at the end of a run. Every run ends: waits for records end on the
-last expected sequence or an idle timeout, and a mirror failure makes the process exit
-with status 1.
+names and are removed at the end of a run. Finite measurement roles have receive deadlines; pongers normally serve until stopped,
+or exit on peer close with `--exit-on-close 1`. Wrap external network experiments in
+`timeout` as well. A mirror failure makes the measurement process exit with status 1.
 
 ### What is timed
 
@@ -111,9 +112,12 @@ a late tick is not skipped.
 ### Loss accounting
 
 Received records are counted by distinct sequence (`support::SeqTracker`), so a duplicate
-cannot hide a loss. Every example reports received out of expected, lost, duplicates,
-records that arrived below the highest sequence seen (`out of order`), and sequences outside
-the expected range. Samples are taken from the first arrival of each sequence only.
+cannot hide a loss. Latency and stress examples report distinct delivery, loss, duplicates and reordering.
+Ping-pong matches one outstanding sequence and reports missing, late and unexpected
+replies; warm-up counters are separate. Stage slaves can count holes only between the
+first and last sequence seen; compare their sample count with the master's published
+total, and use the master's full-range echo accounting to detect missing prefixes/tails.
+Samples are taken from the first arrival of each sequence only.
 
 ### Clock domains
 
@@ -123,7 +127,7 @@ the expected range. Samples are taken from the first arrival of each sequence on
   record; the first record may take 10 s. A lost record is therefore reported as a loss.
   Before this revision the loop waited for a fixed number of samples and hung on any loss.
 - **`replication_pingpong`**: only the pinger's monotonic clock is used, so the round trip
-  is exact; one-way is half of it, which assumes a symmetric path. The pinger sends exactly
+  has no cross-host clock offset; half of it is only a one-way estimate assuming a symmetric path. The pinger sends exactly
   `--warmup + --samples` pings. A reply that misses `--timeout-ms` is lost; if it arrives
   later it is counted late, not as a sample.
 - **`replication_stress`**: the pinger's monotonic clock stamps pushes and echo arrivals.
@@ -133,7 +137,9 @@ the expected range. Samples are taken from the first arrival of each sequence on
   - A slave converts its clock with an offset estimated before the run (minimum round-trip
     probe). The residual error is the path asymmetry plus drift during the run. The slave
     estimates the offset again after the run and prints `offset_change_us`: a change that
-    is not small next to the latencies invalidates that slave's figures.
+    is not small next to the latencies invalidates that slave's figures. Endpoint probes
+    cannot bound transient drift or wall-clock steps during the run; retain RTT results
+    and treat negative/unstable corrected samples as invalid.
   - The round trip via a slave is stamped by the master's wall clock at both ends, so it
     needs no offset.
   - Push stamps are published through a lock-free table. Before this revision the master
@@ -199,8 +205,8 @@ On the measurement host:
    used.
 3. Keep rings on tmpfs: `/dev/shm` is used automatically. Set `RINGFIRE_BENCH_DIR` only to
    point at another tmpfs.
-4. Run each bench in full (commands above), three times, and report the Criterion median
-   of the middle run next to the spread.
+4. Run each bench in full (commands above), three times, and publish all three Criterion medians with their range and sample settings.
+   Do not pick the fastest run or compare results from different hosts as a regression.
 5. For replication, run `replication_stages` and `replication_pingpong` as documented in
    their headers on two hosts, giving each busy-polling process at least two cores (one
    core per mirror process quantizes latencies to scheduler ticks). Report the loss line
@@ -208,28 +214,14 @@ On the measurement host:
 
 ## Smoke check
 
-`scripts/bench-smoke.sh` runs every Criterion bench once in test mode
-(`cargo bench --locked -- --test`), then runs each replication example briefly over
-loopback: both roles of the two-host examples as local processes, with the pongers using
-`--exit-on-close 1`. It checks that every harness completes and validates its data, and
-that no `ringfire_*` file is left in `/dev/shm` or the temp dir. It does not measure
-anything.
+`bash scripts/bench-smoke.sh` runs all five Criterion targets in test mode, then
+runs the four replication examples as local processes over TCP, multicast and
+UDP unicast (where supported). It validates every measured delivery count, sample
+count, sequence-loss/duplicate/reordering counter, and process exit. There are no
+performance thresholds: smoke latencies are not published benchmark results.
 
-Smoke record for this revision (remote Linux build node, aarch64, shared; not the
-measurement host):
-
-```text
-cargo check --all-targets --locked                                    exit 0
-cargo clippy --all-targets --locked -- -D warnings                    exit 0
-cargo clippy --all-targets --no-default-features --locked -- -D warnings  exit 0
-cargo test --locked --test harness_support_tests                      13 passed
-cargo bench --locked -- --test                                        all benches "Success", exit 0
-cargo bench --locked --bench <each> -- --warm-up-time 0.5 --measurement-time 1 --sample-size 10 --noplot
-                                                                      all five exit 0 (validation held over full sampling)
-scripts/bench-smoke.sh                                                "smoke OK", exit 0:
-  replication_latency  --samples 5000 --burst 200000    received 5000/5000 and 200000/200000, lost 0
-  replication_pingpong --samples 2000 --warmup 200      0 lost, 0 late, 0 unexpected
-  replication_stress   --rate 20000 --seconds 2         echoed 40000 (100%), lost 0, duplicates 0
-  replication_stages   master + 1 slave, 1000/s x 2 s   every stage 2000/2000, lost 0
-  leftover ring files: 0
-```
+Each command has a timeout. A private ring directory prevents collisions with
+concurrent tests; a trap kills and reaps owned children and removes that directory
+on failure. Logs remain under `${CARGO_TARGET_DIR:-target}/bench-smoke/` and CI
+uploads them. `scripts/check-bench-smoke.py` rejects partial output and nonzero
+measured losses. Warm-up loss is printed separately from measured ping-pong loss.

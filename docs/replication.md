@@ -4,6 +4,11 @@
 what a stress test taught us on the way, and what it costs on a LAN, across an
 ocean and through a cloud hub.*
 
+The numerical LAN/WAN tables and SVG figures below record the v0.5.0 experiments.
+They are historical, not a rerun of the corrected harnesses. In particular, stage
+latencies used a timestamp-before-lock path; see the
+[benchmark audit and definitions](benchmarking.md) before comparing them with new runs.
+
 ## The problem
 
 A market-data process on one machine parses exchange frames into a ring in
