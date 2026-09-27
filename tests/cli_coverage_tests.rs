@@ -1,3 +1,6 @@
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read};
 use std::net::UdpSocket;
@@ -170,32 +173,39 @@ fn parse_serve_addr(line: &str) -> String {
 /// timeout (a sign the wrong, long-running mode was invoked by mistake) it is killed and
 /// the test fails with a clear message instead of hanging the suite forever.
 fn run_cli(args: &[&str]) -> (bool, String, String) {
-    let child = Command::new(bin_path())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn ringfire CLI");
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+    let mut child = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let mut out = child.stdout();
+    let mut err = child.stderr();
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        out.read_to_end(&mut bytes).unwrap();
+        bytes
     });
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(output)) => (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ),
-        Ok(Err(e)) => panic!("ringfire CLI {:?} failed to complete: {}", args, e),
-        Err(_) => {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            panic!(
-                "ringfire CLI {:?} did not exit within 15s (expected a finite invocation)",
-                args
-            );
-        }
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        err.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let status = child.wait_bounded(Duration::from_secs(15));
+    let out = String::from_utf8(stdout.join().unwrap()).unwrap();
+    let err = String::from_utf8(stderr.join().unwrap()).unwrap();
+    assert!(
+        status.signal().is_none(),
+        "finite CLI invocation was killed or timed out: {args:?}: {err}"
+    );
+    if status.success() && args.contains(&"--json") {
+        let json: serde_json::Value =
+            serde_json::from_str(&out).expect("stat must emit valid JSON");
+        assert!(json.is_object());
+        assert!(json["capacity"].is_u64());
+        assert!(json["readers"].is_array());
     }
+    (status.success(), out, err)
 }
 
 #[test]
@@ -320,8 +330,10 @@ fn test_cli_stat_mpmc_arena_and_readers() {
     let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
     let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
-    let base_ptr =
-        unsafe { mmap.as_mut_ptr().add(header.reader_registry_offset as usize) as *mut ReaderSlot };
+    let base_ptr = unsafe {
+        mmap.as_mut_ptr()
+            .add(header.reader_registry_offset as usize) as *mut ReaderSlot
+    };
     unsafe {
         let slot1 = &mut *base_ptr.add(1);
         slot1.active.store(1, Ordering::SeqCst);
@@ -423,8 +435,10 @@ fn test_cli_prune_options() {
     let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
     let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
-    let base_ptr =
-        unsafe { mmap.as_mut_ptr().add(header.reader_registry_offset as usize) as *mut ReaderSlot };
+    let base_ptr = unsafe {
+        mmap.as_mut_ptr()
+            .add(header.reader_registry_offset as usize) as *mut ReaderSlot
+    };
     unsafe {
         let slot1 = &mut *base_ptr.add(1);
         slot1.active.store(1, Ordering::SeqCst);
@@ -528,8 +542,13 @@ fn test_cli_top_default_signal_termination() {
             .stderr(Stdio::null()),
     );
     let watcher = LineWatcher::spawn(guard.stdout());
-    let frame = watcher.wait_for(Duration::from_secs(5), |l| l.contains("Press Ctrl+C to exit."));
-    assert!(frame.is_some(), "top did not render a frame within the deadline");
+    let frame = watcher.wait_for(Duration::from_secs(5), |l| {
+        l.contains("Press Ctrl+C to exit.")
+    });
+    assert!(
+        frame.is_some(),
+        "top did not render a frame within the deadline"
+    );
 
     guard.signal(libc::SIGTERM);
     let status = guard.wait_bounded(Duration::from_secs(5));
@@ -583,7 +602,7 @@ fn test_cli_serve_and_mirror_errors() {
     assert!(!ok);
     assert!(err.contains("--from expects"));
 
-    let (ok, _, _) = run_cli(&["mirror", "127.0.0.1:1", dst.to_str().unwrap(), "--once"]);
+    let (ok, _, _) = run_cli(&["mirror", "127.0.0.1:0", dst.to_str().unwrap(), "--once"]);
     assert!(!ok);
 }
 
@@ -676,7 +695,7 @@ fn test_cli_serve_and_mirror_full_replication() {
     let dst2 = temp_file("repl_dst2");
     let (ok, _, _) = run_cli(&[
         "mirror",
-        "127.0.0.1:1",
+        "127.0.0.1:0",
         dst2.to_str().unwrap(),
         "--from",
         "latest",
@@ -685,7 +704,7 @@ fn test_cli_serve_and_mirror_full_replication() {
     assert!(!ok);
     let (ok, _, _) = run_cli(&[
         "mirror",
-        "127.0.0.1:1",
+        "127.0.0.1:0",
         dst2.to_str().unwrap(),
         "--from",
         "resume",
@@ -694,7 +713,7 @@ fn test_cli_serve_and_mirror_full_replication() {
     assert!(!ok);
     let (ok, _, _) = run_cli(&[
         "mirror",
-        "127.0.0.1:1",
+        "127.0.0.1:0",
         dst2.to_str().unwrap(),
         "--from",
         "20",
@@ -716,7 +735,7 @@ fn test_cli_mirror_reconnect_default_signal_termination() {
         Command::new(bin_path())
             .args([
                 "mirror",
-                "127.0.0.1:1",
+                "127.0.0.1:0",
                 dst.to_str().unwrap(),
                 "--reconnect-ms",
                 "10",
@@ -780,7 +799,7 @@ fn test_cli_unrecognized_options_and_flags() {
     let unrec_dst = temp_file("unrec_mirror_dst");
     let (ok, _, _) = run_cli(&[
         "mirror",
-        "127.0.0.1:1",
+        "127.0.0.1:0",
         unrec_dst.to_str().unwrap(),
         "--iface",
         "127.0.0.1",
@@ -792,7 +811,7 @@ fn test_cli_unrecognized_options_and_flags() {
 }
 
 /// Exercises every serve network flag with a real mirror handshake and content transfer
-/// rather than a blind launch/sleep/kill: connects through `serve --once`, confirms the
+/// rather than a blind launch/sleep/kill: confirms the
 /// startup announcement reflects the configured flags, and asserts the exact replicated
 /// contents.
 #[test]
@@ -806,7 +825,11 @@ fn test_cli_serve_all_network_flags() {
 
     let udp_port = ephemeral_udp_port();
     let mcast_port = 30_000 + (std::process::id() % 5_000) as u16;
-    let multicast = format!("239.255.77.{}:{}", 1 + (std::process::id() % 250) as u8, mcast_port);
+    let multicast = format!(
+        "239.255.77.{}:{}",
+        1 + (std::process::id() % 250) as u8,
+        mcast_port
+    );
 
     let mut server = ChildGuard::spawn(
         Command::new(bin_path())
@@ -832,7 +855,6 @@ fn test_cli_serve_all_network_flags() {
                 "--spin",
                 "--linger-us",
                 "100",
-                "--once",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped()),
@@ -846,7 +868,9 @@ fn test_cli_serve_all_network_flags() {
     assert!(announce.contains("ttl 1"));
     let addr = parse_serve_addr(&announce);
     let udp_announce = server_stderr
-        .wait_for(Duration::from_secs(5), |l| l.contains("unicast from udp port"))
+        .wait_for(Duration::from_secs(5), |l| {
+            l.contains("unicast from udp port")
+        })
         .expect("serve did not announce its unicast udp port within the deadline");
     assert!(udp_announce.contains(&udp_port.to_string()));
 
@@ -885,9 +909,24 @@ fn test_cli_serve_all_network_flags() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // `serve --once` serves exactly one mirror on the calling thread and only returns once
-    // that connection ends; closing the server is what lets the (already caught-up) mirror
-    // see `peer_gone` and finish `--once` cleanly on its own.
+    prod.push(&11);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut live = RingConsumer::<u64>::builder()
+        .start_from_sequence(11)
+        .attach(&dst)
+        .unwrap();
+    loop {
+        if let Some(value) = live.try_recv() {
+            assert_eq!(value, 11);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live unicast record not delivered"
+        );
+        std::thread::yield_now();
+    }
+    // Stop the source after verifying live UDP delivery; the mirror exits on EOF.
     server.signal(libc::SIGTERM);
     let server_status = server.wait_bounded(Duration::from_secs(5));
     assert!(!server_status.success());
@@ -897,7 +936,7 @@ fn test_cli_serve_all_network_flags() {
     assert!(mirror_status.success());
 
     let mut cons = RingConsumer::<u64>::attach(&dst).unwrap();
-    for i in 1..=10u64 {
+    for i in 1..=11u64 {
         assert_eq!(cons.try_recv(), Some(i));
     }
     assert_eq!(cons.try_recv(), None);
@@ -936,4 +975,65 @@ fn test_cli_stat_truncated_and_mpmc_top() {
     assert!(ok);
     assert!(out.contains("MPMC"));
     let _ = std::fs::remove_file(&p_mpmc);
+}
+
+#[test]
+fn test_cli_finite_tcp_server_and_missing_iterations() {
+    let _deadline = deadline::Deadline::new();
+    let src = temp_file("finite_server");
+    let dst = temp_file("finite_mirror");
+    let mut producer = RingProducer::<u64>::create(&src, 64).unwrap();
+    producer.push(&123);
+    let (ok, _, error) = run_cli(&["top", src.to_str().unwrap(), "--iterations"]);
+    assert!(!ok);
+    assert!(error.contains("positive integer"));
+    for flag in [["--udp", "7403"], ["--multicast", "239.255.0.1:7401"]] {
+        let (ok, _, error) = run_cli(&[
+            "serve",
+            src.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1:0",
+            "--once",
+            flag[0],
+            flag[1],
+        ]);
+        assert!(!ok);
+        assert!(error.contains("supports TCP only"));
+    }
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--once",
+                "--batch",
+                "32",
+                "--spin",
+                "--linger-us",
+                "0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+    let mut mirror = ringfire::Mirror::builder()
+        .start(ringfire::MirrorStart::Oldest)
+        .connect(parse_serve_addr(&line), &dst)
+        .unwrap();
+    while mirror.sequence() < 1 {
+        assert!(mirror.step().unwrap());
+    }
+    let mut reader = RingConsumer::<u64>::attach(&dst).unwrap();
+    assert_eq!(reader.try_recv(), Some(123));
+    assert_eq!(reader.try_recv(), None);
+    drop(mirror); // finite server observes peer closure, returns, and exits normally
+    assert!(server.wait_bounded(Duration::from_secs(5)).success());
+    std::fs::remove_file(dst).unwrap();
 }

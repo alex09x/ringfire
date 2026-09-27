@@ -475,6 +475,7 @@ dependencies = [
  "futures-core",
  "libc",
  "memmap2",
+ "serde_json",
  "tokio",
 ]
 

@@ -90,7 +90,7 @@ OPTIONS:
     --batch <N>                     Max records per frame for serve (default: 256)
     --spin                          Busy-poll instead of sleeping when idle (serve, mirror)
     --from <latest|oldest|resume|N> Where a mirror starts (default: latest)
-    --once                          serve: accept a single mirror and exit once it disconnects
+    --once                          serve: accept one TCP mirror and exit once it disconnects
                                      (no other mirror is accepted); mirror: exit once the source
                                      disconnects instead of reconnecting to it
     --reconnect-ms <N>              Delay between reconnect attempts (default: 500)
@@ -140,9 +140,9 @@ fn main() {
                 if args[i] == "--interval-ms" && i + 1 < args.len() {
                     interval_ms = args[i + 1].parse().unwrap_or(500);
                     i += 2;
-                } else if args[i] == "--iterations" && i + 1 < args.len() {
-                    match args[i + 1].parse::<u64>() {
-                        Ok(n) if n > 0 => iterations = Some(n),
+                } else if args[i] == "--iterations" {
+                    match args.get(i + 1).and_then(|value| value.parse::<u64>().ok()) {
+                        Some(n) if n > 0 => iterations = Some(n),
                         _ => {
                             eprintln!("Error: --iterations expects a positive integer.");
                             std::process::exit(1);
@@ -684,7 +684,11 @@ fn print_blackboard_stat(
     Ok(())
 }
 
-fn cmd_top(path_str: &str, interval_ms: u64, iterations: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_top(
+    path_str: &str,
+    interval_ms: u64,
+    iterations: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mmap, view) = map_ring(path_str)?;
     let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
     let is_lossless = (header.flags & FLAG_POLICY_LOSSLESS_BACKPRESSURE) != 0;
@@ -911,6 +915,9 @@ fn cmd_serve(
     dup: u8,
     once: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if once && (multicast.is_some() || udp_port.is_some()) {
+        return Err("serve --once supports TCP only; omit --multicast and --udp".into());
+    }
     let mut server = ReplicaServer::bind(path, bind)?
         .batch(batch)
         .spin(spin)
@@ -944,7 +951,17 @@ fn cmd_serve(
         );
     }
     if once {
-        server.serve_one()?;
+        match server.serve_one() {
+            Ok(()) => {}
+            Err(ringfire::RingfireError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
     } else {
         server.run()?;
     }
