@@ -37,9 +37,10 @@ fn msg(seq: u64) -> Msg64 {
     }
 }
 
-/// Ping-pong over two rings. `blocking` selects `FutexWait` (sleeps in the kernel when
-/// idle, like a socket read) instead of busy polling on both sides.
-fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
+/// Ping-pong over two rings. Futex modes either use the default adaptive spin budget
+/// or a zero spin budget. Even zero-spin can receive an already-ready reply without
+/// sleeping; this measures the policy, not a forced context switch per message.
+fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool, no_spin: bool) {
     let fwd = TempShm::new(&format!("cmp_fwd_{}", name));
     let rev = TempShm::new(&format!("cmp_rev_{}", name));
 
@@ -50,7 +51,11 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
 
     let echo = thread::spawn(move || {
         let _abort = AbortOnPanic("ringfire echo");
-        let mut wait = FutexWait::default();
+        let mut wait = if no_spin {
+            FutexWait::new(0, None)
+        } else {
+            FutexWait::default()
+        };
         loop {
             let ping = if blocking {
                 cons_fwd.recv_blocking(&mut wait)
@@ -70,9 +75,13 @@ fn bench_ringfire(c: &mut Criterion, name: &str, blocking: bool) {
     });
 
     let mut seq = 1u64;
-    let mut wait = FutexWait::default();
-    // `recv_blocking` is a real kernel wait with no built-in timeout, so `SpinBound`
-    // (which only bounds the busy-poll loop) cannot cover it. The watchdog is an
+    let mut wait = if no_spin {
+        FutexWait::new(0, None)
+    } else {
+        FutexWait::default()
+    };
+    // Individual futex sleeps are bounded, but `recv_blocking` retries indefinitely
+    // without a message, so the whole-case watchdog also covers this mode. The watchdog is an
     // independent guard against the echo thread staying alive but stuck; `AbortOnPanic`
     // on that thread only covers it panicking outright.
     let _watchdog = Watchdog::start(name, Watchdog::default_limit());
@@ -177,8 +186,9 @@ fn pipe_pair() -> (std::fs::File, std::fs::File) {
 }
 
 fn bench_ipc_compare(c: &mut Criterion) {
-    bench_ringfire(c, "ringfire_busy_spin", false);
-    bench_ringfire(c, "ringfire_futex_wait", true);
+    bench_ringfire(c, "ringfire_busy_spin", false, false);
+    bench_ringfire(c, "ringfire_futex_wait", true, false);
+    bench_ringfire(c, "ringfire_futex_no_spin", true, true);
 
     let (a, b) = UnixStream::pair().unwrap();
     let (a_rx, b_rx) = (a.try_clone().unwrap(), b.try_clone().unwrap());
