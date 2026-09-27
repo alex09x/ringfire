@@ -1036,4 +1036,27 @@ fn test_cli_finite_tcp_server_and_missing_iterations() {
     drop(mirror); // finite server observes peer closure, returns, and exits normally
     assert!(server.wait_bounded(Duration::from_secs(5)).success());
     std::fs::remove_file(dst).unwrap();
+
+    // A peer can disappear before sending HELLO (for example a TCP health probe).
+    // Match the long-running server's treatment of that EOF as a normal departure.
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+    drop(std::net::TcpStream::connect(parse_serve_addr(&line)).unwrap());
+    assert!(server.wait_bounded(Duration::from_secs(5)).success());
 }

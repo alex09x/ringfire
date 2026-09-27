@@ -959,6 +959,7 @@ fn cmd_serve(
                     std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
                 ) => {}
             Err(error) => return Err(error.into()),
         }
