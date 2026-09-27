@@ -1043,7 +1043,7 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
         self.registration.as_ref()
     }
 
-    /// Atomically persists the last processed sequence number (`cursor - 1`) directly into shared memory (<10ns).
+    /// Atomically persists the last processed sequence number (`cursor - 1`) directly into shared memory.
     #[inline(always)]
     pub fn commit_offset(&self) -> Result<()> {
         if let Some(ref cp) = self.checkpoint {

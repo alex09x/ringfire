@@ -142,7 +142,7 @@ impl<V: Copy> Drop for BlackboardProducer<V> {
 }
 
 /// Consumer for reading from a shared memory Blackboard state table.
-/// Provides sub-10ns O(1) lock-free, tear-free reads.
+/// Provides O(1) reads validated by a per-slot seqlock.
 pub struct BlackboardConsumer<V: Copy> {
     _mmap: MmapMut,
     _header: *const BlackboardHeader,

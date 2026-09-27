@@ -50,7 +50,7 @@ pub struct RingHeader {
     pub claim_seq: AtomicU64,
     /// Operational flags
     pub flags: u32,
-    /// Futex notification word for 0% CPU idle consumers
+    /// Futex notification word for consumers sleeping while idle
     pub futex_word: AtomicU32,
     /// Count of consumers currently sleeping on the futex
     pub waiting_consumers: AtomicU32,

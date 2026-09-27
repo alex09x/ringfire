@@ -12,10 +12,10 @@ use crate::spmc::{RecvStatus, RingConsumer};
 /// Asynchronous wrapper around `RingConsumer<T>` for the Tokio runtime.
 ///
 /// Designed for high-frequency trading and market-data streaming in async bots:
-/// - **Zero-Latency Fast Path**: If a message is published, `recv()` returns in < 20 ns without async overhead.
+/// - **Ready Fast Path**: If a message is available, `recv()` returns without awaiting.
 /// - **Adaptive Spinning**: Spins briefly (`core::hint::spin_loop`) to catch incoming bursts without context switches.
 /// - **Cooperative Task Switching**: Calls `tokio::task::yield_now().await` when no traffic is present so other Tokio tasks (websockets, order management, REST APIs) are never starved.
-/// - **Zero-CPU Idle Sleep**: Drops into async `tokio::time::sleep` during long quiet periods so CPU usage stays at 0%.
+/// - **Idle Sleep**: Uses `tokio::time::sleep` during quiet periods to avoid continuous polling.
 pub struct AsyncRingConsumer<T: Copy + 'static> {
     inner: RingConsumer<T>,
     max_spins: u32,
@@ -200,7 +200,7 @@ impl<T: Copy + 'static> AsyncRingConsumer<T> {
 
 /// The stream never ends. While idle it follows the same backoff as [`AsyncRingConsumer::recv`]:
 /// a short spin, a few cooperative yields, then `idle_sleep` timer waits, so an idle
-/// stream costs no CPU and spawns no tasks.
+/// stream sleeps between polls and spawns no tasks.
 impl<T: Copy + Unpin + 'static> Stream for AsyncRingConsumer<T> {
     type Item = T;
 

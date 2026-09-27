@@ -11,7 +11,7 @@ pub trait WaitStrategy: Send {
 }
 
 /// Ultra-low-latency spin polling using `core::hint::spin_loop()`.
-/// Achieves steady-state latency < 20 ns at the cost of 100% CPU usage on the core.
+/// Continuously polls, consuming a CPU core while waiting; latency depends on the workload.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BusySpin;
 
@@ -71,7 +71,7 @@ impl WaitStrategy for YieldBackoff {
     }
 }
 
-/// Futex-based wait strategy for 0% CPU consumption when idle.
+/// Futex-based wait strategy that sleeps in the kernel when idle.
 /// Spins briefly (adaptive fast-path) before putting the calling thread to sleep in the kernel.
 ///
 /// Lost wake-ups are prevented with an asymmetric barrier: producers keep a barrier-free
