@@ -2550,4 +2550,5 @@ impl std::fmt::Debug for Mirror {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/replication.rs"]
 mod tests;

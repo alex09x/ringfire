@@ -170,17 +170,10 @@ fn blob_ring_is_mirrored_by_multicast_with_payloads_beyond_a_datagram() {
     let max = 70_000;
     let mut producer = BlobProducer::<Meta>::create(&source, 1024, 1 << 26).unwrap();
     let cfg = multicast(0);
-    if !multicast_works(&cfg) {
-        let is_linux_ci = cfg!(target_os = "linux") && std::env::var_os("CI").is_some();
-        if is_linux_ci {
-            panic!(
-                "multicast delivery must work in Linux CI, but probe failed for group {}:{}",
-                cfg.group, cfg.port
-            );
-        }
-        eprintln!("skipping multicast test: no multicast delivery on this host");
-        return;
-    }
+    assert!(
+        multicast_works(&cfg),
+        "multicast delivery is required for blob replication tests; configure a multicast-capable local route"
+    );
     let addr = start_server(&source, Some(cfg));
     let mut mirror = Mirror::builder()
         .start(MirrorStart::Latest)

@@ -1,3 +1,6 @@
+#[path = "../support/deadline.rs"]
+mod deadline;
+
 use std::io;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
@@ -48,6 +51,7 @@ fn valid_geometry_bytes(arena: bool) -> [u8; GEOMETRY_LEN] {
 
 #[test]
 fn test_geometry_decode_success() {
+    let _deadline = deadline::Deadline::new();
     let b_no_arena = valid_geometry_bytes(false);
     let g_no = Geometry::decode(&b_no_arena).unwrap();
     assert_eq!(g_no.capacity, 1024);
@@ -68,12 +72,15 @@ fn test_geometry_decode_success() {
 
 #[test]
 fn test_geometry_decode_errors() {
+    let _deadline = deadline::Deadline::new();
     // Capacity not power of two
     let mut b = valid_geometry_bytes(false);
     b[0..8].copy_from_slice(&1000u64.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry capacity is not a power of two"))
+        Err(RingfireError::Protocol(
+            "geometry capacity is not a power of two"
+        ))
     ));
 
     // Element size < 8
@@ -81,7 +88,9 @@ fn test_geometry_decode_errors() {
     b[8..12].copy_from_slice(&4u32.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry element size is not a multiple of 8"))
+        Err(RingfireError::Protocol(
+            "geometry element size is not a multiple of 8"
+        ))
     ));
 
     // Element size not multiple of 8
@@ -89,7 +98,9 @@ fn test_geometry_decode_errors() {
     b[8..12].copy_from_slice(&12u32.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry element size is not a multiple of 8"))
+        Err(RingfireError::Protocol(
+            "geometry element size is not a multiple of 8"
+        ))
     ));
 
     // Slots offset too small
@@ -97,7 +108,9 @@ fn test_geometry_decode_errors() {
     b[28..32].copy_from_slice(&64u32.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry slots offset is misplaced"))
+        Err(RingfireError::Protocol(
+            "geometry slots offset is misplaced"
+        ))
     ));
 
     // Slots offset not multiple of 64
@@ -105,7 +118,9 @@ fn test_geometry_decode_errors() {
     b[28..32].copy_from_slice(&130u32.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry slots offset is misplaced"))
+        Err(RingfireError::Protocol(
+            "geometry slots offset is misplaced"
+        ))
     ));
 
     // Slots end overflow
@@ -121,7 +136,9 @@ fn test_geometry_decode_errors() {
     b[32..40].copy_from_slice(&128u64.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena offset is misplaced"))
+        Err(RingfireError::Protocol(
+            "geometry arena offset is misplaced"
+        ))
     ));
 
     // Arena offset not multiple of 64
@@ -130,7 +147,9 @@ fn test_geometry_decode_errors() {
     b[32..40].copy_from_slice(&(misplaced as u64).to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena offset is misplaced"))
+        Err(RingfireError::Protocol(
+            "geometry arena offset is misplaced"
+        ))
     ));
 
     // Arena size not power of two
@@ -138,7 +157,9 @@ fn test_geometry_decode_errors() {
     b[40..48].copy_from_slice(&1000u64.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena size is not a power of two"))
+        Err(RingfireError::Protocol(
+            "geometry arena size is not a power of two"
+        ))
     ));
 
     // Arena size < 64
@@ -146,7 +167,9 @@ fn test_geometry_decode_errors() {
     b[40..48].copy_from_slice(&32u64.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena size is not a power of two"))
+        Err(RingfireError::Protocol(
+            "geometry arena size is not a power of two"
+        ))
     ));
 
     // Arena ring has no blob descriptor (payload_len < 16)
@@ -154,7 +177,9 @@ fn test_geometry_decode_errors() {
     b[8..12].copy_from_slice(&16u32.to_le_bytes()); // payload_len = 8 < 16
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena ring has no blob descriptor"))
+        Err(RingfireError::Protocol(
+            "geometry arena ring has no blob descriptor"
+        ))
     ));
 
     // Arena total size overflow
@@ -173,12 +198,15 @@ fn test_geometry_decode_errors() {
     b[40..48].copy_from_slice(&1024u64.to_le_bytes());
     assert!(matches!(
         Geometry::decode(&b),
-        Err(RingfireError::Protocol("geometry arena size without an arena"))
+        Err(RingfireError::Protocol(
+            "geometry arena size without an arena"
+        ))
     ));
 }
 
 #[test]
 fn test_geometry_encode_roundtrip() {
+    let _deadline = deadline::Deadline::new();
     let b = valid_geometry_bytes(true);
     let g1 = Geometry::decode(&b).unwrap();
     let mut out = [0u8; GEOMETRY_LEN];
@@ -189,6 +217,7 @@ fn test_geometry_encode_roundtrip() {
 
 #[test]
 fn test_geometry_same_layout() {
+    let _deadline = deadline::Deadline::new();
     let g1 = Geometry::decode(&valid_geometry_bytes(true)).unwrap();
     let g2 = g1;
     assert!(g1.same_layout(&g2));
@@ -224,6 +253,7 @@ fn test_geometry_same_layout() {
 
 #[test]
 fn test_geometry_mirror_flags() {
+    let _deadline = deadline::Deadline::new();
     let mut g = Geometry::decode(&valid_geometry_bytes(false)).unwrap();
     assert_eq!(
         g.mirror_flags(),
@@ -245,6 +275,7 @@ fn test_geometry_mirror_flags() {
 
 #[test]
 fn test_multicast_info_decode() {
+    let _deadline = deadline::Deadline::new();
     let mut buf = [0u8; MULTICAST_LEN];
     encode_udp_info(
         Ipv4Addr::new(239, 255, 42, 1),
@@ -287,6 +318,7 @@ fn test_multicast_info_decode() {
 
 #[test]
 fn test_multicast_config_methods() {
+    let _deadline = deadline::Deadline::new();
     let cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 1, 2), 43000)
         .interface(Ipv4Addr::LOCALHOST)
         .mtu(9000)
@@ -313,6 +345,7 @@ fn test_multicast_config_methods() {
 
 #[test]
 fn test_frame_control_and_roundtrip() {
+    let _deadline = deadline::Deadline::new();
     let frame = Frame::control(KIND_GAP, 12345);
     assert_eq!(frame.kind, KIND_GAP);
     assert_eq!(frame.flags, 0);
@@ -327,9 +360,12 @@ fn test_frame_control_and_roundtrip() {
 
 #[test]
 fn test_peer_gone() {
+    let _deadline = deadline::Deadline::new();
     assert!(peer_gone(&io::Error::from(io::ErrorKind::UnexpectedEof)));
     assert!(peer_gone(&io::Error::from(io::ErrorKind::ConnectionReset)));
-    assert!(peer_gone(&io::Error::from(io::ErrorKind::ConnectionAborted)));
+    assert!(peer_gone(&io::Error::from(
+        io::ErrorKind::ConnectionAborted
+    )));
     assert!(peer_gone(&io::Error::from(io::ErrorKind::BrokenPipe)));
     assert!(!peer_gone(&io::Error::from(io::ErrorKind::Other)));
     assert!(!peer_gone(&io::Error::from(io::ErrorKind::TimedOut)));
@@ -338,6 +374,7 @@ fn test_peer_gone() {
 
 #[test]
 fn test_blob_ref_helpers() {
+    let _deadline = deadline::Deadline::new();
     let mut payload = vec![0u8; 32];
     let r = BlobRef {
         offset: 123456,
@@ -353,6 +390,7 @@ fn test_blob_ref_helpers() {
 
 #[test]
 fn test_arena_view_checks() {
+    let _deadline = deadline::Deadline::new();
     let total = std::mem::size_of::<ArenaHeader>() + 1024 + 128;
     let mut mem = vec![0u8; total];
     let offset = (64 - (mem.as_ptr() as usize % 64)) % 64;
@@ -425,6 +463,7 @@ fn test_arena_view_checks() {
 
 #[test]
 fn test_source_ring_and_read_states() {
+    let _deadline = deadline::Deadline::new();
     assert!(SourceRing::open(&PathBuf::from("/non/existent/path/for/ring.shm")).is_err());
 
     let p = temp("src_ring");
@@ -455,8 +494,7 @@ fn test_source_ring_and_read_states() {
 
     // Collect lingering with ZERO duration
     let mut wire2 = vec![0u8; FRAME_HEADER_LEN];
-    let coll_lingering =
-        source.collect_lingering(190, 5, 1000, &mut wire2, Duration::ZERO);
+    let coll_lingering = source.collect_lingering(190, 5, 1000, &mut wire2, Duration::ZERO);
     assert_eq!(coll_lingering.count, 5);
 
     // Resync
@@ -466,6 +504,7 @@ fn test_source_ring_and_read_states() {
 
 #[test]
 fn test_source_ring_arena_read_record() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("src_arena_ring");
     let mut prod = BlobProducer::<u64>::create(&p, 64, 4096).unwrap();
     prod.push(&1u64, &[]).unwrap();
@@ -496,6 +535,7 @@ fn test_source_ring_arena_read_record() {
 
 #[test]
 fn test_source_ring_open_arena_without_descriptor() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("arena_no_desc");
     let file = crate::shm::create_backing_file(&p, 0o660, true, 4096).unwrap();
     let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
@@ -523,13 +563,16 @@ fn test_source_ring_open_arena_without_descriptor() {
     }
     assert!(matches!(
         SourceRing::open(&p),
-        Err(RingfireError::Unsupported("arena ring without a blob descriptor"))
+        Err(RingfireError::Unsupported(
+            "arena ring without a blob descriptor"
+        ))
     ));
     let _ = std::fs::remove_file(&p);
 }
 
 #[test]
 fn test_mirror_ring_operations() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("mirror_ring");
     let geom = Geometry {
         capacity: 64,
@@ -613,8 +656,13 @@ fn test_mirror_ring_operations() {
     // Corrupt arena capacity to test adopt returning None (line 1063)
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut f_arena = std::fs::OpenOptions::new().write(true).open(&p_arena).unwrap();
-        f_arena.seek(SeekFrom::Start(geom_arena.arena_offset)).unwrap();
+        let mut f_arena = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p_arena)
+            .unwrap();
+        f_arena
+            .seek(SeekFrom::Start(geom_arena.arena_offset))
+            .unwrap();
         f_arena.write_all(&999999u64.to_le_bytes()).unwrap();
     }
     assert!(MirrorRing::adopt(&p_arena).unwrap().is_none());
@@ -638,6 +686,7 @@ fn test_mirror_ring_operations() {
 
 #[test]
 fn test_linger_struct() {
+    let _deadline = deadline::Deadline::new();
     let mut l_fixed = Linger::new(Some(Duration::from_millis(10)));
     assert_eq!(l_fixed.current(), Duration::from_millis(10));
     l_fixed.sent();
@@ -649,18 +698,21 @@ fn test_linger_struct() {
 
 #[test]
 fn test_sockets_and_io_helpers() {
+    let _deadline = deadline::Deadline::new();
     let sock = udp_sender(0, None).unwrap();
     assert!(sock.local_addr().is_ok());
 
-    let cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 10, 1), 45000)
-        .interface(Ipv4Addr::LOCALHOST);
+    let cfg =
+        MulticastConfig::new(Ipv4Addr::new(239, 255, 10, 1), 45000).interface(Ipv4Addr::LOCALHOST);
     let sock_mc = udp_sender(0, Some(&cfg)).unwrap();
     assert!(sock_mc.local_addr().is_ok());
 
     let rx1 = multicast_receiver(Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::UNSPECIFIED, 0).unwrap();
-    let rx2 =
-        multicast_receiver(Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::UNSPECIFIED, 65536).unwrap();
-    wait_readable(&[rx1.as_raw_fd(), rx2.as_raw_fd()], Duration::from_millis(1));
+    let rx2 = multicast_receiver(Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::UNSPECIFIED, 65536).unwrap();
+    wait_readable(
+        &[rx1.as_raw_fd(), rx2.as_raw_fd()],
+        Duration::from_millis(1),
+    );
 
     // read_full and write_full
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -683,8 +735,17 @@ fn test_sockets_and_io_helpers() {
     // set_sockopt error on invalid fd
     assert!(set_sockopt(-1, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32).is_err());
 
-    // multicast_receiver bind error on privileged port
-    assert!(multicast_receiver(Ipv4Addr::UNSPECIFIED, 1, Ipv4Addr::UNSPECIFIED, 0).is_err());
+    // Deterministic bind conflict, independent of privilege/capabilities.
+    let occupied = UdpSocket::bind("0.0.0.0:0").unwrap();
+    assert!(
+        multicast_receiver(
+            Ipv4Addr::UNSPECIFIED,
+            occupied.local_addr().unwrap().port(),
+            Ipv4Addr::UNSPECIFIED,
+            0
+        )
+        .is_err()
+    );
 
     // send_datagram
     let u1 = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -717,8 +778,20 @@ fn test_sockets_and_io_helpers() {
     let mut cl_nb = TcpStream::connect(a_nb).unwrap();
     let (mut srv_nb, _) = l_nb.accept().unwrap();
     cl_nb.set_nonblocking(true).unwrap();
-    set_sockopt(cl_nb.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &4096i32).unwrap();
-    set_sockopt(srv_nb.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &4096i32).unwrap();
+    set_sockopt(
+        cl_nb.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_SNDBUF,
+        &4096i32,
+    )
+    .unwrap();
+    set_sockopt(
+        srv_nb.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &4096i32,
+    )
+    .unwrap();
 
     let drainer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
@@ -729,9 +802,11 @@ fn test_sockets_and_io_helpers() {
                 if n == 0 {
                     break;
                 }
+                assert!(b[..n].iter().all(|byte| *byte == 42));
                 total += n;
             }
         }
+        assert_eq!(total, 64 * 1024);
     });
     let big = vec![42u8; 64 * 1024];
     write_full(&mut cl_nb, &big).unwrap();
@@ -742,28 +817,35 @@ fn test_sockets_and_io_helpers() {
     let a_bp = l_bp.local_addr().unwrap();
     let mut cl_bp = TcpStream::connect(a_bp).unwrap();
     let (srv_bp, _) = l_bp.accept().unwrap();
+    cl_bp.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(write_full(&mut cl_bp, &[1u8; 100]).is_err());
     drop(srv_bp);
-    std::thread::sleep(Duration::from_millis(10));
-    let _ = write_full(&mut cl_bp, &[1u8; 100]);
 
     // test send_datagram on oversized payload (hits line 661)
     let u_big = UdpSocket::bind("127.0.0.1:0").unwrap();
     let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
     let oversized = vec![0u8; 70_000];
-    let _ = send_datagram(&u_big, dest, &oversized);
+    assert_eq!(
+        send_datagram(&u_big, dest, &oversized)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EMSGSIZE)
+    );
 
     // multicast interface invalid IP -> EADDRNOTAVAIL (hits line 605)
     let cfg_bad_if = MulticastConfig::new(Ipv4Addr::new(239, 255, 10, 1), 45000)
         .interface(Ipv4Addr::new(192, 0, 2, 250));
-    let _ = udp_sender(0, Some(&cfg_bad_if));
+    assert!(udp_sender(0, Some(&cfg_bad_if)).is_err());
 }
 
 #[test]
 fn test_serve_range_paths() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("serve_range_paths");
     let mut prod = BlobProducer::<u64>::create(&p, 64, 4096).unwrap();
     for seq in 1..=80 {
-        prod.push(&(seq as u64), format!("item {}", seq).as_bytes()).unwrap();
+        prod.push(&(seq as u64), format!("item {}", seq).as_bytes())
+            .unwrap();
     }
 
     let source = SourceRing::open(&p).unwrap();
@@ -802,55 +884,28 @@ fn test_serve_range_paths() {
     }
     serve_range(&source, &mut server, 50, 60, 5, &mut wire).unwrap();
 
-
     drop(server);
     let mut in_buf = Vec::new();
     client.read_to_end(&mut in_buf).unwrap();
-    assert!(!in_buf.is_empty());
-
-    let _ = std::fs::remove_file(&p);
-}
-
-#[test]
-fn test_udp_loop_lost_blob_advancement() {
-    use std::io::{Seek, SeekFrom, Write};
-    use std::sync::{Arc, Mutex};
-    let p = temp("udp_loop_lost");
-    let mut prod = BlobProducer::<u64>::create(&p, 64, 4096).unwrap();
-    prod.push(&1u64, b"item 1").unwrap();
-
-    let ring = SourceRing::open(&p).unwrap();
-    let slot_off = ring.geometry.slots_offset as u64
-        + (2 & (ring.geometry.capacity - 1)) * (ring.geometry.element_size as u64);
-    let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let delivery = UdpDelivery {
-        port: 0,
-        mtu: 1472,
-        multicast: None,
-        peers: peers.clone(),
-        duplicate: 1,
-        heartbeat: Duration::from_millis(10),
-    };
-
-    let handle = std::thread::spawn(move || {
-        let _ = udp_loop(ring, delivery, 1, 10, false, None);
-    });
-
-    // Push item 2 then corrupt its blob ref
-    prod.push(&2u64, b"item 2").unwrap();
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-        f.seek(SeekFrom::Start(slot_off + 24)).unwrap();
-        f.write_all(&100_000u32.to_le_bytes()).unwrap();
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at < in_buf.len() {
+        let header: &[u8; FRAME_HEADER_LEN] = in_buf[at..at + FRAME_HEADER_LEN].try_into().unwrap();
+        let frame = Frame::decode(header);
+        frames.push((frame.kind, frame.seq, frame.count));
+        at += FRAME_HEADER_LEN + frame.len as usize;
     }
+    assert_eq!(at, in_buf.len());
+    assert_eq!(
+        frames,
+        vec![
+            (KIND_GAP, 17, 0),
+            (KIND_DATA, 17, 4),
+            (KIND_GAP, 81, 0),
+            (KIND_GAP, 57, 0),
+            (KIND_DATA, 57, 4)
+        ]
+    );
 
-    // Push item 3 so udp_loop advances cursor past lost item 2
-    std::thread::sleep(Duration::from_millis(20));
-    prod.push(&3u64, b"item 3").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-
-    drop(handle);
     let _ = std::fs::remove_file(&p);
 }
-
-

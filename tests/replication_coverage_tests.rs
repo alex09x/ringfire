@@ -1,3 +1,6 @@
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
@@ -92,12 +95,14 @@ fn valid_geometry_payload(capacity: u64, element_size: u32) -> [u8; GEOMETRY_LEN
 
 #[test]
 fn test_server_bind_missing_fails_early() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("non_existent_server");
     assert!(ReplicaServer::bind(&p, "127.0.0.1:0").is_err());
 }
 
 #[test]
 fn test_server_builder_options() {
+    let _deadline = deadline::Deadline::new();
     let p = temp("server_opts");
     let _prod = RingProducer::<Tick>::create(&p, 64).unwrap();
     let server = ReplicaServer::bind(&p, "127.0.0.1:0")
@@ -115,6 +120,7 @@ fn test_server_builder_options() {
 
 #[test]
 fn test_mirror_builder_options_and_getters() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("mirror_opts_src");
     let dst = temp("mirror_opts_dst");
     let mut prod = RingProducer::<Tick>::create(&src, 128).unwrap();
@@ -162,6 +168,7 @@ fn test_mirror_builder_options_and_getters() {
 
 #[test]
 fn test_server_serve_one_happy_path() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("serve_one_src");
     let dst = temp("serve_one_dst");
     let mut prod = RingProducer::<Tick>::create(&src, 128).unwrap();
@@ -173,7 +180,10 @@ fn test_server_serve_one_happy_path() {
     let addr = server.local_addr().unwrap();
 
     let server_handle = thread::spawn(move || {
-        let _ = server.serve_one();
+        let result = server.serve_one();
+        assert!(
+            matches!(result, Err(RingfireError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof))
+        );
     });
 
     let mut mirror = Mirror::builder()
@@ -209,6 +219,7 @@ fn test_server_serve_one_happy_path() {
 
 #[test]
 fn test_tcp_handshake_rejects_bad_magic() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("hs_bad_magic");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let server = ReplicaServer::bind(&src, "127.0.0.1:0").unwrap();
@@ -235,6 +246,7 @@ fn test_tcp_handshake_rejects_bad_magic() {
 
 #[test]
 fn test_tcp_handshake_rejects_bad_version() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("hs_bad_ver");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let server = ReplicaServer::bind(&src, "127.0.0.1:0").unwrap();
@@ -261,6 +273,7 @@ fn test_tcp_handshake_rejects_bad_version() {
 
 #[test]
 fn test_tcp_handshake_rejects_wrong_kind() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("hs_wrong_kind");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let server = ReplicaServer::bind(&src, "127.0.0.1:0").unwrap();
@@ -282,6 +295,7 @@ fn test_tcp_handshake_rejects_wrong_kind() {
 
 #[test]
 fn test_tcp_handshake_wanted_ahead_sets_reset_flag() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("hs_wanted_ahead");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let server = ReplicaServer::bind(&src, "127.0.0.1:0").unwrap();
@@ -306,6 +320,7 @@ fn test_tcp_handshake_wanted_ahead_sets_reset_flag() {
 
 #[test]
 fn test_mirror_connect_rejects_bad_geometry_frame() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_bad_geom");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -319,13 +334,17 @@ fn test_mirror_connect_rejects_bad_geometry_frame() {
     });
 
     let res = Mirror::builder().connect(addr, &dst);
-    assert!(matches!(res, Err(RingfireError::Protocol("expected GEOMETRY"))));
+    assert!(matches!(
+        res,
+        Err(RingfireError::Protocol("expected GEOMETRY"))
+    ));
     srv.join().unwrap();
     let _ = std::fs::remove_file(&dst);
 }
 
 #[test]
 fn test_mirror_connect_rejects_corrupted_geometry() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_corrupt_geom");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -353,6 +372,7 @@ fn test_mirror_connect_rejects_corrupted_geometry() {
 
 #[test]
 fn test_mirror_connect_multicast_flag_requires_multicast_frame() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_mc_flag_missing");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -361,13 +381,7 @@ fn test_mirror_connect_multicast_flag_requires_multicast_frame() {
         let (mut client, _) = listener.accept().unwrap();
         let mut buf = [0u8; 32];
         client.read_exact(&mut buf).unwrap();
-        let hdr = encode_frame(
-            KIND_GEOMETRY,
-            GEOMETRY_MULTICAST,
-            0,
-            GEOMETRY_LEN as u32,
-            1,
-        );
+        let hdr = encode_frame(KIND_GEOMETRY, GEOMETRY_MULTICAST, 0, GEOMETRY_LEN as u32, 1);
         client.write_all(&hdr).unwrap();
         let body = valid_geometry_payload(64, 32);
         client.write_all(&body).unwrap();
@@ -376,13 +390,17 @@ fn test_mirror_connect_multicast_flag_requires_multicast_frame() {
     });
 
     let res = Mirror::builder().connect(addr, &dst);
-    assert!(matches!(res, Err(RingfireError::Protocol("expected MULTICAST"))));
+    assert!(matches!(
+        res,
+        Err(RingfireError::Protocol("expected MULTICAST"))
+    ));
     srv.join().unwrap();
     let _ = std::fs::remove_file(&dst);
 }
 
 #[test]
 fn test_mirror_connect_multicast_flag_bad_multicast_address() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_mc_bad_addr");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -391,13 +409,7 @@ fn test_mirror_connect_multicast_flag_bad_multicast_address() {
         let (mut client, _) = listener.accept().unwrap();
         let mut buf = [0u8; 32];
         client.read_exact(&mut buf).unwrap();
-        let hdr = encode_frame(
-            KIND_GEOMETRY,
-            GEOMETRY_MULTICAST,
-            0,
-            GEOMETRY_LEN as u32,
-            1,
-        );
+        let hdr = encode_frame(KIND_GEOMETRY, GEOMETRY_MULTICAST, 0, GEOMETRY_LEN as u32, 1);
         client.write_all(&hdr).unwrap();
         let body = valid_geometry_payload(64, 32);
         client.write_all(&body).unwrap();
@@ -421,6 +433,7 @@ fn test_mirror_connect_multicast_flag_bad_multicast_address() {
 
 #[test]
 fn test_mirror_tcp_step_validates_data_payload_size() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_tcp_data_val");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -454,6 +467,7 @@ fn test_mirror_tcp_step_validates_data_payload_size() {
 
 #[test]
 fn test_mirror_tcp_step_handles_gap_and_heartbeat() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_tcp_gap_hb");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -499,6 +513,7 @@ fn test_mirror_tcp_step_handles_gap_and_heartbeat() {
 
 #[test]
 fn test_mirror_tcp_step_handles_source_restart_and_jump() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mirror_tcp_restart_jump");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -546,6 +561,7 @@ fn test_mirror_tcp_step_handles_source_restart_and_jump() {
 
 #[test]
 fn test_multicast_control_rejects_non_nak() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("mc_ctrl_non_nak_src");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 42, 99), 42999);
@@ -570,15 +586,13 @@ fn test_multicast_control_rejects_non_nak() {
     stream.write_all(&non_nak).unwrap();
 
     let mut chk = [0u8; 1];
-    assert!(matches!(
-        stream.read(&mut chk),
-        Ok(0) | Err(_)
-    ));
+    assert!(matches!(stream.read(&mut chk), Ok(0) | Err(_)));
     let _ = std::fs::remove_file(&src);
 }
 
 #[test]
 fn test_mirror_start_sequence() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("start_seq_src");
     let dst = temp("start_seq_dst");
     let mut prod = RingProducer::<Tick>::create(&src, 256).unwrap();
@@ -624,6 +638,7 @@ fn test_mirror_start_sequence() {
 
 #[test]
 fn test_blob_zero_length_replication() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("blob_zero_src");
     let dst = temp("blob_zero_dst");
     let mut prod = BlobProducer::<Tick>::create(&src, 64, 4096).unwrap();
@@ -680,6 +695,7 @@ fn test_blob_zero_length_replication() {
 
 #[test]
 fn test_sparse_ring_with_reader_registry() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("registry_src");
     let dst = temp("registry_dst");
 
@@ -706,6 +722,7 @@ fn test_sparse_ring_with_reader_registry() {
 
 #[test]
 fn test_unicast_mock_protocol_recovery_and_edge_cases() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("uc_mock_dst");
     let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -720,13 +737,7 @@ fn test_unicast_mock_protocol_recovery_and_edge_cases() {
         let mut hello_buf = [0u8; 32];
         tcp_stream.read_exact(&mut hello_buf).unwrap();
 
-        let geom_hdr = encode_frame(
-            KIND_GEOMETRY,
-            GEOMETRY_MULTICAST,
-            0,
-            GEOMETRY_LEN as u32,
-            1,
-        );
+        let geom_hdr = encode_frame(KIND_GEOMETRY, GEOMETRY_MULTICAST, 0, GEOMETRY_LEN as u32, 1);
         tcp_stream.write_all(&geom_hdr).unwrap();
         let geom_body = valid_geometry_payload(64, 32);
         tcp_stream.write_all(&geom_body).unwrap();
@@ -889,7 +900,10 @@ fn test_unicast_mock_protocol_recovery_and_edge_cases() {
             }
         }
     }
-    assert!(matches!(err, Some(RingfireError::Protocol("unexpected frame kind"))));
+    assert!(matches!(
+        err,
+        Some(RingfireError::Protocol("unexpected frame kind"))
+    ));
 
     drop(tcp_stream);
     assert!(!mirror.step().unwrap());
@@ -899,6 +913,7 @@ fn test_unicast_mock_protocol_recovery_and_edge_cases() {
 
 #[test]
 fn test_lapped_arena_payload_generates_gap() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("lap_arena_src");
     let dst = temp("lap_arena_dst");
     let mut prod = BlobProducer::<Tick>::create(&src, 1024, 64).unwrap();
@@ -939,11 +954,16 @@ fn test_lapped_arena_payload_generates_gap() {
 
 #[test]
 fn test_resume_mismatched_layout_recreates_ring() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("res_mismatch_src");
     let dst = temp("res_mismatch_dst");
 
-    let prod_old = RingProducer::<Tick>::create(&dst, 64).unwrap();
+    let prod_old = ringfire::RingProducerBuilder::new(64)
+        .cleanup_mode(ringfire::CleanupMode::Persistent)
+        .build::<Tick, _>(&dst)
+        .unwrap();
     drop(prod_old);
+    assert!(dst.exists(), "resume must inspect an existing ring");
 
     let mut prod_src = RingProducer::<Tick>::create(&src, 256).unwrap();
     for seq in 1..=10 {
@@ -966,12 +986,14 @@ fn test_resume_mismatched_layout_recreates_ring() {
 
 #[test]
 fn test_mirror_builder_default() {
+    let _deadline = deadline::Deadline::new();
     let b = ringfire::replication::MirrorBuilder::default();
     assert_eq!(format!("{:?}", b), format!("{:?}", Mirror::builder()));
 }
 
 #[test]
 fn test_mirror_convenience_connect_and_last_nak() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("conv_connect_src");
     let dst = temp("conv_connect_dst");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
@@ -989,28 +1011,8 @@ fn test_mirror_convenience_connect_and_last_nak() {
 }
 
 #[test]
-fn test_server_mtu_matrix_and_spin() {
-    let src = temp("mtu_matrix_src");
-    let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
-    let cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 42, 42), 44222).mtu(1200);
-
-    let s1 = ReplicaServer::bind(&src, "127.0.0.1:0")
-        .unwrap()
-        .multicast(cfg)
-        .unicast(0, 1300)
-        .spin(true);
-    let _h1 = s1.spawn().unwrap();
-
-    let s2 = ReplicaServer::bind(&src, "127.0.0.1:0")
-        .unwrap()
-        .spin(true);
-    let _h2 = s2.spawn().unwrap();
-
-    let _ = std::fs::remove_file(&src);
-}
-
-#[test]
 fn test_mirror_write_records_arena_blob_size_validations() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("arena_blob_size_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1027,7 +1029,7 @@ fn test_mirror_write_records_arena_blob_size_validations() {
         let element_size = 32u32;
         let flags = ringfire::header::FLAG_WITH_ARENA;
         let registry_count = 0u32;
-        let slots_offset = 128u64;
+        let slots_offset = 128u32;
         let arena_offset = 128 + 64 * 32u64;
         let arena_size = 1024u64;
 
@@ -1037,9 +1039,9 @@ fn test_mirror_write_records_arena_blob_size_validations() {
         geom_body[12..16].copy_from_slice(&flags.to_le_bytes());
         geom_body[16..24].copy_from_slice(&123u64.to_le_bytes());
         geom_body[24..28].copy_from_slice(&registry_count.to_le_bytes());
-        geom_body[28..36].copy_from_slice(&slots_offset.to_le_bytes());
-        geom_body[36..44].copy_from_slice(&arena_offset.to_le_bytes());
-        geom_body[44..48].copy_from_slice(&(arena_size as u32).to_le_bytes());
+        geom_body[28..32].copy_from_slice(&slots_offset.to_le_bytes());
+        geom_body[32..40].copy_from_slice(&arena_offset.to_le_bytes());
+        geom_body[40..48].copy_from_slice(&arena_size.to_le_bytes());
         client.write_all(&geom_body).unwrap();
 
         let mut rec = vec![0u8; 24];
@@ -1066,6 +1068,7 @@ fn test_mirror_write_records_arena_blob_size_validations() {
 
 #[test]
 fn test_mirror_write_records_arena_blob_longer_than_records() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("arena_blob_longer_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1082,7 +1085,7 @@ fn test_mirror_write_records_arena_blob_longer_than_records() {
         let element_size = 32u32;
         let flags = ringfire::header::FLAG_WITH_ARENA;
         let registry_count = 0u32;
-        let slots_offset = 128u64;
+        let slots_offset = 128u32;
         let arena_offset = 128 + 64 * 32u64;
         let arena_size = 1024u64;
 
@@ -1092,9 +1095,9 @@ fn test_mirror_write_records_arena_blob_longer_than_records() {
         geom_body[12..16].copy_from_slice(&flags.to_le_bytes());
         geom_body[16..24].copy_from_slice(&123u64.to_le_bytes());
         geom_body[24..28].copy_from_slice(&registry_count.to_le_bytes());
-        geom_body[28..36].copy_from_slice(&slots_offset.to_le_bytes());
-        geom_body[36..44].copy_from_slice(&arena_offset.to_le_bytes());
-        geom_body[44..48].copy_from_slice(&(arena_size as u32).to_le_bytes());
+        geom_body[28..32].copy_from_slice(&slots_offset.to_le_bytes());
+        geom_body[32..40].copy_from_slice(&arena_offset.to_le_bytes());
+        geom_body[40..48].copy_from_slice(&arena_size.to_le_bytes());
         client.write_all(&geom_body).unwrap();
 
         let mut rec = vec![0u8; 24];
@@ -1120,32 +1123,10 @@ fn test_mirror_write_records_arena_blob_longer_than_records() {
 }
 
 #[test]
-fn test_udp_sender_emsgsize_handling() {
-    let src = temp("emsgsize_src");
-    let mut prod = BlobProducer::<Tick>::create(&src, 64, 128 * 1024).unwrap();
-    let cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 99, 99), 49999).mtu(65535);
-
-    let server = ReplicaServer::bind(&src, "127.0.0.1:0")
-        .unwrap()
-        .multicast(cfg)
-        .linger(Some(Duration::ZERO));
-    server.spawn().unwrap();
-
-    let big_blob = vec![42u8; 65500];
-    prod.push(&Tick::nth(1), &big_blob).unwrap();
-
-    thread::sleep(Duration::from_millis(50));
-
-    let _ = std::fs::remove_file(&src);
-}
-
-#[test]
 fn test_mirror_unicast_rejects_ipv6_source() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("ipv6_unicast_dst");
-    let listener = match TcpListener::bind("[::1]:0") {
-        Ok(l) => l,
-        Err(_) => return,
-    };
+    let listener = TcpListener::bind("[::1]:0").expect("IPv6 loopback is required for this test");
     let addr = listener.local_addr().unwrap();
 
     let srv = thread::spawn(move || {
@@ -1182,6 +1163,7 @@ fn test_mirror_unicast_rejects_ipv6_source() {
 
 #[test]
 fn test_mirror_datagram_shorter_than_records_error() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("dgram_short_rec_dst");
     let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -1201,7 +1183,7 @@ fn test_mirror_datagram_shorter_than_records_error() {
         let element_size = 32u32;
         let flags = ringfire::header::FLAG_WITH_ARENA;
         let registry_count = 0u32;
-        let slots_offset = 128u64;
+        let slots_offset = 128u32;
         let arena_offset = 128 + 64 * 32u64;
         let arena_size = 1024u64;
 
@@ -1211,9 +1193,9 @@ fn test_mirror_datagram_shorter_than_records_error() {
         geom_body[12..16].copy_from_slice(&flags.to_le_bytes());
         geom_body[16..24].copy_from_slice(&123u64.to_le_bytes());
         geom_body[24..28].copy_from_slice(&registry_count.to_le_bytes());
-        geom_body[28..36].copy_from_slice(&slots_offset.to_le_bytes());
-        geom_body[36..44].copy_from_slice(&arena_offset.to_le_bytes());
-        geom_body[44..48].copy_from_slice(&(arena_size as u32).to_le_bytes());
+        geom_body[28..32].copy_from_slice(&slots_offset.to_le_bytes());
+        geom_body[32..40].copy_from_slice(&arena_offset.to_le_bytes());
+        geom_body[40..48].copy_from_slice(&arena_size.to_le_bytes());
         tcp_stream.write_all(&geom_body).unwrap();
 
         let mc_hdr = encode_frame(KIND_MULTICAST, 0, 0, MULTICAST_LEN as u32, 0);
@@ -1260,7 +1242,9 @@ fn test_mirror_datagram_shorter_than_records_error() {
     }
     assert!(matches!(
         err,
-        Some(RingfireError::Protocol("DATA frame shorter than its records"))
+        Some(RingfireError::Protocol(
+            "DATA frame shorter than its records"
+        ))
     ));
 
     srv.join().unwrap();
@@ -1269,6 +1253,7 @@ fn test_mirror_datagram_shorter_than_records_error() {
 
 #[test]
 fn test_mirror_tcp_unexpected_frame_kind() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("tcp_unexp_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1289,7 +1274,10 @@ fn test_mirror_tcp_unexpected_frame_kind() {
 
     let mut mirror = Mirror::builder().connect(addr, &dst).unwrap();
     let err = mirror.step().unwrap_err();
-    assert!(matches!(err, RingfireError::Protocol("unexpected frame kind")));
+    assert!(matches!(
+        err,
+        RingfireError::Protocol("unexpected frame kind")
+    ));
 
     drop(srv.join().unwrap());
     let _ = std::fs::remove_file(&dst);
@@ -1297,6 +1285,7 @@ fn test_mirror_tcp_unexpected_frame_kind() {
 
 #[test]
 fn test_mirror_tcp_data_eof_returns_false() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("tcp_eof_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1325,6 +1314,7 @@ fn test_mirror_tcp_data_eof_returns_false() {
 
 #[test]
 fn test_mirror_multicast_tcp_data_eof_returns_false() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mc_data_eof_dst");
     let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -1338,7 +1328,9 @@ fn test_mirror_multicast_tcp_data_eof_returns_false() {
 
         let geom_hdr = encode_frame(KIND_GEOMETRY, GEOMETRY_MULTICAST, 0, GEOMETRY_LEN as u32, 1);
         tcp_stream.write_all(&geom_hdr).unwrap();
-        tcp_stream.write_all(&valid_geometry_payload(64, 32)).unwrap();
+        tcp_stream
+            .write_all(&valid_geometry_payload(64, 32))
+            .unwrap();
 
         let mc_hdr = encode_frame(KIND_MULTICAST, 0, 0, MULTICAST_LEN as u32, 0);
         tcp_stream.write_all(&mc_hdr).unwrap();
@@ -1355,7 +1347,10 @@ fn test_mirror_multicast_tcp_data_eof_returns_false() {
         drop(tcp_stream);
     });
 
-    let mut mirror = Mirror::builder().unicast(true).connect(tcp_addr, &dst).unwrap();
+    let mut mirror = Mirror::builder()
+        .unicast(true)
+        .connect(tcp_addr, &dst)
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut ok_false = false;
     while Instant::now() < deadline {
@@ -1375,34 +1370,8 @@ fn test_mirror_multicast_tcp_data_eof_returns_false() {
 }
 
 #[test]
-fn test_udp_loop_lost_blob_advances_cursor() {
-    let src = temp("udp_lost_src");
-    let mut prod = BlobProducer::<Tick>::create(&src, 64, 4096).unwrap();
-    prod.push(&Tick::nth(1), b"blob 1").unwrap();
-    prod.push(&Tick::nth(2), b"blob 2").unwrap();
-
-    let server = ReplicaServer::bind(&src, "127.0.0.1:0")
-        .unwrap()
-        .multicast(MulticastConfig::new(Ipv4Addr::new(239, 255, 77, 77), 47777))
-        .linger(Some(Duration::ZERO));
-    server.spawn().unwrap();
-
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
-        let f_len = f.metadata().unwrap().len();
-        if f_len > 2176 + 2 * 48 + 24 {
-            f.seek(SeekFrom::Start(2176 + 2 * 48 + 24)).unwrap();
-            let _ = f.write_all(&100_000u32.to_le_bytes());
-        }
-    }
-
-    thread::sleep(Duration::from_millis(50));
-    let _ = std::fs::remove_file(&src);
-}
-
-#[test]
 fn test_server_spin_mode_mirror_connection() {
+    let _deadline = deadline::Deadline::new();
     let src = temp("spin_mode_src");
     let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
     let dst = temp("spin_mode_dst");
@@ -1420,8 +1389,11 @@ fn test_server_spin_mode_mirror_connection() {
 }
 
 #[test]
-fn test_mirror_connect_multicast_port_1_fails() {
-    let dst = temp("mc_port1_dst");
+fn test_mirror_connect_rejects_occupied_udp_port() {
+    let _deadline = deadline::Deadline::new();
+    let dst = temp("mc_busy_port_dst");
+    let occupied = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1438,7 +1410,7 @@ fn test_mirror_connect_multicast_port_1_fails() {
         let _ = client.write_all(&mc_hdr);
         let mut mc_info = [0u8; MULTICAST_LEN];
         mc_info[0..4].copy_from_slice(&[239, 255, 1, 1]);
-        mc_info[4..6].copy_from_slice(&1u16.to_le_bytes());
+        mc_info[4..6].copy_from_slice(&occupied_port.to_le_bytes());
         mc_info[6..8].copy_from_slice(&1472u16.to_le_bytes());
         let _ = client.write_all(&mc_info);
     });
@@ -1451,22 +1423,8 @@ fn test_mirror_connect_multicast_port_1_fails() {
 }
 
 #[test]
-fn test_replica_server_multicast_and_unicast() {
-    let src = temp("mc_uni_src");
-    let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
-    let mc_cfg = MulticastConfig::new(Ipv4Addr::new(239, 255, 0, 1), 41000).mtu(1400);
-    let server = ReplicaServer::bind(&src, "127.0.0.1:0")
-        .unwrap()
-        .multicast(mc_cfg)
-        .unicast(42000, 1200);
-    let handle = server.spawn().unwrap();
-    thread::sleep(Duration::from_millis(30));
-    drop(handle);
-    let _ = std::fs::remove_file(&src);
-}
-
-#[test]
 fn test_mirror_partial_frame_header_read_full() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("partial_hdr_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1501,6 +1459,7 @@ fn test_mirror_partial_frame_header_read_full() {
 
 #[test]
 fn test_mirror_multicast_out_of_order_datagram_pending() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mc_pending_dst");
     let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -1566,6 +1525,7 @@ fn test_mirror_multicast_out_of_order_datagram_pending() {
 
 #[test]
 fn test_mirror_multicast_peer_gone_on_nak() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("mc_peer_gone_dst");
     let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
@@ -1611,13 +1571,17 @@ fn test_mirror_multicast_peer_gone_on_nak() {
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut ended = false;
     while Instant::now() < deadline {
-        match mirror.step() {
-            Ok(false) => break, // peer_gone returned Ok(false)
-            Ok(true) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => break,
+        match mirror.step().expect("peer closure must be a clean end") {
+            false => {
+                ended = true;
+                break;
+            }
+            true => thread::yield_now(),
         }
     }
+    assert!(ended, "mirror never reported the closed peer");
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&dst);
@@ -1625,6 +1589,7 @@ fn test_mirror_multicast_peer_gone_on_nak() {
 
 #[test]
 fn test_mirror_duplicate_arena_frame() {
+    let _deadline = deadline::Deadline::new();
     let dst = temp("dup_arena_dst");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
