@@ -116,8 +116,8 @@ number was worth reporting:
    back at 500 k msg/s. It now handles at most 32 datagrams per call.
 3. **No batching while keeping up.** A sender that keeps pace with the producer sends one
    record per datagram. Above ~20,000 msg/s that is a system call and a packet per record,
-   and this kernel path sustains about 40,000 datagrams/s: latency went from 50 µs to over
-   a millisecond. Frames are now paced: they leave at most once per 50 µs unless full,
+   and this kernel path sustains about 40,000 datagrams/s. At 50,000 msg/s without
+   linger, round-trip latency reached 830 µs p50 and 1.5 ms p99. Frames are now paced: they leave at most once per 50 µs unless full,
    and a lone record arriving later than that after the previous frame goes out at once,
    so quiet and bursty streams pay nothing. Three pacing rules were tried; the two that
    waited "whenever the previous frame was recent" or "whenever a backlog was seen"
@@ -142,11 +142,13 @@ master's own host) stamp the read. Slave clocks are translated into the master's
 a PTP-style offset from the minimum-round-trip probe, so cross-host figures carry a
 few microseconds of systematic uncertainty; same-host figures are exact.
 
-| Stage, 1,000 msg/s | multicast | UDP unicast | TCP |
+| Stage, 1,000 msg/s (p50 per mirror) | multicast | UDP unicast | TCP |
 | :--- | ---: | ---: | ---: |
 | push → read by a consumer on the master | 0.1 µs | 0.1 µs | 0.1 µs |
 | push → read on a mirror on the same host | 3.8–4.1 µs | 8.8–21 µs | 9 µs |
 | push → read on each of six mirrors on the other host | 29.6–32.4 µs | 38–48 µs | 31–34 µs |
+
+The ranges span the medians of the mirrors in that group.
 
 Multicast is one `sendto` per frame regardless of mirrors; unicast is one per mirror,
 about 1.5 µs each, so later mirrors in the list wait longer.
@@ -219,6 +221,7 @@ sending twice trims the last of the tail. The NAT was punched on the first try.
 Master on the first host, hub on the second (`ringfire mirror --unicast` and
 `ringfire serve --udp` on the same ring), leaf back on the first host, unicast on both
 hops; a direct mirror on the first host measured the same records for reference.
+The run published 1,000 records/s for 5 seconds.
 
 | Path | p50 | p99 | max |
 | :--- | ---: | ---: | ---: |

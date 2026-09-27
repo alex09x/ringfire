@@ -14,9 +14,9 @@
 <text x='181' y='222' text-anchor='middle' fill='#6a737d' font-size='11'>fixed slots, or descriptors + arena</text>
 <rect x='356' y='66' width='250' height='170' rx='10' fill='#e8efff' stroke='#1d4ed8' stroke-dasharray='4 3'/>
 <text x='481' y='86' text-anchor='middle' fill='#1d4ed8' font-weight='bold'>network</text>
-<line x1='336' y1='118' x2='616' y2='118' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/><text x='476.0' y='111' text-anchor='middle' fill='#1d4ed8' font-size='11'>DATA: raw slot bytes + seq</text>
+<line x1='336' y1='118' x2='616' y2='118' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)'/><text x='476.0' y='111' text-anchor='middle' fill='#1d4ed8' font-size='11'>DATA + seq; GAP over TCP</text>
 <text x='481' y='146' text-anchor='middle' fill='#1d4ed8' font-size='11'>UDP multicast · UDP unicast · TCP</text>
-<line x1='616' y1='186' x2='336' y2='186' stroke='#1d4ed8' stroke-width='1.5' marker-end='url(#n)' stroke-dasharray='4 3'/><text x='476.0' y='201' text-anchor='middle' fill='#1d4ed8' font-size='11'>NAK / GAP over TCP</text>
+<text x='481' y='201' text-anchor='middle' fill='#1d4ed8' font-size='11'>NAK over TCP</text>
 <text x='481' y='214' text-anchor='middle' fill='#6a737d' font-size='11'>the source ring is</text>
 <text x='481' y='228' text-anchor='middle' fill='#6a737d' font-size='11'>the retransmission buffer</text>
 <rect x='616' y='56' width='328' height='190' rx='10' fill='#f6f8fa' stroke='#d0d7de'/><text x='628' y='76' fill='#1f2328' font-weight='bold' font-size='13'>mirror host</text>
@@ -26,6 +26,7 @@
 <line x1='832' y1='118' x2='852' y2='118' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
 <rect x='852' y='96' width='80' height='44' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/><text x='892.0' y='116.0' text-anchor='middle' fill='#1f2328' font-size='11' font-weight='bold'>readers</text><text x='892.0' y='132.0' text-anchor='middle' fill='#6a737d' font-size='11'>as local</text>
 <text x='780' y='222' text-anchor='middle' fill='#6a737d' font-size='11'>written in order, never duplicated</text>
+<path d='M630,136 L614,186 L348,186 L348,110 L336,110' fill='none' stroke='#1d4ed8' stroke-width='1.5' stroke-dasharray='4 3' marker-end='url(#n)'/>
 <text x='30' y='276' fill='#1f2328' font-weight='bold' font-size='13'>0.1 µs</text>
 <text x='30' y='292' fill='#6a737d' font-size='11'>same ring</text>
 <text x='250' y='276' fill='#1f2328' font-weight='bold' font-size='13'>3.8 µs</text>
