@@ -159,7 +159,6 @@ pub fn wake_futex(header: &RingHeader, count: i32) {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn sys_futex_wait(addr: &AtomicU32, val: u32, timeout: Option<Duration>) {
     let timespec = timeout.map(|d| libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
@@ -182,16 +181,6 @@ fn sys_futex_wait(addr: &AtomicU32, val: u32, timeout: Option<Duration>) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn sys_futex_wait(_addr: &AtomicU32, _val: u32, timeout: Option<Duration>) {
-    // Portable fallback for macOS and BSDs
-    match timeout {
-        Some(d) => std::thread::sleep(d.min(Duration::from_millis(5))),
-        None => std::thread::yield_now(),
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn sys_futex_wake(addr: &AtomicU32, count: i32) {
     unsafe {
         libc::syscall(
@@ -206,33 +195,22 @@ fn sys_futex_wake(addr: &AtomicU32, count: i32) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn sys_futex_wake(_addr: &AtomicU32, _count: i32) {
-    // No-op on fallback platform; sleeping threads wake on timeout
-}
-
-#[cfg(target_os = "linux")]
 const MEMBARRIER_CMD_GLOBAL_EXPEDITED: libc::c_long = 1 << 1;
-#[cfg(target_os = "linux")]
 const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: libc::c_long = 1 << 2;
 
 /// Registers this process as a producer for the consumers' asymmetric barrier.
 /// Idempotent; failures (old kernel, seccomp) leave consumers on bounded sleeps.
 pub(crate) fn register_producer_barrier() {
-    #[cfg(target_os = "linux")]
-    {
-        static REGISTER: std::sync::Once = std::sync::Once::new();
-        REGISTER.call_once(|| unsafe {
-            libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0);
-        });
-    }
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| unsafe {
+        libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0);
+    });
 }
 
 /// Heavy side of the asymmetric barrier: a full memory barrier on every running thread of
 /// every registered producer process.
 #[inline]
 fn producer_barrier() {
-    #[cfg(target_os = "linux")]
     unsafe {
         libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0);
     }

@@ -93,7 +93,7 @@ impl BlobProducerBuilder {
 /// Producer for variable-sized binary blobs and metadata in shared memory.
 pub struct BlobProducer<M: Copy + 'static> {
     path: PathBuf,
-    file: Option<File>,
+    file: File,
     header: *mut RingHeader,
     slots: *mut Slot<BlobPacket<M>>,
     arena: PayloadArena,
@@ -194,7 +194,7 @@ impl<M: Copy + 'static> BlobProducer<M> {
 
         Ok(Self {
             path: path_buf,
-            file: Some(file),
+            file,
             _mmap: mmap,
             header: header_ptr,
             slots: slots_ptr,
@@ -273,10 +273,8 @@ impl<M: Copy + 'static> Drop for BlobProducer<M> {
         if self.cleanup_mode == CleanupMode::UnlinkOnDrop {
             let _ = std::fs::remove_file(&self.path);
         }
-        if let Some(file) = self.file.take() {
-            unsafe {
-                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-            }
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }

@@ -41,7 +41,7 @@ jobs:
         run: cargo bench --no-run
 
   coverage:
-    name: coverage (95% lines)
+    name: coverage (98% lines)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

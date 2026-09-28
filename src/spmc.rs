@@ -457,6 +457,18 @@ impl<T: Copy + 'static> RingProducer<T> {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Cleanup mode on drop.
+    #[inline]
+    pub fn cleanup_mode(&self) -> CleanupMode {
+        self.cleanup_mode
+    }
+
+    /// Update cleanup mode.
+    #[inline]
+    pub fn set_cleanup_mode(&mut self, mode: CleanupMode) {
+        self.cleanup_mode = mode;
+    }
 }
 
 impl<T: Copy + 'static> Drop for RingProducer<T> {
@@ -853,11 +865,8 @@ impl<T: Copy + LayoutSignature + 'static> RingConsumer<T> {
                     }
                     let write_seq = unsafe { (*self.header).write_seq.load(Ordering::Acquire) };
                     if write_seq >= self.cursor + self.capacity {
-                        let s = self.skip_overwritten(0);
-                        if s > 0 {
-                            skipped += s;
-                            continue;
-                        }
+                        skipped += self.skip_overwritten(0);
+                        continue;
                     }
                     return (None, skipped);
                 }

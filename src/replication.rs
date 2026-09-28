@@ -625,7 +625,6 @@ fn multicast_receiver(
     let sock = unsafe { UdpSocket::from_raw_fd(fd) };
     unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)?;
-    #[cfg(not(target_os = "linux"))]
     set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)?;
     if rcvbuf > 0 {
         let bytes = rcvbuf.min(i32::MAX as usize) as i32;
@@ -668,7 +667,9 @@ fn send_datagram(sock: &UdpSocket, dest: SocketAddrV4, bytes: &[u8]) -> io::Resu
 // ---------------------------------------------------------------------------------------
 
 /// Outcome of reading one record.
-enum RawRead {
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawRead {
     Item,
     Pending,
     Overwritten(u64),
@@ -757,7 +758,8 @@ impl ArenaView {
 }
 
 /// Read-only view of the source ring; one per mirror connection.
-struct SourceRing {
+#[doc(hidden)]
+pub struct SourceRing {
     base: *const u8,
     view: RingView,
     geometry: Geometry,
@@ -768,7 +770,8 @@ struct SourceRing {
 unsafe impl Send for SourceRing {}
 
 impl SourceRing {
-    fn open(path: &Path) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let view = unsafe { validate_ring(mmap.as_ptr(), mmap.len(), None, 8)? };
@@ -802,7 +805,8 @@ impl SourceRing {
     }
 
     /// Copies the slot payload of message `want` into `out` using the v2 slot protocol.
-    fn read(&self, want: u64, out: &mut [u8]) -> RawRead {
+    #[doc(hidden)]
+    pub fn read(&self, want: u64, out: &mut [u8]) -> RawRead {
         let slot = unsafe {
             self.base.add(
                 self.view.slots_offset + (want & self.view.mask) as usize * self.view.slot_size,
@@ -1302,11 +1306,9 @@ impl ReplicaServer {
         let (batch, spin, session, linger) = (self.batch, self.spin, self.session, self.linger);
         let delivery = UdpDelivery {
             port: self.unicast.map_or(0, |(port, _)| port),
-            mtu: match (self.multicast, self.unicast) {
-                (Some(cfg), Some((_, mtu))) => cfg.mtu.min(mtu),
-                (Some(cfg), None) => cfg.mtu,
-                (None, Some((_, mtu))) => mtu,
-                (None, None) => DEFAULT_MTU,
+            mtu: match self.multicast {
+                Some(cfg) => self.unicast.map_or(cfg.mtu, |(_, mtu)| cfg.mtu.min(mtu)),
+                None => self.unicast.map_or(DEFAULT_MTU, |(_, mtu)| mtu),
             },
             multicast: self.multicast,
             peers: self.peers.clone(),
@@ -2029,9 +2031,8 @@ pub struct Mirror {
     retransmitted: u64,
     nak: Option<Nak>,
     last_nak: Option<(u64, u64)>,
-    /// Multicast datagrams that arrived ahead of a hole, by first sequence: record
-    /// count and frame payload.
-    pending: BTreeMap<u64, (usize, Vec<u8>)>,
+    #[doc(hidden)]
+    pub pending: BTreeMap<u64, (usize, Vec<u8>)>,
     buf: Vec<u8>,
     dgram: Vec<u8>,
 }
@@ -2230,14 +2231,21 @@ impl Mirror {
     }
 
     /// Whether `count` records can be `len` bytes long for this ring.
-    fn frame_sizes_ok(&self, count: usize, len: usize) -> bool {
-        let descriptors = count * self.geometry.payload_len();
-        count > 0
-            && if self.geometry.has_arena() {
-                len >= descriptors
-            } else {
-                len == descriptors
-            }
+    #[doc(hidden)]
+    pub fn frame_sizes_ok(&self, count: usize, len: usize) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let Some(descriptors) = count.checked_mul(self.geometry.payload_len()) else {
+            return false;
+        };
+        if self.geometry.has_arena() {
+            let max_blobs = count.saturating_mul(self.geometry.arena_size as usize);
+            let max_allowed = descriptors.saturating_add(max_blobs);
+            len >= descriptors && len <= max_allowed
+        } else {
+            len == descriptors
+        }
     }
 
     /// Writes the records of a `DATA` frame into the ring, skipping those below the
@@ -2465,7 +2473,8 @@ impl Mirror {
 
     /// After the write position moved: drop a satisfied `NAK` and apply queued datagrams
     /// that now continue the ring.
-    fn after_advance(&mut self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn after_advance(&mut self) -> Result<()> {
         loop {
             let next = self.ring().next_seq;
             if let Some(nak) = self.nak

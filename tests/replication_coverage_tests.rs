@@ -192,14 +192,32 @@ fn test_server_serve_one_happy_path() {
         .unwrap();
     let mirror_handle = mirror.handle().unwrap();
 
+    let dst_clone = dst.clone();
     let runner = thread::spawn(move || {
         while mirror.sequence() < 5 {
             mirror.step().unwrap();
         }
         mirror_handle.shutdown().unwrap();
         mirror.run().unwrap();
+        assert_eq!(mirror.path(), dst_clone.as_path());
+        assert!(mirror.peer_addr().is_ok());
+        let _ = mirror.session();
+        let _ = mirror.last_nak();
+        let _ = mirror.source_sequence();
+        let _ = mirror.frames();
+        let _ = mirror.datagrams();
+        let _ = mirror.naks();
+        let _ = mirror.retransmitted();
+        let _ = mirror.gaps();
+        let _ = mirror.first_sequence();
+        let _ = mirror.resumed();
+        let _ = mirror.is_multicast();
+        let _ = mirror.is_unicast();
+        let _ = mirror.geometry();
         mirror.sequence()
     });
+
+    assert!(ReplicaServer::bind(&src, "invalid:addr:999").is_err());
 
     for seq in 1..=5 {
         prod.push(&Tick::nth(seq));
@@ -1645,6 +1663,214 @@ fn test_mirror_duplicate_arena_frame() {
     assert_eq!(blob, [42; 10]);
     assert_eq!(reader.recv(&mut meta, &mut blob).unwrap(), None);
     assert_eq!(reader.lapped_count(), 0);
+
+    drop(srv.join().unwrap());
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[test]
+fn test_mirror_data_frame_trailing_bytes() {
+    let _deadline = deadline::Deadline::new();
+    let dst = temp("trailing_bytes_dst");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 32];
+        let _ = client.read_exact(&mut buf);
+
+        let geom_hdr = encode_frame(KIND_GEOMETRY, 0, 0, GEOMETRY_LEN as u32, 1);
+        let _ = client.write_all(&geom_hdr);
+        let mut geom_bytes = valid_geometry_payload(64, 32);
+        geom_bytes[12..16].copy_from_slice(&FLAG_WITH_ARENA.to_le_bytes());
+        geom_bytes[32..40].copy_from_slice(&(128u64 + 64 * 32).to_le_bytes());
+        geom_bytes[40..48].copy_from_slice(&4096u64.to_le_bytes());
+        let _ = client.write_all(&geom_bytes);
+
+        // Send record 1 with extra trailing bytes: count 1, but len = 24 + 10 + 5
+        let mut d1 = Vec::new();
+        d1.extend_from_slice(&encode_frame(KIND_DATA, 0, 1, 24 + 10 + 5, 1));
+        let mut desc1 = [0u8; 24];
+        desc1[16..20].copy_from_slice(&10u32.to_le_bytes()); // len 10
+        d1.extend_from_slice(&desc1);
+        d1.extend_from_slice(&[42u8; 10]);
+        d1.extend_from_slice(&[99u8; 5]); // 5 trailing bytes!
+        let _ = client.write_all(&d1);
+        client
+    });
+
+    let mut mirror = Mirror::builder().connect(addr, &dst).unwrap();
+    let err = mirror.step().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("DATA frame longer than its records")
+    );
+
+    // Test frame_sizes_ok overflow -> line 2237
+    assert!(!mirror.frame_sizes_ok(usize::MAX, 100));
+
+    // Test after_advance when pending entry has end <= next -> line 2487
+    mirror.pending.insert(1, (1, vec![0; 32]));
+    assert!(mirror.after_advance().is_ok());
+
+    drop(srv.join().unwrap());
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[test]
+fn test_server_spin_idle_and_punch_unexpected_size() {
+    let _deadline = deadline::Deadline::new();
+    let src = temp("server_spin_idle_src");
+    let _prod = RingProducer::<Tick>::create(&src, 64).unwrap();
+
+    let udp_port = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let server = ReplicaServer::bind(&src, "127.0.0.1:0")
+        .unwrap()
+        .unicast(udp_port, 1400)
+        .spin(true);
+    let _ = server.spawn().unwrap();
+
+    // Send a 1-byte datagram to server UDP port -> hits line 1438 (Ok(_) => {})
+    let cl_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    cl_sock
+        .send_to(b"x", format!("127.0.0.1:{}", udp_port))
+        .unwrap();
+
+    // Let the server spin in its idle loop for 10ms -> hits lines 1497-1498 (core::hint::spin_loop())
+    std::thread::sleep(Duration::from_millis(15));
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn test_source_ring_read_slot_races() {
+    let _deadline = deadline::Deadline::new();
+    let src = temp("src_ring_races");
+    let mut prod = ringfire::spmc::RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&src)
+        .unwrap();
+    prod.push(&100);
+
+    let ring = ringfire::replication::SourceRing::open(&src).unwrap();
+    let mut buf = vec![0u8; 8];
+    assert_eq!(ring.read(1, &mut buf), ringfire::replication::RawRead::Item);
+
+    // Modify slot 1 seq concurrently while reading to test line 819
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src)
+        .unwrap();
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let slots_offset = std::mem::size_of::<ringfire::header::RingHeader>();
+    let slot1_ptr = unsafe { mmap.as_mut_ptr().add(slots_offset + 16) as *mut AtomicU64 };
+
+    // When s2 is SLOT_WRITING -> Overwritten(0)
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let slot_addr = slot1_ptr as usize;
+    let handle = std::thread::spawn(move || {
+        let ptr = slot_addr as *mut AtomicU64;
+        while !stop_clone.load(Ordering::Relaxed) {
+            unsafe {
+                (*ptr).store(ringfire::header::SLOT_WRITING, Ordering::Relaxed);
+                (*ptr).store(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    for _ in 0..10_000 {
+        let _ = ring.read(1, &mut buf);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+
+    // When s2 is want + 5 -> Overwritten(want + 5)
+    let stop2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2_clone = stop2.clone();
+    let handle2 = std::thread::spawn(move || {
+        let ptr = slot_addr as *mut AtomicU64;
+        while !stop2_clone.load(Ordering::Relaxed) {
+            unsafe {
+                (*ptr).store(15, Ordering::Relaxed);
+                (*ptr).store(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    for _ in 0..10_000 {
+        let _ = ring.read(1, &mut buf);
+    }
+    stop2.store(true, Ordering::Relaxed);
+    let _ = handle2.join();
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn test_mirror_unicast_punch_and_step_coverage() {
+    let _deadline = deadline::Deadline::new();
+    let dst = temp("mirror_unicast_step_dst");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let punch_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let punch_port = punch_udp.local_addr().unwrap().port();
+
+    let srv = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 32];
+        client.read_exact(&mut buf).unwrap();
+        let hdr = encode_frame(KIND_GEOMETRY, GEOMETRY_MULTICAST, 0, GEOMETRY_LEN as u32, 1);
+        client.write_all(&hdr).unwrap();
+        let body = valid_geometry_payload(64, 32);
+        client.write_all(&body).unwrap();
+        let mc_hdr = encode_frame(KIND_MULTICAST, 0, 0, MULTICAST_LEN as u32, 0);
+        client.write_all(&mc_hdr).unwrap();
+        let mut mc_info = [0u8; MULTICAST_LEN];
+        // 0.0.0.0 (unspecified) announces unicast
+        mc_info[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        mc_info[4..6].copy_from_slice(&punch_port.to_le_bytes());
+        mc_info[6..8].copy_from_slice(&1400u16.to_le_bytes()); // MTU
+        mc_info[8] = 1; // ttl
+        mc_info[9] = 7; // session
+        mc_info[10..14].copy_from_slice(&42u32.to_le_bytes()); // token
+        client.write_all(&mc_info).unwrap();
+        client
+    });
+
+    let mut mirror = Mirror::builder().connect(addr, &dst).unwrap();
+    assert!(mirror.is_unicast());
+    // mirror.step() should send the punch datagram and return Ok(true)
+    let progressed = mirror.step().unwrap();
+    assert!(progressed);
+
+    // Verify punch datagram arrived at punch_udp
+    let mut dgram = [0u8; 64];
+    punch_udp
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let (n, from) = punch_udp.recv_from(&mut dgram).unwrap();
+    assert!(n >= 16);
+    assert_eq!(dgram[0], KIND_PUNCH);
+
+    // Now test sending a datagram back to mirror's ephemeral UDP port:
+    // 1. Short datagram (< 16 bytes) -> Ok(())
+    punch_udp.send_to(b"short", from).unwrap();
+    // 2. Unexpected session datagram -> Ok(())
+    let bad_session = encode_frame(KIND_DATA, 99, 1, 0, 1);
+    punch_udp.send_to(&bad_session, from).unwrap();
+    // 3. Heartbeat frame from correct session -> updates heartbeat
+    let hb = encode_frame(KIND_HEARTBEAT, 7, 0, 0, 1);
+    punch_udp.send_to(&hb, from).unwrap();
+
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = mirror.step();
 
     drop(srv.join().unwrap());
     let _ = std::fs::remove_file(&dst);

@@ -25,7 +25,7 @@ const TICKER: MarketTicker = MarketTicker {
 };
 
 fn shm(name: &str) -> std::path::PathBuf {
-    let dir = if cfg!(target_os = "linux") { "/dev/shm".into() } else { std::env::temp_dir() };
+    let dir = std::path::PathBuf::from("/dev/shm");
     dir.join(format!("ringfire_quickstart_{}_{}", name, std::process::id()))
 }
 

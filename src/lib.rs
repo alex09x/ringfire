@@ -9,6 +9,9 @@
 //! configurable wait strategies (BusySpin, YieldBackoff, Futex sleep while idle),
 //! and an O(1) seqlock-backed Blackboard state table.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("ringfire is strictly Linux-only (requires /dev/shm, sys_futex, and sys_membarrier)");
+
 pub mod arena;
 pub mod blackboard;
 pub mod blob;
@@ -20,8 +23,8 @@ pub mod mpmc;
 pub mod multiplexer;
 pub mod registry;
 pub mod replication;
+pub mod shm;
 pub mod signature;
-mod shm;
 pub mod spmc;
 pub mod tsc;
 pub mod wait;

@@ -4,6 +4,7 @@ mod deadline;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read};
 use std::net::UdpSocket;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -254,6 +255,38 @@ fn test_cli_stat_arg_and_file_errors() {
     assert!(!ok);
     assert!(err.contains("Invalid magic signature"));
     let _ = std::fs::remove_file(&p);
+
+    // Out of bounds reader registry offset
+    let p = temp_file("bad_reg_offset");
+    let _prod = RingProducerBuilder::new(64)
+        .max_readers(4)
+        .build::<u64, _>(&p)
+        .unwrap();
+    let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut RingHeader) };
+    header.reader_registry_offset = 1_000_000;
+    drop(mmap);
+    drop(file);
+    let (ok, _, err) = run_cli(&["stat", p.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("reader registry outside the mapping"));
+    let _ = std::fs::remove_file(&p);
+
+    // Out of bounds arena offset
+    let p = temp_file("bad_arena_offset");
+    let _prod = RingProducer::<u64>::create(&p, 64).unwrap();
+    let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut RingHeader) };
+    header.arena_offset = 1_000_000;
+    header.arena_size = 1000;
+    drop(mmap);
+    drop(file);
+    let (ok, _, err) = run_cli(&["stat", p.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("payload arena outside the mapping"));
+    let _ = std::fs::remove_file(&p);
 }
 
 #[test]
@@ -420,6 +453,13 @@ fn test_cli_prune_options() {
     assert!(ok);
     assert!(out.contains("No ReaderRegistry configured"));
     let _ = std::fs::remove_file(&p);
+
+    let p_bad = temp_file("bad_prune");
+    std::fs::write(&p_bad, [0x11u8; 256]).unwrap();
+    let (ok, _, err) = run_cli(&["prune", p_bad.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("Error:"));
+    let _ = std::fs::remove_file(&p_bad);
 
     let p = temp_file("prune_reg");
     let _prod = RingProducerBuilder::new(64)
@@ -884,6 +924,7 @@ fn test_cli_serve_all_network_flags() {
                 "oldest",
                 "--once",
                 "--unicast",
+                "--spin",
                 "--iface",
                 "127.0.0.1",
             ])
@@ -1059,4 +1100,740 @@ fn test_cli_finite_tcp_server_and_missing_iterations() {
         .expect("server readiness announcement");
     drop(std::net::TcpStream::connect(parse_serve_addr(&line)).unwrap());
     assert!(server.wait_bounded(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn test_cli_clean_subcommand() {
+    let dir = std::env::temp_dir().join(format!("rf_clean_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dead_ring = dir.join("dead.shm");
+    let dead_board = dir.join("dead_board.shm");
+    let unrelated = dir.join("not_a_ring.txt");
+
+    // 1. Create a persistent ring and blackboard, then drop producer so they become orphaned
+    {
+        let _p = RingProducerBuilder::new(4)
+            .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+            .build::<u64, _>(&dead_ring)
+            .unwrap();
+        let mut b = ringfire::BlackboardProducer::<u64>::create(&dead_board, 4).unwrap();
+        b.set_cleanup_mode(ringfire::spmc::CleanupMode::Persistent);
+    }
+    std::fs::write(&unrelated, b"hello").unwrap();
+    let _ = std::fs::create_dir(dir.join("clean_sub_directory"));
+
+    // 2. Run clean --dry-run
+    let out = Command::new(bin_path())
+        .args(["clean", dir.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[DRY RUN] Orphaned shared memory file:"));
+    assert!(stdout.contains("Summary: Found 2 orphaned file(s)"));
+    assert!(dead_ring.exists());
+    assert!(dead_board.exists());
+    assert!(unrelated.exists());
+
+    // 3. Keep an active producer running on active_ring
+    let active_ring = dir.join("active.shm");
+    let _active_p = RingProducerBuilder::new(4)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&active_ring)
+        .unwrap();
+
+    // 4. Run clean for real
+    let out = Command::new(bin_path())
+        .args(["clean", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Cleaned orphaned shared memory file:"));
+    assert!(!dead_ring.exists());
+    assert!(!dead_board.exists());
+    assert!(active_ring.exists(), "active ring should not be removed");
+    assert!(unrelated.exists(), "unrelated file should not be removed");
+
+    // 5. Test nonexistent directory
+    let out = Command::new(bin_path())
+        .args(["clean", "/path/to/nowhere/does_not_exist"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("does not exist or is not accessible"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_cli_serve_and_mirror_additional_flags() {
+    let src = temp_file("src_flags");
+    let mut prod = RingProducerBuilder::new(4)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&src)
+        .unwrap();
+    prod.push(&999);
+
+    let udp_port = ephemeral_udp_port();
+    let mcast_port = ephemeral_udp_port();
+    let mcast_addr = format!("224.0.0.1:{}", mcast_port);
+
+    // Test serve with multicast, iface, mtu, ttl, udp, dup and --once (which rejects and exits 1 after parsing)
+    let (ok, _, err) = run_cli(&[
+        "serve",
+        src.to_str().unwrap(),
+        "--bind",
+        "127.0.0.1:0",
+        "--multicast",
+        &mcast_addr,
+        "--iface",
+        "127.0.0.1",
+        "--mtu",
+        "1400",
+        "--ttl",
+        "1",
+        "--udp",
+        &udp_port.to_string(),
+        "--dup",
+        "2",
+        "--linger-us",
+        "50",
+        "--unknown-extra",
+        "--once",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("supports TCP only"));
+
+    // Test mirror with reconnect-ms and invalid from
+    let (ok, _, err) = run_cli(&[
+        "mirror",
+        "127.0.0.1:9999",
+        "/tmp/nonexistent_mirror.shm",
+        "--reconnect-ms",
+        "100",
+        "--from",
+        "invalid_from_mode",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("--from expects"));
+
+    // Spawn server with all multicast + unicast + dup + linger flags
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--multicast",
+                &mcast_addr,
+                "--iface",
+                "127.0.0.1",
+                "--mtu",
+                "1400",
+                "--ttl",
+                "1",
+                "--udp",
+                &udp_port.to_string(),
+                "--dup",
+                "2",
+                "--linger-us",
+                "50",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let watcher = LineWatcher::spawn(server.stderr());
+    let announce = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("serve announcement");
+    assert!(announce.contains("multicast"));
+    assert!(announce.contains("linger 50 us"));
+
+    server.signal(libc::SIGTERM);
+    let _ = server.wait_bounded(Duration::from_secs(5));
+
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn test_cli_stat_unknown_magic_and_top_dead_reader() {
+    let p_unknown = temp_file("unknown_magic");
+    let prod = RingProducerBuilder::new(8)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&p_unknown)
+        .unwrap();
+    drop(prod);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p_unknown)
+        .unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut RingHeader) };
+    header.flags = 0; // clear MPMC and SPMC flags to test UNKNOWN mode
+    drop(mmap);
+    drop(file);
+
+    let (ok, out, _) = run_cli(&["stat", p_unknown.to_str().unwrap(), "--json"]);
+    assert!(ok);
+    assert!(out.contains("\"mode\": \"UNKNOWN\""));
+    let _ = std::fs::remove_file(&p_unknown);
+
+    let p_ring = temp_file("top_dead");
+    let mut prod = RingProducerBuilder::new(8)
+        .max_readers(2)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&p_ring)
+        .unwrap();
+    prod.push(&100);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p_ring)
+        .unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
+    let base_ptr = unsafe {
+        mmap.as_mut_ptr()
+            .add(header.reader_registry_offset as usize) as *mut ReaderSlot
+    };
+    unsafe {
+        let slot = &mut *base_ptr.add(0);
+        slot.active.store(1, Ordering::SeqCst);
+        slot.pid.store(99999999, Ordering::SeqCst);
+        let name = b"dead_top_r\0";
+        slot.name[..name.len()].copy_from_slice(name);
+    }
+    drop(mmap);
+    drop(file);
+
+    let (ok, out, _) = run_cli(&[
+        "top",
+        p_ring.to_str().unwrap(),
+        "--interval-ms",
+        "10",
+        "--iterations",
+        "1",
+    ]);
+    assert!(ok);
+    assert!(out.contains("DEAD"));
+
+    // Also run top with 2 iterations and active publishing to exercise rate calculation
+    let p_rate = p_ring.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut i = 200u64;
+        while !stop_clone.load(Ordering::Relaxed) {
+            prod.push(&i);
+            i += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let (ok, _out, _) = run_cli(&[
+        "top",
+        p_rate.to_str().unwrap(),
+        "--interval-ms",
+        "50",
+        "--iterations",
+        "2",
+    ]);
+    assert!(ok);
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    let _ = std::fs::remove_file(&p_ring);
+}
+
+#[test]
+fn test_cli_clean_single_file_and_readers() {
+    let p = temp_file("clean_single");
+    {
+        let mut prod = RingProducerBuilder::new(8)
+            .max_readers(2)
+            .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+            .build::<u64, _>(&p)
+            .unwrap();
+        prod.push(&1);
+    }
+
+    // Set an active reader with current process ID
+    let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
+    let base_ptr = unsafe {
+        mmap.as_mut_ptr()
+            .add(header.reader_registry_offset as usize) as *mut ReaderSlot
+    };
+    unsafe {
+        let slot = &mut *base_ptr.add(0);
+        slot.active.store(1, Ordering::SeqCst);
+        slot.pid.store(std::process::id(), Ordering::SeqCst);
+    }
+    drop(mmap);
+    drop(file);
+
+    // Try dry-run on single file with active reader
+    let (ok, out, _) = run_cli(&["clean", p.to_str().unwrap(), "--dry-run"]);
+    assert!(ok);
+    assert!(out.contains("Found 0 orphaned file(s)"));
+    assert!(p.exists());
+
+    // Try real clean on single file with active reader -> skipped
+    let (ok, out, _) = run_cli(&["clean", p.to_str().unwrap()]);
+    assert!(ok);
+    assert!(out.contains("Cleaned 0 orphaned file(s)"));
+    assert!(p.exists());
+
+    // Change reader PID to a dead PID
+    let file = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
+    let base_ptr = unsafe {
+        mmap.as_mut_ptr()
+            .add(header.reader_registry_offset as usize) as *mut ReaderSlot
+    };
+    unsafe {
+        let slot = &mut *base_ptr.add(0);
+        slot.pid.store(99999999, Ordering::SeqCst);
+    }
+    drop(mmap);
+    drop(file);
+
+    // Single file dry run with dead reader
+    let (ok, out, _) = run_cli(&["clean", p.to_str().unwrap(), "--dry-run"]);
+    assert!(ok);
+    assert!(out.contains("[DRY RUN] Orphaned shared memory file:"));
+    assert!(p.exists());
+
+    // Single file real clean
+    let (ok, out, _) = run_cli(&["clean", p.to_str().unwrap()]);
+    assert!(ok);
+    assert!(out.contains("Cleaned orphaned shared memory file:"));
+    assert!(!p.exists());
+
+    // Test clean with extra positional arg -> line 211
+    let (ok, _, _) = run_cli(&["clean", "/dev/shm", "extra_arg"]);
+    assert!(ok);
+
+    // Clean directory containing non-ring file and unreadable file -> lines 951 & 966
+    let clean_dir = std::env::temp_dir().join(format!("rf_clean_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&clean_dir);
+    let bad_magic_f = clean_dir.join("bad_magic.shm");
+    std::fs::write(&bad_magic_f, [0xEEu8; 256]).unwrap();
+    let ro_f = clean_dir.join("ro_file.shm");
+    std::fs::write(&ro_f, [0xEEu8; 256]).unwrap();
+    let mut perms = std::fs::metadata(&ro_f).unwrap().permissions();
+    perms.set_readonly(true);
+    let _ = std::fs::set_permissions(&ro_f, perms);
+    let (ok, _, _) = run_cli(&["clean", clean_dir.to_str().unwrap()]);
+    assert!(ok);
+    let mut restore_f = std::fs::metadata(&ro_f).unwrap().permissions();
+    restore_f.set_mode(0o644);
+    let _ = std::fs::set_permissions(&ro_f, restore_f);
+    let _ = std::fs::remove_dir_all(&clean_dir);
+
+    // Clean directory that is read-only -> line 1016
+    let ro_dir = std::env::temp_dir().join(format!("rf_clean_ro_dir_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&ro_dir);
+    let orphan_f = ro_dir.join("orphan.shm");
+    let prod = RingProducerBuilder::new(64)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&orphan_f)
+        .unwrap();
+    drop(prod);
+    let mut dir_perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+    dir_perms.set_mode(0o555);
+    let _ = std::fs::set_permissions(&ro_dir, dir_perms);
+    let (ok, _, _) = run_cli(&["clean", ro_dir.to_str().unwrap()]);
+    assert!(ok);
+    let mut restore_perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+    restore_perms.set_mode(0o777);
+    let _ = std::fs::set_permissions(&ro_dir, restore_perms);
+    let _ = std::fs::remove_dir_all(&ro_dir);
+
+    // Clean directory that cannot be read (read_dir fails) -> lines 923, 924
+    let unreadable_dir =
+        std::env::temp_dir().join(format!("rf_clean_unreadable_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&unreadable_dir);
+    let mut unread_perms = std::fs::metadata(&unreadable_dir).unwrap().permissions();
+    unread_perms.set_mode(0o000);
+    let _ = std::fs::set_permissions(&unreadable_dir, unread_perms);
+    let (ok, _, _) = run_cli(&["clean", unreadable_dir.to_str().unwrap()]);
+    assert!(ok);
+    let mut restore_unread = std::fs::metadata(&unreadable_dir).unwrap().permissions();
+    restore_unread.set_mode(0o777);
+    let _ = std::fs::set_permissions(&unreadable_dir, restore_unread);
+    let _ = std::fs::remove_dir_all(&unreadable_dir);
+
+    // Clean ring with corrupt registry bounds (end > mmap.len()) -> lines 978, 979
+    let corrupt_reg_p = temp_file("clean_corrupt_reg");
+    let prod_cr = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&corrupt_reg_p)
+        .unwrap();
+    drop(prod_cr);
+    let f_cr = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&corrupt_reg_p)
+        .unwrap();
+    let mut m_cr = unsafe { MmapMut::map_mut(&f_cr).unwrap() };
+    let hdr_cr = unsafe { &mut *(m_cr.as_mut_ptr() as *mut RingHeader) };
+    hdr_cr.reader_registry_offset = 128;
+    hdr_cr.reader_registry_count = 1_000_000;
+    drop(m_cr);
+    drop(f_cr);
+    let (ok, _, _) = run_cli(&["clean", corrupt_reg_p.to_str().unwrap()]);
+    assert!(ok);
+    let _ = std::fs::remove_file(&corrupt_reg_p);
+}
+
+#[test]
+fn test_cli_mirror_resume_mode_and_clean_exit() {
+    let src = temp_file("mirror_res_src");
+    let dst = temp_file("mirror_res_dst");
+    let mut prod = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&src)
+        .unwrap();
+    prod.push(&100);
+
+    // Pre-create the mirror ring with identical layout so mirror.resumed() is true!
+    let dst_prod = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&dst)
+        .unwrap();
+    drop(dst_prod);
+
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+
+    let mut mirror = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "mirror",
+                &parse_serve_addr(&line),
+                dst.to_str().unwrap(),
+                "--from",
+                "resume",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let m_watcher = LineWatcher::spawn(mirror.stderr());
+    let m_line = m_watcher
+        .wait_for(Duration::from_secs(5), |line| line.contains("resumed"))
+        .expect("mirror announced resumed mode");
+    assert!(m_line.contains("resumed"));
+
+    server.signal(libc::SIGTERM);
+    let _ = server.wait_bounded(Duration::from_secs(5));
+    assert!(mirror.wait_bounded(Duration::from_secs(5)).success());
+    let _ = std::fs::remove_file(src);
+    let _ = std::fs::remove_file(dst);
+
+    // Test mirror --once to non-existent server (hits connect fail branch in once mode)
+    let (ok, _, err) = run_cli(&[
+        "mirror",
+        "127.0.0.1:1",
+        "/tmp/rf_nonexistent_mirror.shm",
+        "--once",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("Error:"));
+}
+
+#[test]
+fn test_cli_serve_and_mirror_once_complete_coverage() {
+    let src = temp_file("sm_once_src");
+    let dst = temp_file("sm_once_dst");
+    let mut prod = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&src)
+        .unwrap();
+    prod.push(&100);
+
+    // Verify serve --once error when --udp or --multicast is supplied
+    let (ok, _, err) = run_cli(&[
+        "serve",
+        src.to_str().unwrap(),
+        "--bind",
+        "127.0.0.1:0",
+        "--once",
+        "--udp",
+        "54321",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("serve --once supports TCP only"));
+
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+
+    let mut mirror = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "mirror",
+                &parse_serve_addr(&line),
+                dst.to_str().unwrap(),
+                "--from",
+                "oldest",
+                "--spin",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if RingConsumer::<u64>::attach(&dst).is_ok_and(|mut cons| cons.try_recv().is_some()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timeout waiting for mirror");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    server.signal(libc::SIGTERM);
+    let mirror_status = mirror.wait_bounded(Duration::from_secs(5));
+    assert!(mirror_status.success());
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[test]
+fn test_cli_serve_once_client_disconnect_clean_exit() {
+    let _deadline = deadline::Deadline::new();
+    let src = temp_file("serve_once_eof");
+    let _prod = RingProducer::<u64>::create(&src, 16).unwrap();
+
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                src.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--once",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+
+    let addr = parse_serve_addr(&line);
+    // Connect and immediately close stream without sending HELLO
+    {
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        drop(stream);
+    }
+
+    // Server should handle UnexpectedEof/ConnectionReset, return Ok(()), and exit 0
+    let status = server.wait_bounded(Duration::from_secs(5));
+    assert!(status.success());
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn test_cli_stat_arena_and_registry_edge_cases() {
+    // Arena capacity 0 -> stat prints util = 0.0
+    let p_zero = temp_file("stat_zero_arena");
+    let _prod = BlobProducer::<u32>::create(&p_zero, 8, 1024).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p_zero)
+        .unwrap();
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ringfire::header::RingHeader) };
+    let arena_ptr = unsafe { mmap.as_mut_ptr().add(header.arena_offset as usize) as *mut u64 };
+    unsafe {
+        *arena_ptr = 0; // arena_cap = 0
+    }
+    drop(mmap);
+    drop(file);
+    let (ok, out, _) = run_cli(&["stat", p_zero.to_str().unwrap()]);
+    assert!(ok);
+    assert!(out.contains("0.0%"));
+    let _ = std::fs::remove_file(&p_zero);
+}
+
+#[test]
+fn test_cli_additional_prune_clean_serve_mirror_coverage() {
+    let _deadline = deadline::Deadline::new();
+
+    // 1. clean default (/dev/shm) and clean on directory with files
+    let (ok_clean_def, _, _) = run_cli(&["clean", "--dry-run"]);
+    assert!(ok_clean_def);
+
+    let d_clean = temp_file("clean_dir_test");
+    std::fs::create_dir_all(&d_clean).unwrap();
+    let f1 = d_clean.join("test_file_1");
+    std::fs::write(&f1, b"arbitrary non-shm contents").unwrap();
+    let (ok_clean_dir, _, _) = run_cli(&["clean", d_clean.to_str().unwrap(), "--dry-run"]);
+    assert!(ok_clean_dir);
+    let _ = std::fs::remove_dir_all(&d_clean);
+
+    // 2. prune with an alive reader in reader registry (lines 974-985)
+    let p_prune = temp_file("prune_alive_slot");
+    let mut prod_prune = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .max_readers(2)
+        .build::<u64, _>(&p_prune)
+        .unwrap();
+    prod_prune.push(&100u64);
+    // Attach consumer so it registers current pid
+    let mut cons_prune = RingConsumer::<u64>::builder()
+        .consumer_name("prune_alive")
+        .attach(&p_prune)
+        .unwrap();
+    let _ = cons_prune.try_recv();
+
+    // Drop producer so file is not locked by producer, but reader is still alive!
+    drop(prod_prune);
+
+    let (ok_clean_alive, out_clean_alive, _) =
+        run_cli(&["clean", p_prune.to_str().unwrap(), "--dry-run"]);
+    assert!(ok_clean_alive);
+    assert!(out_clean_alive.contains("Summary: Found 0 orphaned file(s)"));
+
+    let (ok_prune_alive, out_prune_alive, _) = run_cli(&["prune", p_prune.to_str().unwrap()]);
+    assert!(ok_prune_alive);
+    assert!(out_prune_alive.contains("Successfully pruned 0 dead reader slot(s)."));
+    drop(cons_prune);
+    let _ = std::fs::remove_file(&p_prune);
+
+    // 3. serve with --udp, --dup 2, --spin (lines 1039, 1050, 1060-1063, 1079)
+    let p_serve = temp_file("serve_cov_ring");
+    let mut prod_serve = RingProducerBuilder::new(16)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&p_serve)
+        .unwrap();
+    prod_serve.push(&42u64);
+
+    let udp_port = ephemeral_udp_port();
+    let mut server = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "serve",
+                p_serve.to_str().unwrap(),
+                "--bind",
+                "127.0.0.1:0",
+                "--udp",
+                &udp_port.to_string(),
+                "--dup",
+                "2",
+                "--spin",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+
+    let watcher = LineWatcher::spawn(server.stderr());
+    let line = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.starts_with("ringfire serve:")
+        })
+        .expect("server readiness announcement");
+    assert!(line.contains("busy-poll"));
+
+    let line2 = watcher
+        .wait_for(Duration::from_secs(5), |line| {
+            line.contains("unicast from udp port")
+        })
+        .expect("unicast announcement");
+    assert!(line2.contains("2 copies per datagram"));
+
+    server.signal(libc::SIGTERM);
+    let _ = server.wait_bounded(Duration::from_secs(5));
+    let _ = std::fs::remove_file(&p_serve);
+
+    // 4. mirror connect failure with reconnect (lines 1150, 1154, 1155)
+    let dst_mirror = temp_file("mirror_reconnect_test");
+    let mut mirror = ChildGuard::spawn(
+        Command::new(bin_path())
+            .args([
+                "mirror",
+                "127.0.0.1:1", // guaranteed connection refused
+                dst_mirror.to_str().unwrap(),
+                "--reconnect",
+                "10",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    std::thread::sleep(Duration::from_millis(60));
+    mirror.signal(libc::SIGTERM);
+    let _ = mirror.wait_bounded(Duration::from_secs(5));
+    let _ = std::fs::remove_file(&dst_mirror);
+
+    // 5. clean corrupt reader registry bounds (line 979)
+    let p_corrupt_reg = temp_file("clean_corrupt_reg");
+    let _prod_cr = RingProducer::<u64>::create(&p_corrupt_reg, 64).unwrap();
+    let file_cr = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p_corrupt_reg)
+        .unwrap();
+    let mut mmap_cr = unsafe { MmapMut::map_mut(&file_cr).unwrap() };
+    let hdr_cr = unsafe { &mut *(mmap_cr.as_mut_ptr() as *mut RingHeader) };
+    hdr_cr.reader_registry_offset = 128;
+    hdr_cr.reader_registry_count = 100_000;
+    drop(mmap_cr);
+    drop(file_cr);
+    let (ok_cr, _, _) = run_cli(&["clean", p_corrupt_reg.to_str().unwrap(), "--dry-run"]);
+    assert!(ok_cr);
+    let _ = std::fs::remove_file(&p_corrupt_reg);
+
+    // 6. mirror connect failure with --once (lines 1147-1148)
+    let (ok_m_fail, _, _) = run_cli(&["mirror", "127.0.0.1:1", "/dev/null", "--once"]);
+    assert!(!ok_m_fail);
 }

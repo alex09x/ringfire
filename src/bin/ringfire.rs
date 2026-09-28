@@ -8,9 +8,11 @@
 //! - `top <path> [--interval-ms <ms>]`: Live terminal dashboard showing throughput and consumer lag.
 //! - `dump <path> [--tail <n>] [--hex]`: Inspect recent slots and payloads.
 //! - `prune <path>`: Clean up dead reader slots whose processes have terminated.
+//! - `clean [path] [--dry-run]`: Audit and clean abandoned/orphaned ringfire shared memory files.
 
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -68,6 +70,7 @@ SUBCOMMANDS:
     top  <PATH> [--interval-ms <N>] Live terminal monitor with throughput and consumer lag
     dump <PATH> [--tail <N>]        Dump recent slots and payload data
     prune <PATH>                    Reclaim inactive/dead reader slots
+    clean [PATH] [--dry-run]        Audit and remove abandoned/orphaned shared memory files
     serve <PATH> --bind <ADDR>      Stream the ring to network mirrors
     mirror <SOURCE> <PATH>          Keep a byte-identical copy of a remote ring at PATH
 
@@ -193,6 +196,23 @@ fn main() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+        }
+        "clean" => {
+            let mut target = None;
+            let mut dry_run = false;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--dry-run" {
+                    dry_run = true;
+                    i += 1;
+                } else if target.is_none() && !args[i].starts_with('-') {
+                    target = Some(args[i].as_str());
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_clean(target, dry_run);
         }
         "serve" => {
             if args.len() < 3 {
@@ -382,12 +402,6 @@ fn read_readers(mmap: &Mmap, header: &RingHeader, write_seq: u64) -> Vec<ReaderS
 
     let reg_offset = header.reader_registry_offset as usize;
     let reg_count = header.reader_registry_count as usize;
-    let slot_size = std::mem::size_of::<ReaderSlot>();
-
-    if mmap.len() < reg_offset + reg_count * slot_size {
-        return readers;
-    }
-
     let base_ptr = unsafe { mmap.as_ptr().add(reg_offset) as *const ReaderSlot };
 
     for i in 0..reg_count {
@@ -399,11 +413,7 @@ fn read_readers(mmap: &Mmap, header: &RingHeader, write_seq: u64) -> Vec<ReaderS
             let cursor = slot.cursor_seq.load(Ordering::Acquire);
             let name_len = slot.name.iter().position(|&b| b == 0).unwrap_or(32);
             let name = String::from_utf8_lossy(&slot.name[..name_len]).into_owned();
-            let alive = if pid != 0 {
-                is_process_alive(pid)
-            } else {
-                false
-            };
+            let alive = is_process_alive(pid);
             // cursor = next sequence to read, so everything from it to write_seq is unread
             let lag = write_seq.saturating_sub(cursor.saturating_sub(1));
 
@@ -473,16 +483,12 @@ fn cmd_stat(path_str: &str, json: bool) -> Result<(), Box<dyn std::error::Error>
     // Arena stats
     let (arena_cap, arena_reserved) = if has_arena && header.arena_offset > 0 {
         let arena_off = header.arena_offset as usize;
-        if mmap.len() >= arena_off + 24 {
-            let cap = unsafe { *(mmap.as_ptr().add(arena_off) as *const u64) };
-            let res = unsafe {
-                (*(mmap.as_ptr().add(arena_off + 16) as *const std::sync::atomic::AtomicU64))
-                    .load(Ordering::Relaxed)
-            };
-            (cap, res)
-        } else {
-            (0, 0)
-        }
+        let cap = unsafe { *(mmap.as_ptr().add(arena_off) as *const u64) };
+        let res = unsafe {
+            (*(mmap.as_ptr().add(arena_off + 16) as *const std::sync::atomic::AtomicU64))
+                .load(Ordering::Relaxed)
+        };
+        (cap, res)
     } else {
         (0, 0)
     };
@@ -900,6 +906,127 @@ fn cmd_prune(path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Successfully pruned {} dead reader slot(s).", pruned);
     Ok(())
+}
+
+fn cmd_clean(target_str: Option<&str>, dry_run: bool) {
+    let target = target_str.unwrap_or("/dev/shm");
+    let target_path = Path::new(target);
+
+    let entries: Vec<PathBuf> = if target_path.is_dir() {
+        let mut list = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(target_path) {
+            for entry in dir.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    list.push(p);
+                }
+            }
+        }
+        list
+    } else if target_path.is_file() {
+        vec![target_path.to_path_buf()]
+    } else {
+        println!("Target '{}' does not exist or is not accessible.", target);
+        return;
+    };
+
+    let mut orphaned_count = 0;
+    let mut freed_bytes = 0u64;
+
+    for file_path in entries {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&file_path) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if meta.len() < 128 {
+            continue;
+        }
+
+        let mmap = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let magic = unsafe { *(mmap.as_ptr() as *const u64) };
+        if magic != RINGFIRE_MAGIC && magic != BLACKBOARD_MAGIC {
+            continue;
+        }
+
+        let fd = file.as_raw_fd();
+        let lock_rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_rc != 0 {
+            continue;
+        }
+
+        let mut has_alive_readers = false;
+        if magic == RINGFIRE_MAGIC {
+            let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
+            if header.reader_registry_offset != 0 && header.reader_registry_count != 0 {
+                let reg_offset = header.reader_registry_offset as usize;
+                let reg_count = header.reader_registry_count as usize;
+                let end = reg_offset
+                    .saturating_add(reg_count.saturating_mul(std::mem::size_of::<ReaderSlot>()));
+                if end <= mmap.len() {
+                    let base_ptr = unsafe { mmap.as_ptr().add(reg_offset) as *const ReaderSlot };
+                    for i in 0..reg_count {
+                        let slot = unsafe { &*base_ptr.add(i) };
+                        let pid = slot.pid.load(Ordering::Acquire);
+                        if pid != 0 && is_process_alive(pid) {
+                            has_alive_readers = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_alive_readers {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            continue;
+        }
+
+        orphaned_count += 1;
+        freed_bytes += meta.len();
+        let display = file_path.display().to_string();
+
+        if dry_run {
+            println!(
+                "[DRY RUN] Orphaned shared memory file: {} ({} bytes)",
+                display,
+                meta.len()
+            );
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        } else {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            drop(mmap);
+            drop(file);
+            match std::fs::remove_file(&file_path) {
+                Ok(_) => {
+                    println!(
+                        "Cleaned orphaned shared memory file: {} ({} bytes freed)",
+                        display,
+                        meta.len()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Failed to remove {}: {}", display, e);
+                }
+            }
+        }
+    }
+
+    if dry_run {
+        println!(
+            "Summary: Found {} orphaned file(s) ({} bytes would be freed).",
+            orphaned_count, freed_bytes
+        );
+    } else {
+        println!(
+            "Summary: Cleaned {} orphaned file(s) ({} bytes freed).",
+            orphaned_count, freed_bytes
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

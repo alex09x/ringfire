@@ -1,4 +1,5 @@
 use ringfire::{CleanupMode, RingConsumer, RingProducer, RingProducerBuilder};
+use std::sync::atomic::Ordering;
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +34,12 @@ fn test_spmc_broadcast_to_multiple_consumers() {
             let mut last_id = 0;
             while received < msg_count {
                 if let Some(msg) = consumer.try_recv() {
-                    assert_eq!(msg.id, last_id + 1, "Consumer {} sequence discontinuity", cid);
+                    assert_eq!(
+                        msg.id,
+                        last_id + 1,
+                        "Consumer {} sequence discontinuity",
+                        cid
+                    );
                     assert_eq!(msg.price, (last_id + 1) * 100);
                     last_id = msg.id;
                     received += 1;
@@ -148,7 +154,8 @@ fn test_consumer_start_mode_latest_and_head() {
 
 #[test]
 fn test_consumer_start_mode_oldest() {
-    let tmp_path = std::env::temp_dir().join(format!("test_spmc_oldest_{}.shm", std::process::id()));
+    let tmp_path =
+        std::env::temp_dir().join(format!("test_spmc_oldest_{}.shm", std::process::id()));
     let _ = std::fs::remove_file(&tmp_path);
 
     let mut producer = RingProducer::<u64>::create(&tmp_path, 1024).unwrap();
@@ -170,7 +177,10 @@ fn test_consumer_start_mode_oldest() {
 fn test_shm_offset_checkpoint_crash_and_resume() {
     let dir = std::env::temp_dir();
     let ring_path = dir.join(format!("test_spmc_resume_ring_{}.shm", std::process::id()));
-    let offset_path = dir.join(format!("test_spmc_resume_offset_{}.offset", std::process::id()));
+    let offset_path = dir.join(format!(
+        "test_spmc_resume_offset_{}.offset",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 
@@ -205,7 +215,12 @@ fn test_shm_offset_checkpoint_crash_and_resume() {
             .unwrap();
 
         for i in 26..=50 {
-            assert_eq!(cons2.try_recv(), Some(i), "Discontinuity during resume at {}", i);
+            assert_eq!(
+                cons2.try_recv(),
+                Some(i),
+                "Discontinuity during resume at {}",
+                i
+            );
         }
         assert_eq!(cons2.try_recv(), None);
         assert_eq!(cons2.last_processed_sequence(), 50);
@@ -220,7 +235,10 @@ fn test_shm_offset_checkpoint_crash_and_resume() {
 fn test_shm_offset_lapping_recovery() {
     let dir = std::env::temp_dir();
     let ring_path = dir.join(format!("test_spmc_lap_rec_ring_{}.shm", std::process::id()));
-    let offset_path = dir.join(format!("test_spmc_lap_rec_offset_{}.offset", std::process::id()));
+    let offset_path = dir.join(format!(
+        "test_spmc_lap_rec_offset_{}.offset",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&ring_path);
     let _ = std::fs::remove_file(&offset_path);
 
@@ -353,4 +371,159 @@ fn test_flow_control_lossless_backpressure() {
     assert_eq!(producer.headroom(), capacity);
 
     let _ = std::fs::remove_file(&ring_path);
+}
+
+#[test]
+fn test_spmc_cleanup_mode_and_registry_lapping_update() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("test_spmc_cleanup_reg_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut producer = RingProducerBuilder::new(8)
+        .max_readers(2)
+        .build::<u64, _>(&path)
+        .unwrap();
+    producer.set_cleanup_mode(ringfire::spmc::CleanupMode::Persistent);
+
+    let mut consumer = RingConsumer::<u64>::builder()
+        .consumer_name("reader_x")
+        .start_from_oldest()
+        .attach(&path)
+        .unwrap();
+
+    producer.push(&1);
+    assert_eq!(consumer.try_recv(), Some(1));
+
+    // Overwrite the ring so the reader gets lapped while registered
+    for i in 2..=20 {
+        producer.push(&i);
+    }
+
+    // Consumer reads, encounters lapped messages, calls reg.update_cursor
+    let item = consumer.try_recv();
+    assert!(item.is_some());
+    assert!(consumer.lapped_count() > 0);
+
+    // Multi-producer consumer lapping (covers line 860)
+    let mpmc_path = dir.join(format!("test_mpmc_spmc_lap_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&mpmc_path);
+    let m_prod = ringfire::mpmc::MpmcProducer::<u64>::create(&mpmc_path, 8).unwrap();
+    for i in 1..=5 {
+        m_prod.push(&i);
+    }
+    let mut m_cons = RingConsumer::<u64>::attach(&mpmc_path).unwrap();
+    // Advance m_prod by 20 messages
+    for i in 6..=25 {
+        m_prod.push(&i);
+    }
+    // Now m_cons try_recv will see write_seq >= cursor + capacity and call skip_overwritten
+    let _ = m_cons.try_recv();
+    assert!(m_cons.lapped_count() > 0);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&mpmc_path);
+}
+
+#[test]
+fn test_spmc_sparse_skip_hole_with_registry() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("test_spmc_sparse_hole_{}.shm", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut prod = RingProducerBuilder::new(8)
+        .max_readers(2)
+        .cleanup_mode(ringfire::spmc::CleanupMode::Persistent)
+        .build::<u64, _>(&path)
+        .unwrap();
+
+    // Mark the ring buffer as SPARSE in its header
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ringfire::header::RingHeader) };
+    header.flags |= ringfire::header::FLAG_SPARSE;
+    drop(mmap);
+    drop(file);
+
+    prod.push(&1);
+
+    let mut cons = RingConsumer::<u64>::builder()
+        .consumer_name("sparse_r")
+        .attach(&path)
+        .unwrap();
+
+    assert_eq!(cons.try_recv(), Some(1));
+
+    // Now write_seq is 1, consumer cursor is 2.
+    // Simulate a hole: advance write_seq to 5, leaving slot 2 seq at 0.
+    // Write item 5 into slot 5 with seq 5!
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ringfire::header::RingHeader) };
+    header.write_seq.store(5, Ordering::SeqCst);
+    let slots_offset = header.slots_offset as usize;
+    let slot_size = std::mem::size_of::<ringfire::header::Slot<u64>>();
+    let slot5_ptr = unsafe {
+        mmap.as_mut_ptr().add(slots_offset + 5 * slot_size) as *mut ringfire::header::Slot<u64>
+    };
+    unsafe {
+        (*slot5_ptr).data = 555;
+        (*slot5_ptr).seq.store(5, Ordering::SeqCst);
+    }
+
+    // First test line 809: when seen == SLOT_WRITING, skip_hole returns 0.
+    // Set slot 2 (cursor 2) seq to SLOT_WRITING
+    let slot2_ptr = unsafe {
+        mmap.as_mut_ptr().add(slots_offset + 2 * slot_size) as *mut ringfire::header::Slot<u64>
+    };
+    unsafe {
+        (*slot2_ptr)
+            .seq
+            .store(ringfire::header::SLOT_WRITING, Ordering::SeqCst);
+    }
+    drop(mmap);
+    drop(file);
+
+    // Call try_recv 64 times so empty_polls & 63 == 0 triggers skip_hole
+    for _ in 0..64 {
+        let _ = cons.try_recv();
+    }
+
+    // Now set slot 2 seq to 0 (a real hole!)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ringfire::header::RingHeader) };
+    let slots_offset = header.slots_offset as usize;
+    let slot2_ptr = unsafe {
+        mmap.as_mut_ptr().add(slots_offset + 2 * slot_size) as *mut ringfire::header::Slot<u64>
+    };
+    unsafe {
+        (*slot2_ptr).seq.store(0, Ordering::SeqCst);
+    }
+    drop(mmap);
+    drop(file);
+
+    // Call try_recv 64 times so skip_hole finds next published sequence (5),
+    // updates cursor, calls reg.update_cursor(self.cursor) (line 823), and returns 555!
+    let mut got = None;
+    for _ in 0..64 {
+        if let Some(v) = cons.try_recv() {
+            got = Some(v);
+            break;
+        }
+    }
+    assert_eq!(got, Some(555));
+
+    let _ = std::fs::remove_file(&path);
 }

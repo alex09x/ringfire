@@ -234,7 +234,9 @@ pub struct MpmcQueueConsumer<T: Copy + 'static> {
 
 unsafe impl<T: Copy + Send + 'static> Send for MpmcQueueConsumer<T> {}
 
-enum Ticket<T> {
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ticket<T> {
     Ready(T),
     NotYet,
     Lost,
@@ -277,7 +279,8 @@ impl<T: Copy + 'static> MpmcQueueConsumer<T> {
     }
 
     #[inline]
-    fn read_ticket(&self, ticket: u64) -> Ticket<T> {
+    #[doc(hidden)]
+    pub fn read_ticket(&self, ticket: u64) -> Ticket<T> {
         unsafe {
             let slot = self.slots.add((ticket & self.mask) as usize);
             let s1 = (*slot).seq.load(Ordering::Acquire);

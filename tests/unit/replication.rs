@@ -909,3 +909,298 @@ fn test_serve_range_paths() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn test_frame_sizes_ok_and_large_payload_protection() {
+    let _deadline = deadline::Deadline::new();
+    let p = temp("sizes_ring");
+    let geom = Geometry {
+        capacity: 64,
+        element_size: 16,
+        flags: 0,
+        schema_sig: 42,
+        registry_count: 0,
+        slots_offset: 128,
+        arena_offset: 0,
+        arena_size: 0,
+    };
+    let ring = MirrorRing::create(&p, &geom, 0o660).unwrap();
+
+    let stream = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop(server);
+        client
+    };
+
+    let mut mirror = Mirror {
+        stream,
+        udp: None,
+        punch: None,
+        session: 0,
+        ring: Some(ring),
+        ring_path: p.clone(),
+        geometry: geom,
+        spin: false,
+        file_mode: 0o660,
+        nak_timeout: Duration::from_millis(50),
+        first_seq: 1,
+        resumed: false,
+        source_seq: 0,
+        frames: 0,
+        gaps: 0,
+        datagrams: 0,
+        naks: 0,
+        retransmitted: 0,
+        nak: None,
+        last_nak: None,
+        pending: BTreeMap::new(),
+        buf: Vec::new(),
+        dgram: vec![0u8; MAX_DATAGRAM],
+    };
+
+    // Non-arena ring:
+    // payload_len = 8
+    // count = 0 -> false
+    assert!(!mirror.frame_sizes_ok(0, 0));
+    // count = 1, len = 8 -> true
+    assert!(mirror.frame_sizes_ok(1, 8));
+    // count = 1, len = 16 -> false (must equal count * payload_len)
+    assert!(!mirror.frame_sizes_ok(1, 16));
+
+    // Arena ring:
+    mirror.geometry.flags |= FLAG_WITH_ARENA;
+    mirror.geometry.arena_offset = 128 + 64 * 16;
+    mirror.geometry.arena_size = 1024;
+    // count = 1, descriptors = 8
+    // len < descriptors (7) -> false
+    assert!(!mirror.frame_sizes_ok(1, 7));
+    // len = 8 (empty blob) -> true
+    assert!(mirror.frame_sizes_ok(1, 8));
+    // len = 8 + 500 -> true
+    assert!(mirror.frame_sizes_ok(1, 508));
+    // len = 8 + 1024 (max allowed) -> true
+    assert!(mirror.frame_sizes_ok(1, 1032));
+    // len > max_allowed (1033) -> false (prevents OOM!)
+    assert!(!mirror.frame_sizes_ok(1, 1033));
+    // Excessive 2GB frame -> false
+    assert!(!mirror.frame_sizes_ok(1, 2_000_000_000));
+
+    // Also test read_data_payload rejecting excessive frame
+    let frame = Frame {
+        kind: KIND_DATA,
+        flags: 0,
+        count: 1,
+        len: 2_000_000_000,
+        seq: 1,
+    };
+    let err = mirror.read_data_payload(frame).unwrap_err();
+    assert!(matches!(err, RingfireError::Protocol(_)));
+
+    drop(mirror);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn test_replication_internal_coverage() {
+    let _deadline = deadline::Deadline::new();
+    use std::io::Read;
+
+    // 1. multicast_receiver with port 0
+    let grp: Ipv4Addr = "239.255.42.1".parse().unwrap();
+    let iface: Ipv4Addr = "127.0.0.1".parse().unwrap();
+    let mc_sock = multicast_receiver(grp, 0, iface, 65536);
+    assert!(mc_sock.is_ok());
+
+    // 2. write_full on empty buffer
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).unwrap();
+    let (mut server_stream, _) = listener.accept().unwrap();
+    assert!(write_full(&mut client, &[]).is_ok());
+
+    // 3. SourceRing collect with lost payload & serve_range with lost
+    let p_lost = temp("lost_blob_ring");
+    let mut prod_lost = BlobProducer::<u32>::create(&p_lost, 16, 1024).unwrap();
+    prod_lost.push(&10, &[1, 2, 3]).unwrap();
+    let s_ring = SourceRing::open(&p_lost).unwrap();
+    let mut out_rec = Vec::new();
+    assert_eq!(s_ring.read_record(1, &mut out_rec), RawRead::Item);
+
+    // Corrupt the arena reserved counter so r is deemed lapped
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p_lost)
+        .unwrap();
+    let mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &*(mmap.as_ptr() as *const RingHeader) };
+    let arena_hdr =
+        unsafe { &*(mmap.as_ptr().add(header.arena_offset as usize) as *const ArenaHeader) };
+    arena_hdr.reserved.store(100_000, Ordering::SeqCst);
+
+    assert_eq!(s_ring.read_record(1, &mut out_rec), RawRead::Lost);
+    let mut wire = Vec::new();
+    let coll = s_ring.collect(1, 10, 1024, &mut wire);
+    assert!(coll.lost);
+
+    // serve_range with lost payload (lines 1752-1756)
+    let srv_handle = std::thread::spawn(move || {
+        let mut wire_buf = Vec::new();
+        let _ = serve_range(&s_ring, &mut server_stream, 1, 2, 10, &mut wire_buf);
+    });
+
+    let mut gap_hdr = [0u8; FRAME_HEADER_LEN];
+    client.read_exact(&mut gap_hdr).unwrap();
+    let gap_frame = Frame::decode(&gap_hdr);
+    assert_eq!(gap_frame.kind, KIND_GAP);
+    srv_handle.join().unwrap();
+    drop(mmap);
+    drop(file);
+    let _ = std::fs::remove_file(&p_lost);
+
+    // 4. SourceRing lapped in serve_range (lines 1744-1750)
+    let p_lap = temp("lapped_serve_ring");
+    let mut prod_lap = RingProducer::<u64>::create(&p_lap, 16).unwrap();
+    for i in 1..=40 {
+        prod_lap.push(&i);
+    }
+    let s_ring_lap = SourceRing::open(&p_lap).unwrap();
+    let listener_lap = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_lap = listener_lap.local_addr().unwrap();
+    let mut client_lap = TcpStream::connect(addr_lap).unwrap();
+    let (mut server_lap, _) = listener_lap.accept().unwrap();
+
+    let srv_lap_handle = std::thread::spawn(move || {
+        let mut wire_buf = Vec::new();
+        let _ = serve_range(&s_ring_lap, &mut server_lap, 1, 40, 10, &mut wire_buf);
+    });
+
+    let mut gap_hdr2 = [0u8; FRAME_HEADER_LEN];
+    client_lap.read_exact(&mut gap_hdr2).unwrap();
+    let gap_frame2 = Frame::decode(&gap_hdr2);
+    assert_eq!(gap_frame2.kind, KIND_GAP);
+    assert_eq!(gap_frame2.seq, 25); // oldest retained
+    srv_lap_handle.join().unwrap();
+    let _ = std::fs::remove_file(&p_lap);
+
+    // 5. Mirror handle_control and handle_datagram edge cases
+    let p_mirror = temp("unit_mirror_test");
+    let geom = Geometry {
+        capacity: 64,
+        element_size: 16,
+        flags: FLAG_MODE_SPMC | FLAG_POLICY_LATEST_WINS,
+        schema_sig: 0x1234,
+        registry_count: 0,
+        slots_offset: 128,
+        arena_offset: 0,
+        arena_size: 0,
+    };
+    let ring = MirrorRing::create(&p_mirror, &geom, 0o660).unwrap();
+    let listener_m = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_m = listener_m.local_addr().unwrap();
+    let stream_m = TcpStream::connect(addr_m).unwrap();
+
+    let mut mirror = Mirror {
+        stream: stream_m,
+        udp: None,
+        punch: None,
+        ring: Some(ring),
+        ring_path: p_mirror.clone(),
+        geometry: geom,
+        session: 7,
+        spin: false,
+        file_mode: 0o660,
+        nak_timeout: Duration::from_millis(50),
+        first_seq: 1,
+        resumed: false,
+        source_seq: 0,
+        frames: 0,
+        gaps: 0,
+        datagrams: 0,
+        naks: 0,
+        retransmitted: 0,
+        nak: None,
+        last_nak: None,
+        pending: std::collections::BTreeMap::new(),
+        buf: Vec::new(),
+        dgram: vec![0u8; MAX_DATAGRAM],
+    };
+
+    // handle_control: KIND_MULTICAST -> Ok(()) (line 2420)
+    let f_mc = Frame {
+        kind: KIND_MULTICAST,
+        flags: 0,
+        count: 0,
+        len: 0,
+        seq: 0,
+    };
+    assert!(mirror.handle_control(f_mc).is_ok());
+
+    // handle_control: KIND_GAP with seq <= next_seq -> Ok(()) (line 2416)
+    let f_gap = Frame {
+        kind: KIND_GAP,
+        flags: 0,
+        count: 0,
+        len: 0,
+        seq: 1,
+    };
+    assert!(mirror.handle_control(f_gap).is_ok());
+
+    // handle_datagram: short datagram < FRAME_HEADER_LEN -> Ok(()) (line 2427)
+    assert!(mirror.handle_datagram(&[0u8; 8]).is_ok());
+
+    // handle_datagram: wrong session -> Ok(()) (line 2431)
+    let bad_session_dgram = Frame {
+        kind: KIND_DATA,
+        flags: 99,
+        count: 1,
+        len: 8,
+        seq: 1,
+    }
+    .encode();
+    assert!(mirror.handle_datagram(&bad_session_dgram).is_ok());
+
+    // handle_datagram: unexpected kind -> Ok(()) (line 2450)
+    let other_kind_dgram = Frame {
+        kind: KIND_PUNCH,
+        flags: 7,
+        count: 0,
+        len: 0,
+        seq: 0,
+    }
+    .encode();
+    assert!(mirror.handle_datagram(&other_kind_dgram).is_ok());
+
+    // apply: pending >= PENDING_MAX (lines 2463-2468)
+    for i in 0..70 {
+        mirror.pending.insert(1000 + i, (1, vec![0u8; 8]));
+    }
+    // Should skip pending.entry and call request
+    let _ = mirror.apply(2000, 1, &[0u8; 8]);
+
+    // 6. mirror.step(): test expired NAK and due punch (lines 2302-2364)
+    let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp_sock.set_nonblocking(true).unwrap();
+    let udp_port = udp_sock.local_addr().unwrap().port();
+    mirror.udp = Some(udp_sock);
+    mirror.nak = Some(Nak {
+        from: 1,
+        to: 2,
+        sent: Instant::now() - Duration::from_secs(1),
+    });
+    mirror.punch = Some(Punch {
+        to: SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, udp_port),
+        token: 42,
+        last: Instant::now() - Duration::from_secs(10),
+        heard: true,
+    });
+    mirror.stream.set_nonblocking(true).unwrap();
+    let step_res = mirror.step();
+    assert!(step_res.is_ok());
+
+    drop(mirror);
+    let _ = std::fs::remove_file(&p_mirror);
+}
