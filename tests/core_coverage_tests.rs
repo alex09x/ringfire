@@ -517,6 +517,8 @@ fn wait_strategies_return_and_reset_on_empty_and_ready_headers() {
     assert_eq!(CycleStamp::cycles_to_ns(900, 3.0), 300.0);
     #[cfg(target_arch = "aarch64")]
     assert!(CycleStamp::counter_frequency_hz().unwrap() > 0);
+    #[cfg(target_arch = "x86_64")]
+    assert!(CycleStamp::counter_frequency_hz().is_none());
 }
 
 #[test]
@@ -1169,6 +1171,8 @@ fn wait_strategy_default_and_none_timeout_coverage() {
     use ringfire::wait::{BusySpin, FutexWait, WaitStrategy, YieldBackoff};
     let mut bs = BusySpin::new();
     bs.reset();
+    let empty_hdr: ringfire::header::RingHeader = unsafe { std::mem::zeroed() };
+    bs.wait(&empty_hdr, 0);
     #[allow(clippy::default_constructed_unit_structs)]
     let mut bs2 = BusySpin::default();
     bs2.reset();

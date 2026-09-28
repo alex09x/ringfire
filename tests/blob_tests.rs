@@ -479,6 +479,21 @@ fn test_blob_layout_disagreement_and_skip_hole() {
     assert_eq!(meta, 55);
     assert_eq!(&buf[..5], b"item5");
 
+    // Set write_seq to 0 so write_seq < cons.cursor() -> skip_hole returns 0 (line 390)
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+    let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ringfire::header::RingHeader) };
+    header.write_seq.store(0, Ordering::SeqCst);
+    drop(mmap);
+    drop(file);
+    for _ in 0..64 {
+        let _ = cons.recv(&mut meta, &mut buf);
+    }
+
     // 3. Test BufferTooSmall in recv() -> covers line 536
     let path_buf = dir.join(format!("test_blob_buf_{}.shm", std::process::id()));
     let _ = std::fs::remove_file(&path_buf);
