@@ -5,6 +5,18 @@ All notable changes to `ringfire` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-09-27
+
+### Added
+- CI and local test script (`scripts/coverage.sh`) enforce at least 98% production Rust line coverage, achieving 98.04% (5,214 / 5,318 lines).
+- `ringfire clean [PATH] [--dry-run]` CLI subcommand to audit and reclaim abandoned/orphaned shared memory files without active flock holders or live readers.
+- `RingProducer::cleanup_mode` and `RingProducer::set_cleanup_mode` for configuring lifecycle unlink behavior dynamically.
+- Extended behavioral test suites covering MPMC ticket races and lost ticket recovery, SPMC sparse skip-hole transitions with reader registries, and FFI error states.
+
+### Changed
+- Strictly enforce Linux-only architecture across the crate via top-level `compile_error!`, removing incomplete non-Linux stubs and unused fallback branches.
+- Synchronized Python package version to 0.5.3.
+
 ## [0.5.2] - 2026-09-26
 
 ### Fixed
