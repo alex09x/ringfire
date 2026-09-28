@@ -22,12 +22,12 @@ impl BusySpin {
 }
 
 impl WaitStrategy for BusySpin {
-    #[inline(always)]
+    #[inline]
     fn wait(&mut self, _header: &RingHeader, _cursor: u64) {
         core::hint::spin_loop();
     }
 
-    #[inline(always)]
+    #[inline]
     fn reset(&mut self) {}
 }
 

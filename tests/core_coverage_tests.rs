@@ -1175,10 +1175,17 @@ fn wait_strategy_default_and_none_timeout_coverage() {
     bs.wait(&empty_hdr, 0);
     #[allow(clippy::default_constructed_unit_structs)]
     let mut bs2 = BusySpin::default();
+    bs2.wait(&empty_hdr, 0);
     bs2.reset();
 
     let mut yb = YieldBackoff::default();
+    yb.wait(&empty_hdr, 0);
     yb.reset();
+
+    let mut yb2 = YieldBackoff::new(1);
+    yb2.wait(&empty_hdr, 0);
+    yb2.wait(&empty_hdr, 0);
+    yb2.reset();
 
     let mut fw = FutexWait::default();
     fw.reset();
@@ -1414,4 +1421,39 @@ fn test_shm_mpmc_spmc_blob_additional_lines() {
     }
     stop_race.store(true, Ordering::Relaxed);
     let _ = t_handle.join();
+}
+
+#[test]
+fn lossless_backpressure_prunes_dead_reader_in_wait_for_headroom() {
+    let d = Dir::new();
+    let path = d.path("backpressure_dead_reader");
+    let mut prod = RingProducerBuilder::new(4)
+        .flow_control(FlowControl::LosslessBackpressure)
+        .max_readers(2)
+        .build::<u64, _>(&path)
+        .unwrap();
+
+    for i in 1..=4 {
+        prod.push(&i);
+    }
+
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut m = unsafe { memmap2::MmapMut::map_mut(&f).unwrap() };
+    let hdr = unsafe { &*(m.as_ptr() as *const ringfire::header::RingHeader) };
+    let slots = hdr.reader_registry_offset as usize;
+    let slot_ptr = unsafe { m.as_mut_ptr().add(slots) as *mut ringfire::header::ReaderSlot };
+    unsafe {
+        (*slot_ptr).pid.store(99999999, Ordering::SeqCst);
+        (*slot_ptr).active.store(1, Ordering::SeqCst);
+        (*slot_ptr).cursor_seq.store(0, Ordering::SeqCst);
+    }
+    drop(m);
+    drop(f);
+
+    prod.push(&5);
+    assert_eq!(prod.sequence(), 5);
 }

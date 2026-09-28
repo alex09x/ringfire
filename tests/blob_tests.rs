@@ -479,6 +479,13 @@ fn test_blob_layout_disagreement_and_skip_hole() {
     assert_eq!(meta, 55);
     assert_eq!(&buf[..5], b"item5");
 
+    // Anonymous consumer (registration is None) exercises skip_hole without registration (line 409)
+    let mut anon_cons = BlobConsumer::<u32>::attach(&path).unwrap();
+    let mut anon_meta = 0u32;
+    let mut anon_buf = [0u8; 64];
+    let _ = anon_cons.recv(&mut anon_meta, &mut anon_buf);
+    let _ = anon_cons.recv(&mut anon_meta, &mut anon_buf);
+
     // Set write_seq to 0 so write_seq < cons.cursor() -> skip_hole returns 0 (line 390)
     let file = OpenOptions::new()
         .read(true)
