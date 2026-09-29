@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "ringfire: Shared-memory ring buffers for Rust"
+type: software
+authors:
+  - given-names: Alexander
+    family-names: Panasenko
+    email: alex@prod.codes
+    orcid: "https://orcid.org/0009-0003-3569-6490"
+repository-code: "https://github.com/alex09x/ringfire"
+url: "https://github.com/alex09x/ringfire"
+license:
+  - MIT
+  - Apache-2.0
+doi: 10.5281/zenodo.23028630
+preferred-citation:
+  type: software
+  title: "ringfire: Shared-memory ring buffers for Rust"
+  authors:
+    - given-names: Alexander
+      family-names: Panasenko
+      email: alex@prod.codes
+      orcid: "https://orcid.org/0009-0003-3569-6490"
+  version: 0.5.3+licenses.462b66d
+  date-released: "2026-09-29"
+  doi: 10.5281/zenodo.23028631
+  license:
+    - MIT
+    - Apache-2.0
+  repository-code: "https://github.com/alex09x/ringfire"
+  url: "https://github.com/alex09x/ringfire"

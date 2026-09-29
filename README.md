@@ -638,6 +638,28 @@ rely on x86-64 store ordering (Python has no fences); use a Rust or C producer o
 
 ---
 
+## 📚 Citation
+
+If you use `ringfire` in academic research or technical publications, please cite this verified source archive snapshot:
+
+```bibtex
+@software{panasenko_ringfire_2026,
+  author    = {Panasenko, Alexander},
+  title     = {ringfire: Shared-memory ring buffers for Rust},
+  month     = sep,
+  year      = 2026,
+  publisher = {Zenodo},
+  version   = {0.5.3+licenses.462b66d},
+  doi       = {10.5281/zenodo.23028631},
+  url       = {https://doi.org/10.5281/zenodo.23028631}
+}
+```
+
+> [!NOTE]
+> This archival snapshot (`0.5.3+licenses.462b66d`, commit `462b66d5cb6e400e7a406e872e7f2409ac861d7b`) differs from original tag `v0.5.3` only by adding standard `LICENSE-MIT` and `LICENSE-APACHE` license texts; it is not a separate tagged release. For complete metadata, see [`CITATION.cff`](CITATION.cff) or the Zenodo record ([Concept DOI: 10.5281/zenodo.23028630](https://doi.org/10.5281/zenodo.23028630), [Version DOI: 10.5281/zenodo.23028631](https://doi.org/10.5281/zenodo.23028631)).
+
+---
+
 ## 👥 Author
 
 [**Alexander Panasenko**](https://prod.codes/about/)
